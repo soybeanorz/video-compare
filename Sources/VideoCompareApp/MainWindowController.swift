@@ -652,10 +652,6 @@ final class MainWindowController: NSWindowController {
 
     private func stepSyncFrames(_ delta: Int) {
         pauseBothIfNeeded()
-        if delta > 0 {
-            stepSynchronizedNextFrame()
-            return
-        }
         var callbacks = 0
         func done() {
             callbacks += 1
@@ -664,33 +660,6 @@ final class MainWindowController: NSWindowController {
         }
         playerA.stepFrame(direction: delta) { _ in done() }
         playerB.stepFrame(direction: delta) { _ in done() }
-    }
-
-    private func stepSynchronizedNextFrame() {
-        var frameA: NativeVideoFrame?
-        var frameB: NativeVideoFrame?
-        var callbacks = 0
-        func finishIfReady() {
-            callbacks += 1
-            guard callbacks == 2 else { return }
-            if let frameA {
-                playerA.setVideoVisible(true)
-                playerA.presentSynchronizedFrame(frameA)
-            }
-            if let frameB {
-                playerB.setVideoVisible(true)
-                playerB.presentSynchronizedFrame(frameB)
-            }
-            refreshStatus()
-        }
-        playerA.decodeNextFrameForSynchronization { frame in
-            frameA = frame
-            finishIfReady()
-        }
-        playerB.decodeNextFrameForSynchronization { frame in
-            frameB = frame
-            finishIfReady()
-        }
     }
 
     private func stepIndividualFrame(slot: VideoSlot, delta: Int) {

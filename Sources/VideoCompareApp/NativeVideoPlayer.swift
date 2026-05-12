@@ -26,6 +26,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private var playbackGeneration = 0
     private var visible = true
     private var frameHistory: [NativeVideoFrame] = []
+    private var frameHistoryIndex: Int?
 
     private(set) var fileURL: URL?
     private(set) var timePosition: Double = 0
@@ -110,6 +111,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     func seekAbsolute(_ seconds: Double, exact: Bool = true) {
         DispatchQueue.main.async {
             self.frameHistory.removeAll(keepingCapacity: true)
+            self.frameHistoryIndex = nil
         }
         stateLock.lock()
         pendingSeek = (max(0, seconds), exact)
@@ -146,6 +148,9 @@ final class NativeVideoPlayer: @unchecked Sendable {
         }
 
         if direction > 0 {
+            if presentNextFrameFromHistory(completion: completion) {
+                return
+            }
             decodeNextFrameForSynchronization { frame in
                 guard let frame else {
                     completion(nil)
@@ -177,6 +182,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
             )
             DispatchQueue.main.async {
                 self.frameHistory.removeAll(keepingCapacity: true)
+                self.frameHistoryIndex = nil
                 self.presentSynchronizedFrame(videoFrame)
                 completion(videoFrame.pts)
             }
@@ -237,26 +243,50 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private func presentPreviousFrameFromHistory(completion: @escaping (Double?) -> Void) -> Bool {
         guard Thread.isMainThread else { return false }
         guard frameHistory.count >= 2 else { return false }
-        let currentIndex = frameHistory.lastIndex { $0.pts <= timePosition + 0.0001 } ?? frameHistory.count - 1
+        let currentIndex = frameHistoryIndex ?? frameHistory.lastIndex { $0.pts <= timePosition + 0.0001 } ?? frameHistory.count - 1
         let previousIndex = max(0, currentIndex - 1)
         guard previousIndex != currentIndex else { return false }
         let frame = frameHistory[previousIndex]
-        frameHistory.removeSubrange((previousIndex + 1)..<frameHistory.count)
-        timePosition = frame.pts
-        onFrameDecoded?(slot, frame.pixelBuffer, frame.pts)
-        notifyStatus()
+        frameHistoryIndex = previousIndex
+        presentHistoricalFrame(frame)
         completion(frame.pts)
         return true
     }
 
+    private func presentNextFrameFromHistory(completion: @escaping (Double?) -> Void) -> Bool {
+        guard Thread.isMainThread else { return false }
+        guard let currentIndex = frameHistoryIndex, currentIndex + 1 < frameHistory.count else { return false }
+        let nextIndex = currentIndex + 1
+        let frame = frameHistory[nextIndex]
+        frameHistoryIndex = nextIndex
+        presentHistoricalFrame(frame)
+        completion(frame.pts)
+        return true
+    }
+
+    private func presentHistoricalFrame(_ frame: NativeVideoFrame) {
+        timePosition = frame.pts
+        onFrameDecoded?(slot, frame.pixelBuffer, frame.pts)
+        notifyStatus()
+    }
+
     private func record(_ frame: NativeVideoFrame) {
+        if let current = frameHistoryIndex, current < frameHistory.count - 1 {
+            frameHistory.removeSubrange((current + 1)..<frameHistory.count)
+        }
         if let last = frameHistory.last, abs(last.pts - frame.pts) < 0.0001 {
             frameHistory[frameHistory.count - 1] = frame
+            frameHistoryIndex = frameHistory.count - 1
         } else {
             frameHistory.append(frame)
+            frameHistoryIndex = frameHistory.count - 1
         }
         if frameHistory.count > 240 {
-            frameHistory.removeFirst(frameHistory.count - 240)
+            let removed = frameHistory.count - 240
+            frameHistory.removeFirst(removed)
+            if let index = frameHistoryIndex {
+                frameHistoryIndex = max(0, index - removed)
+            }
         }
     }
 
