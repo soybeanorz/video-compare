@@ -80,6 +80,13 @@ final class TimelineControl: NSView {
             applyTheme()
         }
     }
+    var showsTimeLabels = true {
+        didSet {
+            currentLabel.isHidden = !showsTimeLabels
+            durationLabel.isHidden = !showsTimeLabels
+            needsLayout = true
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -93,9 +100,9 @@ final class TimelineControl: NSView {
             button.contentTintColor = .white
             addSubview(button)
         }
-        previousButton.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
+        previousButton.font = NSFont.systemFont(ofSize: 28, weight: .semibold)
         playButton.font = NSFont.systemFont(ofSize: 28, weight: .semibold)
-        nextButton.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
+        nextButton.font = NSFont.systemFont(ofSize: 28, weight: .semibold)
 
         slider.isContinuous = true
 
@@ -125,13 +132,17 @@ final class TimelineControl: NSView {
         let buttonSize: CGFloat = 44
         let centerX = floor((bounds.width - buttonSize) / 2)
         playButton.frame = NSRect(x: centerX, y: 4, width: buttonSize, height: buttonSize)
-        previousButton.frame = NSRect(x: centerX - 52, y: 8, width: buttonSize, height: buttonSize)
-        nextButton.frame = NSRect(x: centerX + 52, y: 8, width: buttonSize, height: buttonSize)
+        previousButton.frame = NSRect(x: centerX - 52, y: 4, width: buttonSize, height: buttonSize)
+        nextButton.frame = NSRect(x: centerX + 52, y: 4, width: buttonSize, height: buttonSize)
         let labelY: CGFloat = bounds.height - 30
         let labelW: CGFloat = 72
         currentLabel.frame = NSRect(x: pad, y: labelY, width: labelW, height: 22)
         durationLabel.frame = NSRect(x: bounds.width - pad - labelW, y: labelY, width: labelW, height: 22)
-        slider.frame = NSRect(x: pad + labelW + 10, y: labelY - 2, width: max(80, bounds.width - (pad + labelW + 10) * 2), height: 24)
+        if showsTimeLabels {
+            slider.frame = NSRect(x: pad + labelW + 10, y: labelY - 2, width: max(80, bounds.width - (pad + labelW + 10) * 2), height: 24)
+        } else {
+            slider.frame = NSRect(x: pad + 70, y: labelY - 2, width: max(80, bounds.width - (pad + 70) * 2), height: 24)
+        }
     }
 
     func setTime(current: String, duration: String) {
@@ -273,6 +284,7 @@ final class MainWindowController: NSWindowController {
             self?.selectedSlot = slot
         }
         syncTimeline.showsBackground = false
+        syncTimeline.showsTimeLabels = false
 
         let controls = [
             layoutControl,
@@ -402,6 +414,7 @@ final class MainWindowController: NSWindowController {
         let appItem = NSMenuItem()
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "关闭 VideoCompare", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "w")
         appMenu.addItem(withTitle: "退出 VideoCompare", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
@@ -568,11 +581,11 @@ final class MainWindowController: NSWindowController {
     }
 
     @objc private func videoATimelinePreviousFrame() {
-        adjustOffset(slot: .a, delta: -1)
+        stepIndividualFrame(slot: .a, delta: -1)
     }
 
     @objc private func videoATimelineNextFrame() {
-        adjustOffset(slot: .a, delta: 1)
+        stepIndividualFrame(slot: .a, delta: 1)
     }
 
     @objc private func toggleVideoBTimelinePlayback() {
@@ -584,11 +597,11 @@ final class MainWindowController: NSWindowController {
     }
 
     @objc private func videoBTimelinePreviousFrame() {
-        adjustOffset(slot: .b, delta: -1)
+        stepIndividualFrame(slot: .b, delta: -1)
     }
 
     @objc private func videoBTimelineNextFrame() {
-        adjustOffset(slot: .b, delta: 1)
+        stepIndividualFrame(slot: .b, delta: 1)
     }
 
     @objc private func toggleA() {
@@ -631,7 +644,7 @@ final class MainWindowController: NSWindowController {
 
     private func stepBySelection(_ delta: Int) {
         if let selectedSlot {
-            adjustOffset(slot: selectedSlot, delta: delta)
+            stepIndividualFrame(slot: selectedSlot, delta: delta)
         } else {
             stepSyncFrames(delta)
         }
@@ -639,9 +652,56 @@ final class MainWindowController: NSWindowController {
 
     private func stepSyncFrames(_ delta: Int) {
         pauseBothIfNeeded()
-        let fps = max(1, playerA.fps)
-        let base = currentBaseTime() + Double(delta) / fps
-        seekToBaseTime(base)
+        if delta > 0 {
+            stepSynchronizedNextFrame()
+            return
+        }
+        var callbacks = 0
+        func done() {
+            callbacks += 1
+            guard callbacks == 2 else { return }
+            refreshStatus()
+        }
+        playerA.stepFrame(direction: delta) { _ in done() }
+        playerB.stepFrame(direction: delta) { _ in done() }
+    }
+
+    private func stepSynchronizedNextFrame() {
+        var frameA: NativeVideoFrame?
+        var frameB: NativeVideoFrame?
+        var callbacks = 0
+        func finishIfReady() {
+            callbacks += 1
+            guard callbacks == 2 else { return }
+            if let frameA {
+                playerA.setVideoVisible(true)
+                playerA.presentSynchronizedFrame(frameA)
+            }
+            if let frameB {
+                playerB.setVideoVisible(true)
+                playerB.presentSynchronizedFrame(frameB)
+            }
+            refreshStatus()
+        }
+        playerA.decodeNextFrameForSynchronization { frame in
+            frameA = frame
+            finishIfReady()
+        }
+        playerB.decodeNextFrameForSynchronization { frame in
+            frameB = frame
+            finishIfReady()
+        }
+    }
+
+    private func stepIndividualFrame(slot: VideoSlot, delta: Int) {
+        pauseBothIfNeeded()
+        let player = slot == .a ? playerA! : playerB!
+        player.stepFrame(direction: delta) { newTime in
+            guard let newTime else { return }
+            self.updateOffsetAfterIndividualSeek(slot: slot, targetTime: newTime)
+            self.saveState()
+            self.refreshStatus()
+        }
     }
 
     private func currentBaseTime() -> Double {

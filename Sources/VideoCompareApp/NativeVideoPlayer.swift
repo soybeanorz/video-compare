@@ -25,6 +25,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private var isSeeking = false
     private var playbackGeneration = 0
     private var visible = true
+    private var frameHistory: [NativeVideoFrame] = []
 
     private(set) var fileURL: URL?
     private(set) var timePosition: Double = 0
@@ -107,6 +108,9 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func seekAbsolute(_ seconds: Double, exact: Bool = true) {
+        DispatchQueue.main.async {
+            self.frameHistory.removeAll(keepingCapacity: true)
+        }
         stateLock.lock()
         pendingSeek = (max(0, seconds), exact)
         guard !isSeeking else {
@@ -132,9 +136,51 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func frameStep(_ direction: Int) {
+        stepFrame(direction: direction) { _ in }
+    }
+
+    func stepFrame(direction: Int, completion: @escaping (Double?) -> Void) {
         setPause(true)
-        let step = 1.0 / max(1, fps)
-        seekAbsolute(timePosition + Double(direction) * step, exact: true)
+        if direction < 0, presentPreviousFrameFromHistory(completion: completion) {
+            return
+        }
+
+        if direction > 0 {
+            decodeNextFrameForSynchronization { frame in
+                guard let frame else {
+                    completion(nil)
+                    return
+                }
+                self.presentSynchronizedFrame(frame)
+                completion(frame.pts)
+            }
+            return
+        }
+
+        let target = max(0, timePosition + Double(direction) / max(1, fps))
+        queue.async {
+            guard let decoder = self.decoder else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            var frame = VCDecodedFrame()
+            let result = vc_decoder_seek(decoder, target, 1, &frame)
+            guard result > 0, let unmanagedPixelBuffer = frame.pixelBuffer else {
+                vc_frame_release(&frame)
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let videoFrame = NativeVideoFrame(
+                pixelBuffer: unmanagedPixelBuffer.takeRetainedValue(),
+                pts: frame.pts,
+                duration: frame.duration
+            )
+            DispatchQueue.main.async {
+                self.frameHistory.removeAll(keepingCapacity: true)
+                self.presentSynchronizedFrame(videoFrame)
+                completion(videoFrame.pts)
+            }
+        }
     }
 
     func setVideoVisible(_ visible: Bool) {
@@ -182,9 +228,36 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func presentSynchronizedFrame(_ frame: NativeVideoFrame) {
+        record(frame)
         timePosition = frame.pts
         onFrameDecoded?(slot, frame.pixelBuffer, frame.pts)
         notifyStatus()
+    }
+
+    private func presentPreviousFrameFromHistory(completion: @escaping (Double?) -> Void) -> Bool {
+        guard Thread.isMainThread else { return false }
+        guard frameHistory.count >= 2 else { return false }
+        let currentIndex = frameHistory.lastIndex { $0.pts <= timePosition + 0.0001 } ?? frameHistory.count - 1
+        let previousIndex = max(0, currentIndex - 1)
+        guard previousIndex != currentIndex else { return false }
+        let frame = frameHistory[previousIndex]
+        frameHistory.removeSubrange((previousIndex + 1)..<frameHistory.count)
+        timePosition = frame.pts
+        onFrameDecoded?(slot, frame.pixelBuffer, frame.pts)
+        notifyStatus()
+        completion(frame.pts)
+        return true
+    }
+
+    private func record(_ frame: NativeVideoFrame) {
+        if let last = frameHistory.last, abs(last.pts - frame.pts) < 0.0001 {
+            frameHistory[frameHistory.count - 1] = frame
+        } else {
+            frameHistory.append(frame)
+        }
+        if frameHistory.count > 240 {
+            frameHistory.removeFirst(frameHistory.count - 240)
+        }
     }
 
     private func startPlaybackLoop() {
