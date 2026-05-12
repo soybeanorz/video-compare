@@ -8,7 +8,7 @@ final class DropVideoView: NSView {
         self.slot = slot
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
         layer?.masksToBounds = true
         registerForDraggedTypes([.fileURL])
     }
@@ -76,8 +76,7 @@ final class WipeDividerView: NSView {
 final class VideoCanvasView: NSView {
     let containerA = DropVideoView(slot: .a)
     let containerB = DropVideoView(slot: .b)
-    let hostA = MPVRenderView()
-    let hostB = MPVRenderView()
+    let renderer = MetalCompositeView()
     let labelA = NSTextField(labelWithString: "A: 未加载")
     let labelB = NSTextField(labelWithString: "B: 未加载")
     private let divider = WipeDividerView()
@@ -96,9 +95,11 @@ final class VideoCanvasView: NSView {
     var onWipeChanged: ((CGFloat) -> Void)?
     var onPanDragged: ((VideoSlot, CGFloat, CGFloat) -> Void)?
     var onZoomDragged: ((VideoSlot, CGFloat) -> Void)?
+    var onAlignmentGestureEnded: (() -> Void)?
     var onSelectionChanged: ((VideoSlot?) -> Void)?
     var selectedSlot: VideoSlot? {
         didSet {
+            guard oldValue != selectedSlot else { return }
             updateSelectionAppearance()
             onSelectionChanged?(selectedSlot)
         }
@@ -117,17 +118,12 @@ final class VideoCanvasView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        containerA.addSubview(hostA)
-        containerB.addSubview(hostB)
+        addSubview(renderer)
         addSubview(containerA)
         addSubview(containerB)
         addSubview(labelA)
         addSubview(labelB)
         addSubview(divider)
-        for view in [hostA, hostB] {
-            view.wantsLayer = true
-            view.layer?.backgroundColor = NSColor.black.cgColor
-        }
         for label in [labelA, labelB] {
             label.lineBreakMode = .byTruncatingMiddle
             label.maximumNumberOfLines = 1
@@ -149,6 +145,9 @@ final class VideoCanvasView: NSView {
         super.layout()
         let b = bounds
         let oneLabel = labelHeight
+        renderer.frame = b
+        var rectA = NSRect.zero
+        var rectB = NSRect.zero
         switch layoutMode {
         case .sideBySideHorizontal:
             let leftWidth = floor(b.width / 2)
@@ -161,8 +160,8 @@ final class VideoCanvasView: NSView {
             labelB.frame = NSRect(x: leftWidth + 1, y: 0, width: max(0, b.width - leftWidth - 1), height: oneLabel)
             containerA.frame = NSRect(x: 0, y: oneLabel, width: leftWidth, height: max(0, b.height - oneLabel))
             containerB.frame = NSRect(x: leftWidth + 1, y: oneLabel, width: max(0, b.width - leftWidth - 1), height: max(0, b.height - oneLabel))
-            hostA.frame = containerA.bounds
-            hostB.frame = containerB.bounds
+            rectA = containerA.frame
+            rectB = containerB.frame
         case .sideBySideVertical:
             let topHeight = floor(b.height / 2)
             containerA.isHidden = false
@@ -174,8 +173,8 @@ final class VideoCanvasView: NSView {
             containerA.frame = NSRect(x: 0, y: oneLabel, width: b.width, height: max(0, topHeight - oneLabel))
             labelB.frame = NSRect(x: 0, y: topHeight + 1, width: b.width, height: oneLabel)
             containerB.frame = NSRect(x: 0, y: topHeight + 1 + oneLabel, width: b.width, height: max(0, b.height - topHeight - 1 - oneLabel))
-            hostA.frame = containerA.bounds
-            hostB.frame = containerB.bounds
+            rectA = containerA.frame
+            rectB = containerB.frame
         case .overlapToggle:
             labelA.isHidden = !showingAInToggle
             labelB.isHidden = showingAInToggle
@@ -185,10 +184,10 @@ final class VideoCanvasView: NSView {
             let content = NSRect(x: 0, y: oneLabel, width: b.width, height: max(0, b.height - oneLabel))
             containerA.frame = content
             containerB.frame = content
-            hostA.frame = containerA.bounds
-            hostB.frame = containerB.bounds
             containerA.isHidden = !showingAInToggle
             containerB.isHidden = showingAInToggle
+            rectA = content
+            rectB = content
         case .overlapWipe:
             labelA.isHidden = false
             labelB.isHidden = false
@@ -201,12 +200,17 @@ final class VideoCanvasView: NSView {
             containerA.isHidden = false
             containerB.isHidden = false
             containerA.frame = content
-            hostA.frame = containerA.bounds
             containerB.frame = NSRect(x: content.minX, y: content.minY, width: width, height: content.height)
-            hostB.frame = NSRect(x: 0, y: 0, width: content.width, height: content.height)
             divider.isHidden = false
             divider.frame = NSRect(x: content.minX + width - 12, y: content.minY, width: 24, height: content.height)
+            rectA = content
+            rectB = content
         }
+        renderer.layoutMode = layoutMode
+        renderer.showingAInToggle = showingAInToggle
+        renderer.wipeFraction = wipeFraction
+        renderer.rectA = rectA
+        renderer.rectB = rectB
         if layoutMode != .overlapWipe {
             labelA.alignment = .left
             labelB.alignment = .left
@@ -258,11 +262,15 @@ final class VideoCanvasView: NSView {
         isPanning = false
         panSlot = nil
         lastDragPoint = nil
+        if didPan {
+            onAlignmentGestureEnded?()
+        }
     }
 
     func toggleOverlapDisplay() {
         guard layoutMode == .overlapToggle else { return }
         showingAInToggle.toggle()
+        renderer.showingAInToggle = showingAInToggle
         selectedSlot = showingAInToggle ? .a : .b
         onToggleChanged?()
     }
@@ -326,6 +334,7 @@ final class VideoCanvasView: NSView {
     private func updateWipeFromPoint(_ point: NSPoint) {
         let content = activeContentBounds()
         wipeFraction = content.width <= 0 ? 0.5 : max(0, min(1, (point.x - content.minX) / content.width))
+        renderer.wipeFraction = wipeFraction
         needsDisplay = true
         onWipeChanged?(wipeFraction)
     }

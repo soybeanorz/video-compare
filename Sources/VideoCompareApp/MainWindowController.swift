@@ -14,8 +14,8 @@ final class ContinuousSeekSlider: NSSlider {
 
 final class MainWindowController: NSWindowController {
     private let canvas = VideoCanvasView()
-    private var playerA: MPVPlayer!
-    private var playerB: MPVPlayer!
+    private var playerA: NativeVideoPlayer!
+    private var playerB: NativeVideoPlayer!
 
     private let layoutControl = NSSegmentedControl(labels: CompareLayout.allCases.map(\.title), trackingMode: .selectOne, target: nil, action: nil)
     private let syncPlayButton = NSButton(title: "同步播放", target: nil, action: nil)
@@ -86,20 +86,36 @@ final class MainWindowController: NSWindowController {
         content.wantsLayer = true
         content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
-        playerA = MPVPlayer(slot: .a, hostView: canvas.hostA)
-        playerB = MPVPlayer(slot: .b, hostView: canvas.hostB)
+        playerA = NativeVideoPlayer(slot: .a)
+        playerB = NativeVideoPlayer(slot: .b)
         playerA.onStatusChanged = { [weak self] in self?.scheduleStatusRefresh() }
         playerB.onStatusChanged = { [weak self] in self?.scheduleStatusRefresh() }
+        playerA.onFrameDecoded = { [weak self] slot, pixelBuffer, _ in self?.canvas.renderer.setFrame(pixelBuffer, slot: slot) }
+        playerB.onFrameDecoded = { [weak self] slot, pixelBuffer, _ in self?.canvas.renderer.setFrame(pixelBuffer, slot: slot) }
+        playerA.onVisibilityChanged = { [weak self] slot, visible in self?.canvas.renderer.setVisible(visible, slot: slot) }
+        playerB.onVisibilityChanged = { [weak self] slot, visible in self?.canvas.renderer.setVisible(visible, slot: slot) }
+        playerA.onOpenFailed = { [weak self] slot, message in self?.showLoadError(slot: slot, message: message) }
+        playerB.onOpenFailed = { [weak self] slot, message in self?.showLoadError(slot: slot, message: message) }
 
         canvas.containerA.onFileDropped = { [weak self] _, url in self?.load(url: url, slot: .a) }
         canvas.containerB.onFileDropped = { [weak self] _, url in self?.load(url: url, slot: .b) }
         canvas.onPanDragged = { [weak self] slot, dx, dy in
-            self?.selectedSlot = slot
+            if self?.selectedSlot != slot {
+                self?.selectedSlot = slot
+            }
             self?.adjustTransform(slot: slot, dx: dx, dy: dy, dz: 0)
         }
         canvas.onZoomDragged = { [weak self] slot, dz in
-            self?.selectedSlot = slot
+            if self?.selectedSlot != slot {
+                self?.selectedSlot = slot
+            }
             self?.adjustTransform(slot: slot, dx: 0, dy: 0, dz: dz)
+        }
+        canvas.onAlignmentGestureEnded = { [weak self] in
+            self?.saveState()
+        }
+        canvas.onToggleChanged = { [weak self] in
+            self?.seekVisibleToggleFrame()
         }
         canvas.onSelectionChanged = { [weak self] slot in
             guard self?.selectedSlot != slot else { return }
@@ -293,6 +309,8 @@ final class MainWindowController: NSWindowController {
         syncState = PersistenceStore.shared.loadState(for: pair)
         playerA.applyTransform(syncState.transformA)
         playerB.applyTransform(syncState.transformB)
+        canvas.renderer.transformA = syncState.transformA
+        canvas.renderer.transformB = syncState.transformB
         PersistenceStore.shared.addRecent(a: a, b: b)
         refreshRecentMenu()
         refreshStatus()
@@ -373,11 +391,19 @@ final class MainWindowController: NSWindowController {
     private func seekToBaseTime(_ base: Double, exact: Bool = true) {
         let aTime = base + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
         let bTime = base + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
+        if !exact && canvas.layoutMode == .overlapToggle {
+            if canvas.showingAInToggle {
+                display(playerA, at: aTime, exact: false)
+            } else {
+                display(playerB, at: bTime, exact: false)
+            }
+            return
+        }
         display(playerA, at: aTime, exact: exact)
         display(playerB, at: bTime, exact: exact)
     }
 
-    private func display(_ player: MPVPlayer, at seconds: Double, exact: Bool = true) {
+    private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true) {
         let hasContent = seconds >= 0 && (player.duration <= 0 || seconds <= player.duration)
         player.setVideoVisible(hasContent)
         if hasContent {
@@ -409,7 +435,7 @@ final class MainWindowController: NSWindowController {
         pendingCoalescedSeek = base
         guard !coalescedSeekScheduled else { return }
         coalescedSeekScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.033) {
             self.coalescedSeekScheduled = false
             guard let base = self.pendingCoalescedSeek else { return }
             self.pendingCoalescedSeek = nil
@@ -439,24 +465,26 @@ final class MainWindowController: NSWindowController {
             syncState.transformA.panX += dx
             syncState.transformA.panY += dy
             syncState.transformA.zoom += dz
+            canvas.renderer.transformA = syncState.transformA
             playerA.applyTransform(syncState.transformA)
         } else {
             syncState.transformB.panX += dx
             syncState.transformB.panY += dy
             syncState.transformB.zoom += dz
+            canvas.renderer.transformB = syncState.transformB
             playerB.applyTransform(syncState.transformB)
         }
-        saveState()
-        refreshStatus()
     }
 
     @objc private func resetTransform() {
         guard canvas.allowsAlignmentAdjustment, let slot = selectedSlot else { return }
         if slot == .a {
             syncState.transformA = TransformState()
+            canvas.renderer.transformA = syncState.transformA
             playerA.applyTransform(syncState.transformA)
         } else {
             syncState.transformB = TransformState()
+            canvas.renderer.transformB = syncState.transformB
             playerB.applyTransform(syncState.transformB)
         }
         saveState()
@@ -467,6 +495,8 @@ final class MainWindowController: NSWindowController {
         guard let pair = currentPair else { return }
         PersistenceStore.shared.clearState(for: pair)
         syncState = SyncState()
+        canvas.renderer.transformA = syncState.transformA
+        canvas.renderer.transformB = syncState.transformB
         playerA.applyTransform(syncState.transformA)
         playerB.applyTransform(syncState.transformB)
         refreshStatus()
@@ -528,6 +558,23 @@ final class MainWindowController: NSWindowController {
     private func saveState() {
         guard let pair = currentPair else { return }
         PersistenceStore.shared.saveState(syncState, for: pair)
+    }
+
+    private func seekVisibleToggleFrame() {
+        guard canvas.layoutMode == .overlapToggle else { return }
+        let base = currentBaseTime()
+        if canvas.showingAInToggle {
+            display(playerA, at: base + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps), exact: false)
+        } else {
+            display(playerB, at: base + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps), exact: false)
+        }
+    }
+
+    private func showLoadError(slot: VideoSlot, message: String) {
+        let alert = NSAlert()
+        alert.messageText = "加载 \(slot.rawValue.uppercased()) 失败"
+        alert.informativeText = message
+        alert.runModal()
     }
 
     private func handleKey(_ event: NSEvent) -> Bool {
