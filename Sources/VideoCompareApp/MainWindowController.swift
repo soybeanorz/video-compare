@@ -2,21 +2,84 @@ import AppKit
 import Foundation
 import UniformTypeIdentifiers
 
-final class ContinuousSeekSlider: NSSlider {
+final class ContinuousSeekSlider: NSControl {
     var onTrackingChanged: ((Bool) -> Void)?
+    private var value: Double = 0
+
+    convenience init(value: Double, minValue: Double, maxValue: Double, target: AnyObject?, action: Selector?) {
+        self.init(frame: .zero)
+        doubleValue = value
+        self.target = target
+        self.action = action
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override var doubleValue: Double {
+        get { value }
+        set {
+            value = min(1, max(0, newValue))
+            needsDisplay = true
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let trackH: CGFloat = 4
+        let thumbW: CGFloat = 4
+        let thumbH: CGFloat = min(bounds.height, 24)
+        let track = NSRect(x: 0, y: floor((bounds.height - trackH) / 2), width: bounds.width, height: trackH)
+        let progressW = max(0, min(bounds.width, bounds.width * CGFloat(value)))
+
+        NSColor(calibratedWhite: 0.35, alpha: 0.72).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 2, yRadius: 2).fill()
+
+        NSColor(calibratedWhite: 0.86, alpha: 0.95).setFill()
+        NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY, width: progressW, height: track.height), xRadius: 2, yRadius: 2).fill()
+
+        let thumbX = min(bounds.width - thumbW, max(0, progressW - thumbW / 2))
+        NSBezierPath(roundedRect: NSRect(x: thumbX, y: floor((bounds.height - thumbH) / 2), width: thumbW, height: thumbH), xRadius: 1.5, yRadius: 1.5).fill()
+    }
 
     override func mouseDown(with event: NSEvent) {
         onTrackingChanged?(true)
-        super.mouseDown(with: event)
+        updateValue(with: event)
+        while true {
+            guard let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else { break }
+            if next.type == .leftMouseUp { break }
+            updateValue(with: next)
+        }
         onTrackingChanged?(false)
+    }
+
+    private func updateValue(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        doubleValue = bounds.width <= 0 ? 0 : Double(point.x / bounds.width)
+        sendAction(action, to: target)
     }
 }
 
 final class TimelineControl: NSView {
+    let previousButton = NSButton(title: "<", target: nil, action: nil)
     let playButton = NSButton(title: "▶", target: nil, action: nil)
+    let nextButton = NSButton(title: ">", target: nil, action: nil)
     let slider = ContinuousSeekSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let currentLabel = NSTextField(labelWithString: "00:00")
     private let durationLabel = NSTextField(labelWithString: "00:00")
+    var showsBackground = true {
+        didSet {
+            layer?.backgroundColor = showsBackground ? NSColor(calibratedWhite: 0.08, alpha: 0.78).cgColor : NSColor.clear.cgColor
+            applyTheme()
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -25,25 +88,29 @@ final class TimelineControl: NSView {
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
 
-        playButton.isBordered = false
+        for button in [previousButton, playButton, nextButton] {
+            button.isBordered = false
+            button.contentTintColor = .white
+            addSubview(button)
+        }
+        previousButton.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
         playButton.font = NSFont.systemFont(ofSize: 28, weight: .semibold)
-        playButton.contentTintColor = .white
+        nextButton.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
 
         slider.isContinuous = true
 
         for label in [currentLabel, durationLabel] {
             label.font = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
-            label.textColor = NSColor(calibratedWhite: 0.92, alpha: 1)
             label.backgroundColor = .clear
             label.drawsBackground = false
         }
         currentLabel.alignment = .left
         durationLabel.alignment = .right
 
-        addSubview(playButton)
         addSubview(slider)
         addSubview(currentLabel)
         addSubview(durationLabel)
+        applyTheme()
     }
 
     required init?(coder: NSCoder) {
@@ -56,7 +123,10 @@ final class TimelineControl: NSView {
         super.layout()
         let pad: CGFloat = 14
         let buttonSize: CGFloat = 44
-        playButton.frame = NSRect(x: floor((bounds.width - buttonSize) / 2), y: 4, width: buttonSize, height: buttonSize)
+        let centerX = floor((bounds.width - buttonSize) / 2)
+        playButton.frame = NSRect(x: centerX, y: 4, width: buttonSize, height: buttonSize)
+        previousButton.frame = NSRect(x: centerX - 52, y: 8, width: buttonSize, height: buttonSize)
+        nextButton.frame = NSRect(x: centerX + 52, y: 8, width: buttonSize, height: buttonSize)
         let labelY: CGFloat = bounds.height - 30
         let labelW: CGFloat = 72
         currentLabel.frame = NSRect(x: pad, y: labelY, width: labelW, height: 22)
@@ -71,6 +141,15 @@ final class TimelineControl: NSView {
 
     func setPlaying(_ playing: Bool) {
         playButton.title = playing ? "⏸" : "▶"
+    }
+
+    private func applyTheme() {
+        let color: NSColor = showsBackground ? NSColor(calibratedWhite: 0.92, alpha: 1) : .labelColor
+        for button in [previousButton, playButton, nextButton] {
+            button.contentTintColor = color
+        }
+        currentLabel.textColor = color
+        durationLabel.textColor = color
     }
 }
 
@@ -193,6 +272,7 @@ final class MainWindowController: NSWindowController {
             guard self?.selectedSlot != slot else { return }
             self?.selectedSlot = slot
         }
+        syncTimeline.showsBackground = false
 
         let controls = [
             layoutControl,
@@ -262,10 +342,22 @@ final class MainWindowController: NSWindowController {
         clearStateButton.action = #selector(clearCurrentState)
         syncTimeline.playButton.target = self
         syncTimeline.playButton.action = #selector(toggleSyncTimelinePlayback)
+        syncTimeline.previousButton.target = self
+        syncTimeline.previousButton.action = #selector(syncTimelinePreviousFrame)
+        syncTimeline.nextButton.target = self
+        syncTimeline.nextButton.action = #selector(syncTimelineNextFrame)
         videoATimeline.playButton.target = self
         videoATimeline.playButton.action = #selector(toggleVideoATimelinePlayback)
+        videoATimeline.previousButton.target = self
+        videoATimeline.previousButton.action = #selector(videoATimelinePreviousFrame)
+        videoATimeline.nextButton.target = self
+        videoATimeline.nextButton.action = #selector(videoATimelineNextFrame)
         videoBTimeline.playButton.target = self
         videoBTimeline.playButton.action = #selector(toggleVideoBTimelinePlayback)
+        videoBTimeline.previousButton.target = self
+        videoBTimeline.previousButton.action = #selector(videoBTimelinePreviousFrame)
+        videoBTimeline.nextButton.target = self
+        videoBTimeline.nextButton.action = #selector(videoBTimelineNextFrame)
 
         layoutControl.target = self
         layoutControl.action = #selector(layoutChanged)
@@ -364,8 +456,9 @@ final class MainWindowController: NSWindowController {
         let canvasTop = toolbarY - gap
         canvas.frame = NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY))
         canvas.layoutSubtreeIfNeeded()
-        layoutVideoTimeline(videoATimeline, over: canvas.containerA.frame, hidden: canvas.containerA.isHidden, in: content)
-        layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: canvas.containerB.isHidden, in: content)
+        let hideIndependentTimelines = canvas.layoutMode != .sideBySideHorizontal
+        layoutVideoTimeline(videoATimeline, over: canvas.containerA.frame, hidden: hideIndependentTimelines || canvas.containerA.isHidden, in: content)
+        layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: hideIndependentTimelines || canvas.containerB.isHidden, in: content)
     }
 
     private func layoutVideoTimeline(_ timeline: TimelineControl, over canvasRect: NSRect, hidden: Bool, in content: NSView) {
@@ -435,6 +528,7 @@ final class MainWindowController: NSWindowController {
         guard let layout = CompareLayout(rawValue: layoutControl.selectedSegment) else { return }
         canvas.layoutMode = layout
         canvas.needsDisplay = true
+        layoutContent()
     }
 
     @objc private func targetSelectionChanged() {
@@ -457,6 +551,14 @@ final class MainWindowController: NSWindowController {
         toggleSynchronizedPlayback()
     }
 
+    @objc private func syncTimelinePreviousFrame() {
+        stepSyncFrames(-1)
+    }
+
+    @objc private func syncTimelineNextFrame() {
+        stepSyncFrames(1)
+    }
+
     @objc private func toggleVideoATimelinePlayback() {
         if canvas.allowsAlignmentAdjustment {
             toggleSynchronizedPlayback()
@@ -465,12 +567,28 @@ final class MainWindowController: NSWindowController {
         }
     }
 
+    @objc private func videoATimelinePreviousFrame() {
+        adjustOffset(slot: .a, delta: -1)
+    }
+
+    @objc private func videoATimelineNextFrame() {
+        adjustOffset(slot: .a, delta: 1)
+    }
+
     @objc private func toggleVideoBTimelinePlayback() {
         if canvas.allowsAlignmentAdjustment {
             toggleSynchronizedPlayback()
         } else {
             toggleB()
         }
+    }
+
+    @objc private func videoBTimelinePreviousFrame() {
+        adjustOffset(slot: .b, delta: -1)
+    }
+
+    @objc private func videoBTimelineNextFrame() {
+        adjustOffset(slot: .b, delta: 1)
     }
 
     @objc private func toggleA() {
@@ -900,6 +1018,10 @@ final class MainWindowController: NSWindowController {
 
     private func handleKey(_ event: NSEvent) -> Bool {
         switch event.keyCode {
+        case 53:
+            selectedSlot = nil
+            canvas.clearSelection()
+            return true
         case 48:
             guard canvas.layoutMode == .overlapToggle else { return false }
             canvas.toggleOverlapDisplay()
