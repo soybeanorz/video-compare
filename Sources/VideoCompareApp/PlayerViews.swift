@@ -162,19 +162,6 @@ final class VideoCanvasView: NSView {
             containerB.frame = NSRect(x: leftWidth + 1, y: oneLabel, width: max(0, b.width - leftWidth - 1), height: max(0, b.height - oneLabel))
             rectA = containerA.frame
             rectB = containerB.frame
-        case .sideBySideVertical:
-            let topHeight = floor(b.height / 2)
-            containerA.isHidden = false
-            containerB.isHidden = false
-            divider.isHidden = true
-            labelA.isHidden = false
-            labelB.isHidden = false
-            labelA.frame = NSRect(x: 0, y: 0, width: b.width, height: oneLabel)
-            containerA.frame = NSRect(x: 0, y: oneLabel, width: b.width, height: max(0, topHeight - oneLabel))
-            labelB.frame = NSRect(x: 0, y: topHeight + 1, width: b.width, height: oneLabel)
-            containerB.frame = NSRect(x: 0, y: topHeight + 1 + oneLabel, width: b.width, height: max(0, b.height - topHeight - 1 - oneLabel))
-            rectA = containerA.frame
-            rectB = containerB.frame
         case .overlapToggle:
             labelA.isHidden = !showingAInToggle
             labelB.isHidden = showingAInToggle
@@ -191,18 +178,18 @@ final class VideoCanvasView: NSView {
         case .overlapWipe:
             labelA.isHidden = false
             labelB.isHidden = false
-            labelB.alignment = .left
-            labelA.alignment = .right
-            labelB.frame = NSRect(x: 0, y: 0, width: floor(b.width / 2), height: oneLabel)
-            labelA.frame = NSRect(x: floor(b.width / 2), y: 0, width: ceil(b.width / 2), height: oneLabel)
+            labelA.alignment = .left
+            labelB.alignment = .right
+            labelA.frame = NSRect(x: 0, y: 0, width: floor(b.width / 2), height: oneLabel)
+            labelB.frame = NSRect(x: floor(b.width / 2), y: 0, width: ceil(b.width / 2), height: oneLabel)
             let content = NSRect(x: 0, y: oneLabel, width: b.width, height: max(0, b.height - oneLabel))
             let width = max(0, min(content.width, content.width * wipeFraction))
             let leftRect = NSRect(x: content.minX, y: content.minY, width: width, height: content.height)
             let rightRect = NSRect(x: content.minX + width, y: content.minY, width: max(0, content.width - width), height: content.height)
             containerA.isHidden = false
             containerB.isHidden = false
-            containerA.frame = rightRect
-            containerB.frame = leftRect
+            containerA.frame = leftRect
+            containerB.frame = rightRect
             divider.isHidden = false
             divider.frame = NSRect(x: content.minX + width - 12, y: content.minY, width: 24, height: content.height)
             rectA = content
@@ -307,9 +294,6 @@ final class VideoCanvasView: NSView {
         case .sideBySideHorizontal:
             if containerA.frame.contains(point) || labelA.frame.contains(point) { return .a }
             if containerB.frame.contains(point) || labelB.frame.contains(point) { return .b }
-        case .sideBySideVertical:
-            if containerA.frame.contains(point) || labelA.frame.contains(point) { return .a }
-            if containerB.frame.contains(point) || labelB.frame.contains(point) { return .b }
         case .overlapToggle:
             let content = activeContentBounds()
             if content.contains(point) || labelA.frame.contains(point) || labelB.frame.contains(point) {
@@ -318,7 +302,7 @@ final class VideoCanvasView: NSView {
         case .overlapWipe:
             let content = activeContentBounds()
             if content.contains(point) {
-                return point.x <= content.minX + content.width * wipeFraction ? .b : .a
+                return point.x <= content.minX + content.width * wipeFraction ? .a : .b
             }
             if labelA.frame.contains(point) { return .a }
             if labelB.frame.contains(point) { return .b }

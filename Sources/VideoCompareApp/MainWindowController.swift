@@ -293,41 +293,43 @@ final class MainWindowController: NSWindowController {
         let h = content.bounds.height
         let pad: CGFloat = 12
         let rowH: CGFloat = 28
-        var y = pad
+        let infoH: CGFloat = 20
+        let gap: CGFloat = 8
 
-        func place(_ view: NSView, x: CGFloat, width: CGFloat) {
+        func place(_ view: NSView, x: CGFloat, y: CGFloat, width: CGFloat) {
             view.frame = NSRect(x: x, y: y, width: width, height: rowH)
         }
 
-        let layoutWidth: CGFloat = 360
+        let layoutWidth: CGFloat = 300
         let zoomWidth: CGFloat = 58
         let resetWidth: CGFloat = 84
-        let gap: CGFloat = 8
         let groupWidth = layoutWidth + gap * 3 + zoomWidth * 2 + resetWidth
         let groupX = max(pad, floor((w - groupWidth) / 2))
-        place(layoutControl, x: groupX, width: layoutWidth)
-        place(zoomOutButton, x: groupX + layoutWidth + gap, width: zoomWidth)
-        place(zoomInButton, x: groupX + layoutWidth + gap * 2 + zoomWidth, width: zoomWidth)
-        place(resetTransformButton, x: groupX + layoutWidth + gap * 3 + zoomWidth * 2, width: resetWidth)
+        let toolbarY = max(pad, h - pad - rowH)
+        place(layoutControl, x: groupX, y: toolbarY, width: layoutWidth)
+        place(zoomOutButton, x: groupX + layoutWidth + gap, y: toolbarY, width: zoomWidth)
+        place(zoomInButton, x: groupX + layoutWidth + gap * 2 + zoomWidth, y: toolbarY, width: zoomWidth)
+        place(resetTransformButton, x: groupX + layoutWidth + gap * 3 + zoomWidth * 2, y: toolbarY, width: resetWidth)
 
-        y += rowH + 8
+        var y = pad
+        timeInfoLabel.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 2), height: infoH)
+
+        y += infoH + 2
         timeSlider.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 2), height: rowH)
 
-        y += rowH + 2
-        timeInfoLabel.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 2), height: 20)
-
-        y += 20 + 6
+        y += rowH + 6
         let halfWidth = floor((w - pad * 2 - gap) / 2)
-        videoASlider.frame = NSRect(x: pad, y: y, width: max(80, halfWidth), height: rowH)
         let bX = pad + halfWidth + gap
+        videoAInfoLabel.frame = NSRect(x: pad, y: y, width: max(80, halfWidth), height: infoH)
+        videoBInfoLabel.frame = NSRect(x: bX, y: y, width: max(80, halfWidth), height: infoH)
+
+        y += infoH + 2
+        videoASlider.frame = NSRect(x: pad, y: y, width: max(80, halfWidth), height: rowH)
         videoBSlider.frame = NSRect(x: bX, y: y, width: max(80, halfWidth), height: rowH)
 
-        y += rowH + 2
-        videoAInfoLabel.frame = NSRect(x: pad, y: y, width: max(80, halfWidth), height: 20)
-        videoBInfoLabel.frame = NSRect(x: bX, y: y, width: max(80, halfWidth), height: 20)
-
-        let top = y + 20 + pad
-        canvas.frame = NSRect(x: 0, y: top, width: w, height: max(100, h - top))
+        let canvasY = y + rowH + pad
+        let canvasTop = toolbarY - gap
+        canvas.frame = NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY))
     }
 
     @objc private func openA() { open(slot: .a) }
@@ -847,19 +849,24 @@ final class MainWindowController: NSWindowController {
     }
 
     private func togglePlaybackBySelection() {
-        if canvas.allowsAlignmentAdjustment {
-            toggleSynchronizedPlayback()
-            return
-        }
         switch selectedSlot {
         case .a:
-            stopSynchronizedBarrierPlayback()
-            playerA.togglePause()
+            toggleSelectedPlayback(selected: playerA, other: playerB)
         case .b:
-            stopSynchronizedBarrierPlayback()
-            playerB.togglePause()
+            toggleSelectedPlayback(selected: playerB, other: playerA)
         case nil:
             toggleSynchronizedPlayback()
+        }
+    }
+
+    private func toggleSelectedPlayback(selected: NativeVideoPlayer, other: NativeVideoPlayer) {
+        if isSynchronizedPlaying {
+            stopSynchronizedBarrierPlayback()
+            selected.setPause(true)
+            other.setPause(false)
+        } else {
+            stopSynchronizedBarrierPlayback()
+            selected.togglePause()
         }
     }
 

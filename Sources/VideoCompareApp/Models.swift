@@ -7,14 +7,12 @@ enum VideoSlot: String, Codable {
 
 enum CompareLayout: Int, CaseIterable {
     case sideBySideHorizontal = 0
-    case sideBySideVertical = 1
-    case overlapToggle = 2
-    case overlapWipe = 3
+    case overlapToggle = 1
+    case overlapWipe = 2
 
     var title: String {
         switch self {
         case .sideBySideHorizontal: "左右"
-        case .sideBySideVertical: "上下"
         case .overlapToggle: "点击切换"
         case .overlapWipe: "拖动遮罩"
         }

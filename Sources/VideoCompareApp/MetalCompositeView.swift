@@ -121,7 +121,7 @@ final class MetalCompositeView: MTKView {
         var uniforms = MetalVideoUniforms(viewportSize: viewport, fullRange: 0, bitDepth: 8)
 
         switch layoutMode {
-        case .sideBySideHorizontal, .sideBySideVertical:
+        case .sideBySideHorizontal:
             draw(slot: .a, appRect: scaledTopLeft(rectA, scale: scale), clip: scaledTopLeft(rectA, scale: scale), encoder: encoder, uniforms: &uniforms)
             draw(slot: .b, appRect: scaledTopLeft(rectB, scale: scale), clip: scaledTopLeft(rectB, scale: scale), encoder: encoder, uniforms: &uniforms)
         case .overlapToggle:
@@ -130,9 +130,9 @@ final class MetalCompositeView: MTKView {
             draw(slot: slot, appRect: rect, clip: rect, encoder: encoder, uniforms: &uniforms)
         case .overlapWipe:
             let full = scaledTopLeft(rectA, scale: scale)
-            draw(slot: .a, appRect: full, clip: full, encoder: encoder, uniforms: &uniforms)
+            draw(slot: .b, appRect: full, clip: full, encoder: encoder, uniforms: &uniforms)
             let clip = CGRect(x: full.minX, y: full.minY, width: full.width * max(0, min(1, wipeFraction)), height: full.height)
-            draw(slot: .b, appRect: full, clip: clip, encoder: encoder, uniforms: &uniforms)
+            draw(slot: .a, appRect: full, clip: clip, encoder: encoder, uniforms: &uniforms)
         }
 
         encoder.endEncoding()
@@ -155,7 +155,7 @@ final class MetalCompositeView: MTKView {
             visible = visibleB
         }
         guard visible, let pixelBuffer, appRect.width > 1, appRect.height > 1 else { return }
-        if layoutMode == .sideBySideHorizontal || layoutMode == .sideBySideVertical {
+        if layoutMode == .sideBySideHorizontal {
             transform = TransformState()
         }
 
