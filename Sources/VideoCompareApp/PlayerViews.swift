@@ -191,16 +191,18 @@ final class VideoCanvasView: NSView {
         case .overlapWipe:
             labelA.isHidden = false
             labelB.isHidden = false
-            labelA.alignment = .left
-            labelB.alignment = .right
-            labelA.frame = NSRect(x: 0, y: 0, width: floor(b.width / 2), height: oneLabel)
-            labelB.frame = NSRect(x: floor(b.width / 2), y: 0, width: ceil(b.width / 2), height: oneLabel)
+            labelB.alignment = .left
+            labelA.alignment = .right
+            labelB.frame = NSRect(x: 0, y: 0, width: floor(b.width / 2), height: oneLabel)
+            labelA.frame = NSRect(x: floor(b.width / 2), y: 0, width: ceil(b.width / 2), height: oneLabel)
             let content = NSRect(x: 0, y: oneLabel, width: b.width, height: max(0, b.height - oneLabel))
             let width = max(0, min(content.width, content.width * wipeFraction))
+            let leftRect = NSRect(x: content.minX, y: content.minY, width: width, height: content.height)
+            let rightRect = NSRect(x: content.minX + width, y: content.minY, width: max(0, content.width - width), height: content.height)
             containerA.isHidden = false
             containerB.isHidden = false
-            containerA.frame = content
-            containerB.frame = NSRect(x: content.minX, y: content.minY, width: width, height: content.height)
+            containerA.frame = rightRect
+            containerB.frame = leftRect
             divider.isHidden = false
             divider.frame = NSRect(x: content.minX + width - 12, y: content.minY, width: 24, height: content.height)
             rectA = content

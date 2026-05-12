@@ -50,6 +50,7 @@ final class MainWindowController: NSWindowController {
     private var isTrackingVideoBSlider = false
     private var pendingCoalescedSeek: Double?
     private var coalescedSeekScheduled = false
+    private var coalescedSeekGeneration = 0
     private var isSynchronizedPlaying = false
     private var synchronizedPlaybackToken = 0
     private var selectedSlot: VideoSlot? {
@@ -82,6 +83,9 @@ final class MainWindowController: NSWindowController {
         }
         window.onMouseDownInContent = { [weak self] point in
             self?.handleMouseDownInContent(point)
+        }
+        window.onScrollWheelInContent = { [weak self] event in
+            self?.handleScrollWheel(event) ?? false
         }
         setup()
     }
@@ -124,7 +128,7 @@ final class MainWindowController: NSWindowController {
             self?.saveState()
         }
         canvas.onToggleChanged = { [weak self] in
-            self?.seekVisibleToggleFrame()
+            self?.refreshStatus()
         }
         canvas.onSelectionChanged = { [weak self] slot in
             guard self?.selectedSlot != slot else { return }
@@ -307,20 +311,22 @@ final class MainWindowController: NSWindowController {
         place(resetTransformButton, x: groupX + layoutWidth + gap * 3 + zoomWidth * 2, width: resetWidth)
 
         y += rowH + 8
-        let infoWidth: CGFloat = min(360, max(240, w * 0.28))
-        timeSlider.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 3 - infoWidth), height: rowH)
-        timeInfoLabel.frame = NSRect(x: w - pad - infoWidth, y: y, width: infoWidth, height: rowH)
+        timeSlider.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 2), height: rowH)
 
-        y += rowH + 6
+        y += rowH + 2
+        timeInfoLabel.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 2), height: 20)
+
+        y += 20 + 6
         let halfWidth = floor((w - pad * 2 - gap) / 2)
-        let labelWidth: CGFloat = 150
-        videoAInfoLabel.frame = NSRect(x: pad, y: y, width: min(labelWidth, halfWidth * 0.45), height: rowH)
-        videoASlider.frame = NSRect(x: videoAInfoLabel.frame.maxX + gap, y: y, width: max(80, halfWidth - videoAInfoLabel.frame.width - gap), height: rowH)
+        videoASlider.frame = NSRect(x: pad, y: y, width: max(80, halfWidth), height: rowH)
         let bX = pad + halfWidth + gap
-        videoBInfoLabel.frame = NSRect(x: bX, y: y, width: min(labelWidth, halfWidth * 0.45), height: rowH)
-        videoBSlider.frame = NSRect(x: videoBInfoLabel.frame.maxX + gap, y: y, width: max(80, halfWidth - videoBInfoLabel.frame.width - gap), height: rowH)
+        videoBSlider.frame = NSRect(x: bX, y: y, width: max(80, halfWidth), height: rowH)
 
-        let top = y + rowH + pad
+        y += rowH + 2
+        videoAInfoLabel.frame = NSRect(x: pad, y: y, width: max(80, halfWidth), height: 20)
+        videoBInfoLabel.frame = NSRect(x: bX, y: y, width: max(80, halfWidth), height: 20)
+
+        let top = y + 20 + pad
         canvas.frame = NSRect(x: 0, y: top, width: w, height: max(100, h - top))
     }
 
@@ -416,11 +422,12 @@ final class MainWindowController: NSWindowController {
 
     private func adjustOffset(slot: VideoSlot, delta: Int) {
         pauseBothIfNeeded()
+        let base = baseTimeAnchoredOpposite(of: slot)
         switch slot {
         case .a: syncState.offsetFramesA += delta
         case .b: syncState.offsetFramesB += delta
         }
-        seekPlayersToCurrentBase()
+        seekToBaseTime(base)
         saveState()
         refreshStatus()
     }
@@ -452,18 +459,30 @@ final class MainWindowController: NSWindowController {
     }
 
     private func seekToBaseTime(_ base: Double, exact: Bool = true) {
-        let aTime = base + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
-        let bTime = base + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
-        if !exact && canvas.layoutMode == .overlapToggle {
-            if canvas.showingAInToggle {
-                display(playerA, at: aTime, exact: false)
-            } else {
-                display(playerB, at: bTime, exact: false)
-            }
-            return
-        }
+        let alignedBase = frameAlignedBaseTime(base)
+        let aTime = alignedBase + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
+        let bTime = alignedBase + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
         display(playerA, at: aTime, exact: exact)
         display(playerB, at: bTime, exact: exact)
+    }
+
+    private func baseTimeAnchoredOpposite(of slot: VideoSlot) -> Double {
+        switch slot {
+        case .a:
+            if playerB.fileURL != nil {
+                return max(0, playerB.timePosition - seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps))
+            }
+        case .b:
+            if playerA.fileURL != nil {
+                return max(0, playerA.timePosition - seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps))
+            }
+        }
+        return currentBaseTime()
+    }
+
+    private func frameAlignedBaseTime(_ base: Double) -> Double {
+        let fps = max(1, max(playerA.fps, playerB.fps))
+        return max(0, round(base * fps) / fps)
     }
 
     private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true) {
@@ -494,8 +513,10 @@ final class MainWindowController: NSWindowController {
         let duration = max(playerA.duration, playerB.duration)
         guard duration > 0 else { return }
         pauseBothIfNeeded()
-        let base = timeSlider.doubleValue * duration
+        let base = frameAlignedBaseTime(timeSlider.doubleValue * duration)
         if exact {
+            pendingCoalescedSeek = nil
+            coalescedSeekGeneration += 1
             seekToBaseTime(base, exact: true)
         } else {
             coalesceFastSeek(to: base)
@@ -504,10 +525,12 @@ final class MainWindowController: NSWindowController {
 
     private func coalesceFastSeek(to base: Double) {
         pendingCoalescedSeek = base
+        let generation = coalescedSeekGeneration
         guard !coalescedSeekScheduled else { return }
         coalescedSeekScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.033) {
             self.coalescedSeekScheduled = false
+            guard generation == self.coalescedSeekGeneration else { return }
             guard let base = self.pendingCoalescedSeek else { return }
             self.pendingCoalescedSeek = nil
             self.seekToBaseTime(base, exact: false)
@@ -657,8 +680,8 @@ final class MainWindowController: NSWindowController {
         }
         let base = currentBaseTime()
         timeInfoLabel.stringValue = "同步 \(formatTime(base)) / \(formatTime(duration))  F\(frameNumber(base, fps: playerA.fps))"
-        videoAInfoLabel.stringValue = "A \(formatTime(playerA.timePosition))  F\(frameNumber(playerA.timePosition, fps: playerA.fps))"
-        videoBInfoLabel.stringValue = "B \(formatTime(playerB.timePosition))  F\(frameNumber(playerB.timePosition, fps: playerB.fps))"
+        videoAInfoLabel.stringValue = "A \(formatTime(playerA.timePosition)) / \(formatTime(playerA.duration))  F\(frameNumber(playerA.timePosition, fps: playerA.fps))"
+        videoBInfoLabel.stringValue = "B \(formatTime(playerB.timePosition)) / \(formatTime(playerB.duration))  F\(frameNumber(playerB.timePosition, fps: playerB.fps))"
         updateEndVisibility()
     }
 
@@ -804,6 +827,23 @@ final class MainWindowController: NSWindowController {
         default:
             return false
         }
+    }
+
+    private func handleScrollWheel(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.command),
+              canvas.allowsAlignmentAdjustment,
+              let content = window?.contentView else { return false }
+        let point = content.convert(event.locationInWindow, from: nil)
+        guard canvas.frame.contains(point) else { return false }
+        let canvasPoint = canvas.convert(point, from: content)
+        let slot = selectedSlot ?? canvas.selectSlot(at: canvasPoint)
+        guard let slot else { return false }
+        selectedSlot = slot
+        let rawDelta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.deltaY
+        let dz = max(-0.25, min(0.25, Double(rawDelta) * 0.01))
+        adjustTransform(slot: slot, dx: 0, dy: 0, dz: dz)
+        saveState()
+        return true
     }
 
     private func togglePlaybackBySelection() {
