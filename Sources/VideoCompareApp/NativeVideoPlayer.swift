@@ -3,11 +3,15 @@ import CFFmpeg
 import CoreVideo
 import Foundation
 
-private final class PixelBufferBox: @unchecked Sendable {
+final class NativeVideoFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
+    let pts: Double
+    let duration: Double
 
-    init(_ pixelBuffer: CVPixelBuffer) {
+    init(pixelBuffer: CVPixelBuffer, pts: Double, duration: Double) {
         self.pixelBuffer = pixelBuffer
+        self.pts = pts
+        self.duration = duration
     }
 }
 
@@ -15,6 +19,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     let slot: VideoSlot
 
     private let queue: DispatchQueue
+    private let stateLock = NSLock()
     private var decoder: OpaquePointer?
     private var pendingSeek: (seconds: Double, exact: Bool)?
     private var isSeeking = false
@@ -91,20 +96,38 @@ final class NativeVideoPlayer: @unchecked Sendable {
         notifyStatus()
     }
 
+    func setSynchronizedPlaybackActive(_ active: Bool) {
+        playbackGeneration += 1
+        isPaused = !active
+        notifyStatus()
+    }
+
     func togglePause() {
         setPause(!isPaused)
     }
 
     func seekAbsolute(_ seconds: Double, exact: Bool = true) {
+        stateLock.lock()
+        pendingSeek = (max(0, seconds), exact)
+        guard !isSeeking else {
+            stateLock.unlock()
+            return
+        }
+        isSeeking = true
+        stateLock.unlock()
+
         queue.async {
-            self.pendingSeek = (max(0, seconds), exact)
-            guard !self.isSeeking else { return }
-            self.isSeeking = true
-            while let request = self.pendingSeek {
+            while true {
+                self.stateLock.lock()
+                guard let request = self.pendingSeek else {
+                    self.isSeeking = false
+                    self.stateLock.unlock()
+                    break
+                }
                 self.pendingSeek = nil
+                self.stateLock.unlock()
                 self.decodeSeek(seconds: request.seconds, exact: request.exact, publishStale: false)
             }
-            self.isSeeking = false
         }
     }
 
@@ -131,6 +154,36 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func queryPlaybackInfo() {
+        notifyStatus()
+    }
+
+    func decodeNextFrameForSynchronization(completion: @escaping (NativeVideoFrame?) -> Void) {
+        queue.async {
+            guard self.decoder != nil else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            var frame = VCDecodedFrame()
+            let result = vc_decoder_next(self.decoder, &frame)
+            guard result > 0, let unmanagedPixelBuffer = frame.pixelBuffer else {
+                vc_frame_release(&frame)
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let videoFrame = NativeVideoFrame(
+                pixelBuffer: unmanagedPixelBuffer.takeRetainedValue(),
+                pts: frame.pts,
+                duration: frame.duration
+            )
+            DispatchQueue.main.async {
+                completion(videoFrame)
+            }
+        }
+    }
+
+    func presentSynchronizedFrame(_ frame: NativeVideoFrame) {
+        timePosition = frame.pts
+        onFrameDecoded?(slot, frame.pixelBuffer, frame.pts)
         notifyStatus()
     }
 
@@ -174,12 +227,9 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     private func publish(frame: VCDecodedFrame, pixelBuffer: CVPixelBuffer) {
-        let pts = frame.pts
-        let box = PixelBufferBox(pixelBuffer)
+        let videoFrame = NativeVideoFrame(pixelBuffer: pixelBuffer, pts: frame.pts, duration: frame.duration)
         DispatchQueue.main.async {
-            self.timePosition = pts
-            self.onFrameDecoded?(self.slot, box.pixelBuffer, pts)
-            self.notifyStatus()
+            self.presentSynchronizedFrame(videoFrame)
         }
     }
 

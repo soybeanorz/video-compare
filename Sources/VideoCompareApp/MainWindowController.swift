@@ -34,6 +34,11 @@ final class MainWindowController: NSWindowController {
     private let resetTransformButton = NSButton(title: "重置对齐", target: nil, action: nil)
     private let clearStateButton = NSButton(title: "清理本组", target: nil, action: nil)
     private let timeSlider = ContinuousSeekSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let timeInfoLabel = NSTextField(labelWithString: "同步 00:00.000 / 00:00.000  F0")
+    private let videoASlider = ContinuousSeekSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let videoBSlider = ContinuousSeekSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let videoAInfoLabel = NSTextField(labelWithString: "A 00:00.000  F0")
+    private let videoBInfoLabel = NSTextField(labelWithString: "B 00:00.000  F0")
 
     private var syncState = SyncState()
     private var currentPair: VideoPairIdentity?
@@ -41,8 +46,12 @@ final class MainWindowController: NSWindowController {
     private let recentMenu = NSMenu(title: "最近视频组")
     private var statusRefreshPending = false
     private var isTrackingTimeSlider = false
+    private var isTrackingVideoASlider = false
+    private var isTrackingVideoBSlider = false
     private var pendingCoalescedSeek: Double?
     private var coalescedSeekScheduled = false
+    private var isSynchronizedPlaying = false
+    private var synchronizedPlaybackToken = 0
     private var selectedSlot: VideoSlot? {
         didSet {
             canvas.selectedSlot = selectedSlot
@@ -125,7 +134,9 @@ final class MainWindowController: NSWindowController {
         let controls = [
             layoutControl,
             zoomOutButton, zoomInButton, resetTransformButton,
-            timeSlider
+            timeSlider, timeInfoLabel,
+            videoAInfoLabel, videoASlider,
+            videoBInfoLabel, videoBSlider
         ] as [NSView]
         controls.forEach(content.addSubview)
         content.addSubview(canvas)
@@ -206,6 +217,34 @@ final class MainWindowController: NSWindowController {
                 self.seekToSliderPosition(exact: true)
             }
         }
+        videoASlider.target = self
+        videoASlider.action = #selector(videoASliderChanged)
+        videoASlider.isContinuous = true
+        videoASlider.onTrackingChanged = { [weak self] tracking in
+            guard let self else { return }
+            self.isTrackingVideoASlider = tracking
+            if !tracking {
+                self.seekIndividualVideo(slot: .a, exact: true)
+                self.saveState()
+            }
+        }
+        videoBSlider.target = self
+        videoBSlider.action = #selector(videoBSliderChanged)
+        videoBSlider.isContinuous = true
+        videoBSlider.onTrackingChanged = { [weak self] tracking in
+            guard let self else { return }
+            self.isTrackingVideoBSlider = tracking
+            if !tracking {
+                self.seekIndividualVideo(slot: .b, exact: true)
+                self.saveState()
+            }
+        }
+        for label in [timeInfoLabel, videoAInfoLabel, videoBInfoLabel] {
+            label.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            label.textColor = .secondaryLabelColor
+            label.alignment = .center
+            label.lineBreakMode = .byTruncatingMiddle
+        }
     }
 
     private func setupMenu() {
@@ -268,7 +307,18 @@ final class MainWindowController: NSWindowController {
         place(resetTransformButton, x: groupX + layoutWidth + gap * 3 + zoomWidth * 2, width: resetWidth)
 
         y += rowH + 8
-        timeSlider.frame = NSRect(x: pad, y: y, width: w - pad * 2, height: rowH)
+        let infoWidth: CGFloat = min(360, max(240, w * 0.28))
+        timeSlider.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 3 - infoWidth), height: rowH)
+        timeInfoLabel.frame = NSRect(x: w - pad - infoWidth, y: y, width: infoWidth, height: rowH)
+
+        y += rowH + 6
+        let halfWidth = floor((w - pad * 2 - gap) / 2)
+        let labelWidth: CGFloat = 150
+        videoAInfoLabel.frame = NSRect(x: pad, y: y, width: min(labelWidth, halfWidth * 0.45), height: rowH)
+        videoASlider.frame = NSRect(x: videoAInfoLabel.frame.maxX + gap, y: y, width: max(80, halfWidth - videoAInfoLabel.frame.width - gap), height: rowH)
+        let bX = pad + halfWidth + gap
+        videoBInfoLabel.frame = NSRect(x: bX, y: y, width: min(labelWidth, halfWidth * 0.45), height: rowH)
+        videoBSlider.frame = NSRect(x: videoBInfoLabel.frame.maxX + gap, y: y, width: max(80, halfWidth - videoBInfoLabel.frame.width - gap), height: rowH)
 
         let top = y + rowH + pad
         canvas.frame = NSRect(x: 0, y: top, width: w, height: max(100, h - top))
@@ -331,17 +381,30 @@ final class MainWindowController: NSWindowController {
     }
 
     @objc private func syncPlay() {
-        seekPlayersToCurrentBase()
-        playerA.setPause(false)
-        playerB.setPause(false)
+        startSynchronizedBarrierPlayback()
     }
 
     @objc private func syncPause() {
         pauseBothIfNeeded()
     }
 
-    @objc private func toggleA() { playerA.togglePause() }
-    @objc private func toggleB() { playerB.togglePause() }
+    @objc private func toggleA() {
+        guard !canvas.allowsAlignmentAdjustment else {
+            toggleSynchronizedPlayback()
+            return
+        }
+        stopSynchronizedBarrierPlayback()
+        playerA.togglePause()
+    }
+
+    @objc private func toggleB() {
+        guard !canvas.allowsAlignmentAdjustment else {
+            toggleSynchronizedPlayback()
+            return
+        }
+        stopSynchronizedBarrierPlayback()
+        playerB.togglePause()
+    }
 
     @objc private func prevFrame() { stepBySelection(-1) }
     @objc private func nextFrame() { stepBySelection(1) }
@@ -419,6 +482,14 @@ final class MainWindowController: NSWindowController {
         seekToSliderPosition(exact: !isTrackingTimeSlider)
     }
 
+    @objc private func videoASliderChanged() {
+        seekIndividualVideo(slot: .a, exact: !isTrackingVideoASlider)
+    }
+
+    @objc private func videoBSliderChanged() {
+        seekIndividualVideo(slot: .b, exact: !isTrackingVideoBSlider)
+    }
+
     private func seekToSliderPosition(exact: Bool) {
         let duration = max(playerA.duration, playerB.duration)
         guard duration > 0 else { return }
@@ -443,8 +514,47 @@ final class MainWindowController: NSWindowController {
         }
     }
 
-    @objc private func zoomOut() { adjustTransform(dx: 0, dy: 0, dz: -0.05) }
-    @objc private func zoomIn() { adjustTransform(dx: 0, dy: 0, dz: 0.05) }
+    private func seekIndividualVideo(slot: VideoSlot, exact: Bool) {
+        stopSynchronizedBarrierPlayback()
+        let player = slot == .a ? playerA! : playerB!
+        let slider = slot == .a ? videoASlider : videoBSlider
+        guard player.duration > 0 else { return }
+        if !player.isPaused {
+            player.setPause(true)
+        }
+        let targetTime = slider.doubleValue * player.duration
+        updateOffsetAfterIndividualSeek(slot: slot, targetTime: targetTime)
+        player.setVideoVisible(targetTime >= 0 && targetTime <= player.duration)
+        player.seekAbsolute(targetTime, exact: exact)
+        refreshStatus()
+    }
+
+    private func updateOffsetAfterIndividualSeek(slot: VideoSlot, targetTime: Double) {
+        switch slot {
+        case .a:
+            let base = playerB.fileURL != nil
+                ? playerB.timePosition - seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
+                : 0
+            syncState.offsetFramesA = Int(round((targetTime - base) * max(1, playerA.fps)))
+        case .b:
+            let base = playerA.fileURL != nil
+                ? playerA.timePosition - seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
+                : 0
+            syncState.offsetFramesB = Int(round((targetTime - base) * max(1, playerB.fps)))
+        }
+    }
+
+    @objc private func zoomOut() {
+        guard canvas.allowsAlignmentAdjustment else { return }
+        adjustTransform(dx: 0, dy: 0, dz: -0.05)
+        saveState()
+    }
+
+    @objc private func zoomIn() {
+        guard canvas.allowsAlignmentAdjustment else { return }
+        adjustTransform(dx: 0, dy: 0, dz: 0.05)
+        saveState()
+    }
 
     @objc private func toggleDisableSubtitles() {
         let value = !AppSettings.shared.disableSubtitles
@@ -539,12 +649,111 @@ final class MainWindowController: NSWindowController {
         if duration > 0 && !isTrackingTimeSlider {
             timeSlider.doubleValue = min(1, max(0, currentBaseTime() / duration))
         }
+        if playerA.duration > 0 && !isTrackingVideoASlider {
+            videoASlider.doubleValue = min(1, max(0, playerA.timePosition / playerA.duration))
+        }
+        if playerB.duration > 0 && !isTrackingVideoBSlider {
+            videoBSlider.doubleValue = min(1, max(0, playerB.timePosition / playerB.duration))
+        }
+        let base = currentBaseTime()
+        timeInfoLabel.stringValue = "同步 \(formatTime(base)) / \(formatTime(duration))  F\(frameNumber(base, fps: playerA.fps))"
+        videoAInfoLabel.stringValue = "A \(formatTime(playerA.timePosition))  F\(frameNumber(playerA.timePosition, fps: playerA.fps))"
+        videoBInfoLabel.stringValue = "B \(formatTime(playerB.timePosition))  F\(frameNumber(playerB.timePosition, fps: playerB.fps))"
         updateEndVisibility()
     }
 
+    private func formatTime(_ seconds: Double) -> String {
+        guard seconds.isFinite && seconds >= 0 else { return "00:00.000" }
+        let minutes = Int(seconds / 60)
+        let wholeSeconds = Int(seconds) % 60
+        let milliseconds = Int((seconds - floor(seconds)) * 1000)
+        return String(format: "%02d:%02d.%03d", minutes, wholeSeconds, milliseconds)
+    }
+
+    private func frameNumber(_ seconds: Double, fps: Double) -> Int {
+        max(0, Int(round(seconds * max(1, fps))))
+    }
+
     private func pauseBothIfNeeded() {
+        stopSynchronizedBarrierPlayback()
         if !playerA.isPaused { playerA.setPause(true) }
         if !playerB.isPaused { playerB.setPause(true) }
+    }
+
+    private func toggleSynchronizedPlayback() {
+        if isSynchronizedPlaying {
+            syncPause()
+        } else {
+            syncPlay()
+        }
+    }
+
+    private func startSynchronizedBarrierPlayback() {
+        guard playerA.fileURL != nil || playerB.fileURL != nil else { return }
+        if !playerA.isPaused { playerA.setPause(true) }
+        if !playerB.isPaused { playerB.setPause(true) }
+        isSynchronizedPlaying = true
+        synchronizedPlaybackToken += 1
+        let token = synchronizedPlaybackToken
+        playerA.setSynchronizedPlaybackActive(true)
+        playerB.setSynchronizedPlaybackActive(true)
+        scheduleSynchronizedFrame(token: token)
+    }
+
+    private func stopSynchronizedBarrierPlayback() {
+        guard isSynchronizedPlaying else { return }
+        isSynchronizedPlaying = false
+        synchronizedPlaybackToken += 1
+        playerA.setSynchronizedPlaybackActive(false)
+        playerB.setSynchronizedPlaybackActive(false)
+    }
+
+    private func scheduleSynchronizedFrame(token: Int) {
+        guard isSynchronizedPlaying, token == synchronizedPlaybackToken else { return }
+        let started = CACurrentMediaTime()
+        var frameA: NativeVideoFrame?
+        var frameB: NativeVideoFrame?
+        var callbacks = 0
+
+        func finishIfReady() {
+            callbacks += 1
+            guard callbacks == 2 else { return }
+            guard self.isSynchronizedPlaying, token == self.synchronizedPlaybackToken else { return }
+
+            if let frameA {
+                self.playerA.setVideoVisible(true)
+                self.playerA.presentSynchronizedFrame(frameA)
+            } else {
+                self.playerA.setVideoVisible(false)
+            }
+
+            if let frameB {
+                self.playerB.setVideoVisible(true)
+                self.playerB.presentSynchronizedFrame(frameB)
+            } else {
+                self.playerB.setVideoVisible(false)
+            }
+
+            if frameA == nil && frameB == nil {
+                self.stopSynchronizedBarrierPlayback()
+                return
+            }
+
+            let frameInterval = 1.0 / max(1, max(self.playerA.fps, self.playerB.fps))
+            let elapsed = CACurrentMediaTime() - started
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(0, frameInterval - elapsed)) {
+                self.scheduleSynchronizedFrame(token: token)
+            }
+        }
+
+        playerA.decodeNextFrameForSynchronization { frame in
+            frameA = frame
+            finishIfReady()
+        }
+        playerB.decodeNextFrameForSynchronization { frame in
+            frameB = frame
+            finishIfReady()
+        }
     }
 
     private func updateEndVisibility() {
@@ -598,17 +807,19 @@ final class MainWindowController: NSWindowController {
     }
 
     private func togglePlaybackBySelection() {
+        if canvas.allowsAlignmentAdjustment {
+            toggleSynchronizedPlayback()
+            return
+        }
         switch selectedSlot {
         case .a:
+            stopSynchronizedBarrierPlayback()
             playerA.togglePause()
         case .b:
+            stopSynchronizedBarrierPlayback()
             playerB.togglePause()
         case nil:
-            if playerA.isPaused && playerB.isPaused {
-                syncPlay()
-            } else {
-                syncPause()
-            }
+            toggleSynchronizedPlayback()
         }
     }
 
@@ -617,7 +828,18 @@ final class MainWindowController: NSWindowController {
         if canvas.frame.contains(point) {
             let canvasPoint = canvas.convert(point, from: content)
             selectedSlot = canvas.selectSlot(at: canvasPoint)
-        } else if [layoutControl, zoomOutButton, zoomInButton, resetTransformButton].contains(where: { $0.frame.contains(point) }) {
+        } else if [
+            layoutControl,
+            zoomOutButton,
+            zoomInButton,
+            resetTransformButton,
+            timeSlider,
+            timeInfoLabel,
+            videoAInfoLabel,
+            videoASlider,
+            videoBInfoLabel,
+            videoBSlider
+        ].contains(where: { $0.frame.contains(point) }) {
             return
         } else {
             selectedSlot = nil

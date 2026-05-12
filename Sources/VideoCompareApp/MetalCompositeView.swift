@@ -142,7 +142,7 @@ final class MetalCompositeView: MTKView {
 
     private func draw(slot: VideoSlot, appRect: CGRect, clip: CGRect, encoder: MTLRenderCommandEncoder, uniforms: inout MetalVideoUniforms) {
         let pixelBuffer: CVPixelBuffer?
-        let transform: TransformState
+        var transform: TransformState
         let visible: Bool
         switch slot {
         case .a:
@@ -155,6 +155,9 @@ final class MetalCompositeView: MTKView {
             visible = visibleB
         }
         guard visible, let pixelBuffer, appRect.width > 1, appRect.height > 1 else { return }
+        if layoutMode == .sideBySideHorizontal || layoutMode == .sideBySideVertical {
+            transform = TransformState()
+        }
 
         let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
         let sourceWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
