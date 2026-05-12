@@ -12,6 +12,68 @@ final class ContinuousSeekSlider: NSSlider {
     }
 }
 
+final class TimelineControl: NSView {
+    let playButton = NSButton(title: "▶", target: nil, action: nil)
+    let slider = ContinuousSeekSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let currentLabel = NSTextField(labelWithString: "00:00")
+    private let durationLabel = NSTextField(labelWithString: "00:00")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 0.78).cgColor
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+
+        playButton.isBordered = false
+        playButton.font = NSFont.systemFont(ofSize: 28, weight: .semibold)
+        playButton.contentTintColor = .white
+
+        slider.isContinuous = true
+
+        for label in [currentLabel, durationLabel] {
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+            label.textColor = NSColor(calibratedWhite: 0.92, alpha: 1)
+            label.backgroundColor = .clear
+            label.drawsBackground = false
+        }
+        currentLabel.alignment = .left
+        durationLabel.alignment = .right
+
+        addSubview(playButton)
+        addSubview(slider)
+        addSubview(currentLabel)
+        addSubview(durationLabel)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        let pad: CGFloat = 14
+        let buttonSize: CGFloat = 44
+        playButton.frame = NSRect(x: floor((bounds.width - buttonSize) / 2), y: 4, width: buttonSize, height: buttonSize)
+        let labelY: CGFloat = bounds.height - 30
+        let labelW: CGFloat = 72
+        currentLabel.frame = NSRect(x: pad, y: labelY, width: labelW, height: 22)
+        durationLabel.frame = NSRect(x: bounds.width - pad - labelW, y: labelY, width: labelW, height: 22)
+        slider.frame = NSRect(x: pad + labelW + 10, y: labelY - 2, width: max(80, bounds.width - (pad + labelW + 10) * 2), height: 24)
+    }
+
+    func setTime(current: String, duration: String) {
+        currentLabel.stringValue = current
+        durationLabel.stringValue = duration
+    }
+
+    func setPlaying(_ playing: Bool) {
+        playButton.title = playing ? "⏸" : "▶"
+    }
+}
+
 final class MainWindowController: NSWindowController {
     private let canvas = VideoCanvasView()
     private var playerA: NativeVideoPlayer!
@@ -29,16 +91,13 @@ final class MainWindowController: NSWindowController {
     private let offsetBMinus = NSButton(title: "B 偏移 -1f", target: nil, action: nil)
     private let offsetBPlus = NSButton(title: "B 偏移 +1f", target: nil, action: nil)
     private let targetControl = NSSegmentedControl(labels: ["调 A", "调 B"], trackingMode: .selectOne, target: nil, action: nil)
-    private let zoomOutButton = NSButton(title: "缩小", target: nil, action: nil)
-    private let zoomInButton = NSButton(title: "放大", target: nil, action: nil)
-    private let resetTransformButton = NSButton(title: "重置对齐", target: nil, action: nil)
     private let clearStateButton = NSButton(title: "清理本组", target: nil, action: nil)
-    private let timeSlider = ContinuousSeekSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
-    private let timeInfoLabel = NSTextField(labelWithString: "同步 00:00.000 / 00:00.000  F0")
-    private let videoASlider = ContinuousSeekSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
-    private let videoBSlider = ContinuousSeekSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
-    private let videoAInfoLabel = NSTextField(labelWithString: "A 00:00.000  F0")
-    private let videoBInfoLabel = NSTextField(labelWithString: "B 00:00.000  F0")
+    private let syncTimeline = TimelineControl()
+    private let videoATimeline = TimelineControl()
+    private let videoBTimeline = TimelineControl()
+    private var timeSlider: ContinuousSeekSlider { syncTimeline.slider }
+    private var videoASlider: ContinuousSeekSlider { videoATimeline.slider }
+    private var videoBSlider: ContinuousSeekSlider { videoBTimeline.slider }
 
     private var syncState = SyncState()
     private var currentPair: VideoPairIdentity?
@@ -137,13 +196,12 @@ final class MainWindowController: NSWindowController {
 
         let controls = [
             layoutControl,
-            zoomOutButton, zoomInButton, resetTransformButton,
-            timeSlider, timeInfoLabel,
-            videoAInfoLabel, videoASlider,
-            videoBInfoLabel, videoBSlider
+            syncTimeline,
+            videoATimeline,
+            videoBTimeline
         ] as [NSView]
-        controls.forEach(content.addSubview)
         content.addSubview(canvas)
+        controls.forEach(content.addSubview)
 
         setupMenu()
         configureControls()
@@ -186,8 +244,7 @@ final class MainWindowController: NSWindowController {
     private func configureControls() {
         for button in [syncPlayButton, syncPauseButton, prevFrameButton, nextFrameButton,
                        playAButton, playBButton, offsetAMinus, offsetAPlus, offsetBMinus, offsetBPlus,
-                       zoomOutButton, zoomInButton,
-                       resetTransformButton, clearStateButton] {
+                       clearStateButton] {
             button.bezelStyle = .rounded
             button.target = self
         }
@@ -202,10 +259,13 @@ final class MainWindowController: NSWindowController {
         offsetAPlus.action = #selector(offsetAPlusFrame)
         offsetBMinus.action = #selector(offsetBMinusFrame)
         offsetBPlus.action = #selector(offsetBPlusFrame)
-        zoomOutButton.action = #selector(zoomOut)
-        zoomInButton.action = #selector(zoomIn)
-        resetTransformButton.action = #selector(resetTransform)
         clearStateButton.action = #selector(clearCurrentState)
+        syncTimeline.playButton.target = self
+        syncTimeline.playButton.action = #selector(toggleSyncTimelinePlayback)
+        videoATimeline.playButton.target = self
+        videoATimeline.playButton.action = #selector(toggleVideoATimelinePlayback)
+        videoBTimeline.playButton.target = self
+        videoBTimeline.playButton.action = #selector(toggleVideoBTimelinePlayback)
 
         layoutControl.target = self
         layoutControl.action = #selector(layoutChanged)
@@ -242,12 +302,6 @@ final class MainWindowController: NSWindowController {
                 self.seekIndividualVideo(slot: .b, exact: true)
                 self.saveState()
             }
-        }
-        for label in [timeInfoLabel, videoAInfoLabel, videoBInfoLabel] {
-            label.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-            label.textColor = .secondaryLabelColor
-            label.alignment = .center
-            label.lineBreakMode = .byTruncatingMiddle
         }
     }
 
@@ -293,7 +347,6 @@ final class MainWindowController: NSWindowController {
         let h = content.bounds.height
         let pad: CGFloat = 12
         let rowH: CGFloat = 28
-        let infoH: CGFloat = 20
         let gap: CGFloat = 8
 
         func place(_ view: NSView, x: CGFloat, y: CGFloat, width: CGFloat) {
@@ -301,35 +354,39 @@ final class MainWindowController: NSWindowController {
         }
 
         let layoutWidth: CGFloat = 300
-        let zoomWidth: CGFloat = 58
-        let resetWidth: CGFloat = 84
-        let groupWidth = layoutWidth + gap * 3 + zoomWidth * 2 + resetWidth
-        let groupX = max(pad, floor((w - groupWidth) / 2))
+        let groupX = max(pad, floor((w - layoutWidth) / 2))
         let toolbarY = max(pad, h - pad - rowH)
         place(layoutControl, x: groupX, y: toolbarY, width: layoutWidth)
-        place(zoomOutButton, x: groupX + layoutWidth + gap, y: toolbarY, width: zoomWidth)
-        place(zoomInButton, x: groupX + layoutWidth + gap * 2 + zoomWidth, y: toolbarY, width: zoomWidth)
-        place(resetTransformButton, x: groupX + layoutWidth + gap * 3 + zoomWidth * 2, y: toolbarY, width: resetWidth)
 
-        var y = pad
-        timeInfoLabel.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 2), height: infoH)
+        syncTimeline.frame = NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78)
 
-        y += infoH + 2
-        timeSlider.frame = NSRect(x: pad, y: y, width: max(100, w - pad * 2), height: rowH)
-
-        y += rowH + 6
-        let halfWidth = floor((w - pad * 2 - gap) / 2)
-        let bX = pad + halfWidth + gap
-        videoAInfoLabel.frame = NSRect(x: pad, y: y, width: max(80, halfWidth), height: infoH)
-        videoBInfoLabel.frame = NSRect(x: bX, y: y, width: max(80, halfWidth), height: infoH)
-
-        y += infoH + 2
-        videoASlider.frame = NSRect(x: pad, y: y, width: max(80, halfWidth), height: rowH)
-        videoBSlider.frame = NSRect(x: bX, y: y, width: max(80, halfWidth), height: rowH)
-
-        let canvasY = y + rowH + pad
+        let canvasY = syncTimeline.frame.maxY + gap
         let canvasTop = toolbarY - gap
         canvas.frame = NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY))
+        canvas.layoutSubtreeIfNeeded()
+        layoutVideoTimeline(videoATimeline, over: canvas.containerA.frame, hidden: canvas.containerA.isHidden, in: content)
+        layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: canvas.containerB.isHidden, in: content)
+    }
+
+    private func layoutVideoTimeline(_ timeline: TimelineControl, over canvasRect: NSRect, hidden: Bool, in content: NSView) {
+        guard !hidden else {
+            timeline.isHidden = true
+            return
+        }
+        let rect = canvas.convert(canvasRect, to: content)
+        guard !rect.isEmpty, rect.width > 120, rect.height > 90 else {
+            timeline.isHidden = true
+            return
+        }
+        timeline.isHidden = false
+        let pad: CGFloat = 14
+        let width = min(rect.width - pad * 2, max(260, rect.width * 0.72))
+        timeline.frame = NSRect(
+            x: rect.midX - width / 2,
+            y: rect.minY + pad,
+            width: width,
+            height: 72
+        )
     }
 
     @objc private func openA() { open(slot: .a) }
@@ -394,6 +451,26 @@ final class MainWindowController: NSWindowController {
 
     @objc private func syncPause() {
         pauseBothIfNeeded()
+    }
+
+    @objc private func toggleSyncTimelinePlayback() {
+        toggleSynchronizedPlayback()
+    }
+
+    @objc private func toggleVideoATimelinePlayback() {
+        if canvas.allowsAlignmentAdjustment {
+            toggleSynchronizedPlayback()
+        } else {
+            toggleA()
+        }
+    }
+
+    @objc private func toggleVideoBTimelinePlayback() {
+        if canvas.allowsAlignmentAdjustment {
+            toggleSynchronizedPlayback()
+        } else {
+            toggleB()
+        }
     }
 
     @objc private func toggleA() {
@@ -681,10 +758,20 @@ final class MainWindowController: NSWindowController {
             videoBSlider.doubleValue = min(1, max(0, playerB.timePosition / playerB.duration))
         }
         let base = currentBaseTime()
-        timeInfoLabel.stringValue = "同步 \(formatTime(base)) / \(formatTime(duration))  F\(frameNumber(base, fps: playerA.fps))"
-        videoAInfoLabel.stringValue = "A \(formatTime(playerA.timePosition)) / \(formatTime(playerA.duration))  F\(frameNumber(playerA.timePosition, fps: playerA.fps))"
-        videoBInfoLabel.stringValue = "B \(formatTime(playerB.timePosition)) / \(formatTime(playerB.duration))  F\(frameNumber(playerB.timePosition, fps: playerB.fps))"
+        syncTimeline.setTime(current: formatShortTime(base), duration: formatShortTime(duration))
+        videoATimeline.setTime(current: formatShortTime(playerA.timePosition), duration: formatShortTime(playerA.duration))
+        videoBTimeline.setTime(current: formatShortTime(playerB.timePosition), duration: formatShortTime(playerB.duration))
+        let synchronizedPlaying = isSynchronizedPlaying || (!playerA.isPaused && !playerB.isPaused)
+        syncTimeline.setPlaying(synchronizedPlaying)
+        videoATimeline.setPlaying(canvas.allowsAlignmentAdjustment ? synchronizedPlaying : !playerA.isPaused)
+        videoBTimeline.setPlaying(canvas.allowsAlignmentAdjustment ? synchronizedPlaying : !playerB.isPaused)
         updateEndVisibility()
+    }
+
+    private func formatShortTime(_ seconds: Double) -> String {
+        guard seconds.isFinite && seconds >= 0 else { return "00:00" }
+        let totalSeconds = Int(seconds.rounded(.down))
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
     }
 
     private func formatTime(_ seconds: Double) -> String {
@@ -849,6 +936,10 @@ final class MainWindowController: NSWindowController {
     }
 
     private func togglePlaybackBySelection() {
+        if canvas.allowsAlignmentAdjustment {
+            toggleSynchronizedPlayback()
+            return
+        }
         switch selectedSlot {
         case .a:
             toggleSelectedPlayback(selected: playerA, other: playerB)
@@ -877,15 +968,9 @@ final class MainWindowController: NSWindowController {
             selectedSlot = canvas.selectSlot(at: canvasPoint)
         } else if [
             layoutControl,
-            zoomOutButton,
-            zoomInButton,
-            resetTransformButton,
-            timeSlider,
-            timeInfoLabel,
-            videoAInfoLabel,
-            videoASlider,
-            videoBInfoLabel,
-            videoBSlider
+            syncTimeline,
+            videoATimeline,
+            videoBTimeline
         ].contains(where: { $0.frame.contains(point) }) {
             return
         } else {
