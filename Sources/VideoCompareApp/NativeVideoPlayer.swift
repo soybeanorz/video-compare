@@ -16,6 +16,20 @@ final class NativeVideoFrame: @unchecked Sendable {
     }
 }
 
+private final class SeekCancelToken: @unchecked Sendable {
+    let pointer: UnsafeMutablePointer<Int32>
+
+    init() {
+        pointer = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        pointer.initialize(to: 0)
+    }
+
+    deinit {
+        pointer.deinitialize(count: 1)
+        pointer.deallocate()
+    }
+}
+
 final class NativeVideoPlayer: @unchecked Sendable {
     let slot: VideoSlot
 
@@ -25,7 +39,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private var pendingSeek: (seconds: Double, exact: Bool, generation: Int)?
     private var isSeeking = false
     private var seekGeneration = 0
-    private let seekCancelGeneration = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+    private let seekCancelToken = SeekCancelToken()
     private var playbackGeneration = 0
     private var visible = true
     private var frameHistory: [NativeVideoFrame] = []
@@ -48,21 +62,16 @@ final class NativeVideoPlayer: @unchecked Sendable {
     init(slot: VideoSlot) {
         self.slot = slot
         self.queue = DispatchQueue(label: "VideoCompare.native.decode.\(slot.rawValue)", qos: .userInitiated)
-        seekCancelGeneration.initialize(to: 0)
     }
 
     deinit {
         let decoder = self.decoder
         self.decoder = nil
-        seekCancelGeneration.pointee = Int32.max
-        let cancelGeneration = seekCancelGeneration
+        seekCancelToken.pointer.pointee = Int32.max
         if let decoder {
             queue.async {
                 vc_decoder_close(decoder)
-                cancelGeneration.deallocate()
             }
-        } else {
-            cancelGeneration.deallocate()
         }
     }
 
@@ -101,7 +110,8 @@ final class NativeVideoPlayer: @unchecked Sendable {
             self.decoder = opened
             let duration = vc_decoder_duration(opened)
             let fps = vc_decoder_fps(opened)
-            Diagnostics.log("player.\(self.slot.rawValue).opened duration=\(String(format: "%.6f", duration)) fps=\(String(format: "%.6f", fps))")
+            let keyframes = vc_decoder_keyframe_count(opened)
+            Diagnostics.log("player.\(self.slot.rawValue).opened duration=\(String(format: "%.6f", duration)) fps=\(String(format: "%.6f", fps)) keyframes=\(keyframes)")
             DispatchQueue.main.async {
                 self.duration = duration
                 self.fps = fps > 1 ? fps : 60
@@ -137,7 +147,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
         stateLock.lock()
         seekGeneration += 1
         let generation = seekGeneration
-        seekCancelGeneration.pointee = Int32(generation)
+        seekCancelToken.pointer.pointee = Int32(generation)
         if exact, Thread.isMainThread, let cached = cachedFrame(at: seconds) {
             pendingSeek = nil
             stateLock.unlock()
@@ -347,6 +357,25 @@ final class NativeVideoPlayer: @unchecked Sendable {
         max(0, Int(round(seconds * max(1, fps))))
     }
 
+    private func cacheDecodedFrame(_ frame: VCDecodedFrame) {
+        guard let unmanagedPixelBuffer = frame.pixelBuffer else { return }
+        let pixelBuffer = unmanagedPixelBuffer.retain().takeRetainedValue()
+        let videoFrame = NativeVideoFrame(
+            pixelBuffer: pixelBuffer,
+            pts: frame.pts,
+            duration: frame.duration
+        )
+        DispatchQueue.main.async {
+            self.cache(videoFrame)
+        }
+    }
+
+    private static let cacheDecodedFrameCallback: VCFrameCallback = { frame, context in
+        guard let frame, let context else { return }
+        let player = Unmanaged<NativeVideoPlayer>.fromOpaque(context).takeUnretainedValue()
+        player.cacheDecodedFrame(frame.pointee)
+    }
+
     private func startPlaybackLoop() {
         playbackGeneration += 1
         let generation = playbackGeneration
@@ -379,7 +408,16 @@ final class NativeVideoPlayer: @unchecked Sendable {
         let started = CACurrentMediaTime()
         let result: Int32
         if let seekGeneration {
-            result = vc_decoder_seek_cancelable(decoder, seconds, exact ? 1 : 0, &frame, seekCancelGeneration, Int32(seekGeneration))
+            result = vc_decoder_seek_collect(
+                decoder,
+                seconds,
+                exact ? 1 : 0,
+                &frame,
+                seekCancelToken.pointer,
+                Int32(seekGeneration),
+                exact ? NativeVideoPlayer.cacheDecodedFrameCallback : nil,
+                Unmanaged.passUnretained(self).toOpaque()
+            )
         } else {
             result = vc_decoder_seek(decoder, seconds, exact ? 1 : 0, &frame)
         }

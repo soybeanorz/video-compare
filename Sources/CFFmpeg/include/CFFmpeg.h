@@ -16,6 +16,8 @@ typedef struct VCDecodedFrame {
     int height;
 } VCDecodedFrame;
 
+typedef void (*VCFrameCallback)(const VCDecodedFrame *frame, void *context);
+
 VCDecoder *vc_decoder_open(const char *path, char *error, int error_len);
 void vc_decoder_close(VCDecoder *decoder);
 
@@ -23,9 +25,12 @@ double vc_decoder_duration(VCDecoder *decoder);
 double vc_decoder_fps(VCDecoder *decoder);
 int vc_decoder_width(VCDecoder *decoder);
 int vc_decoder_height(VCDecoder *decoder);
+int vc_decoder_keyframe_count(VCDecoder *decoder);
+double vc_decoder_keyframe_before(VCDecoder *decoder, double seconds);
 
 int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame);
 int vc_decoder_seek_cancelable(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame, volatile int *seek_generation, int generation);
+int vc_decoder_seek_collect(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame, volatile int *seek_generation, int generation, VCFrameCallback callback, void *context);
 int vc_decoder_next(VCDecoder *decoder, VCDecodedFrame *out_frame);
 void vc_frame_release(VCDecodedFrame *frame);
 

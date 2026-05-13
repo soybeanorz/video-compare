@@ -25,6 +25,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         controller.runSeekStress()
                     }
                 }
+                if LaunchArguments.scrubBenchmark {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        controller.runScrubBenchmark()
+                    }
+                }
             }
         }
     }
@@ -55,6 +60,10 @@ private enum LaunchArguments {
 
     static var seekStress: Bool {
         CommandLine.arguments.contains("--seek-stress")
+    }
+
+    static var scrubBenchmark: Bool {
+        CommandLine.arguments.contains("--scrub-benchmark")
     }
 }
 
