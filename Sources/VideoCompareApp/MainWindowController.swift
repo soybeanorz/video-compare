@@ -231,6 +231,19 @@ final class MainWindowController: NSWindowController {
     private let syncTimeline = TimelineControl()
     private let videoATimeline = TimelineControl()
     private let videoBTimeline = TimelineControl()
+    private let helpButton = NSButton(title: "?", target: nil, action: nil)
+    private let shortcutHelpPanel = NSView()
+    private let shortcutHelpLabel = NSTextField(labelWithString: """
+    - 1 / 2: 选择视频 A / B
+    - Cmd+1 / Cmd+2: 切换左右对比 / 拖动遮罩
+    - Tab: 拖动遮罩分界线切到最左或最右
+    - ← / →: 未选中时同步逐帧；选中 A/B 时只调整该视频
+    - Space: 未选中时同步播放/暂停；选中 A/B 时按当前模式控制播放
+    - Esc: 取消当前选中
+    - Cmd+滚轮: 未选中时同步缩放；选中 A/B 时只缩放选中视频
+    - Cmd+拖动同步进度条: 创建循环片段
+    - 右键循环片段: 取消循环
+    """)
     private var timeSlider: ContinuousSeekSlider { syncTimeline.slider }
     private var videoASlider: ContinuousSeekSlider { videoATimeline.slider }
     private var videoBSlider: ContinuousSeekSlider { videoBTimeline.slider }
@@ -335,6 +348,8 @@ final class MainWindowController: NSWindowController {
 
         let controls = [
             layoutControl,
+            helpButton,
+            shortcutHelpPanel,
             syncTimeline,
             videoATimeline,
             videoBTimeline
@@ -344,6 +359,7 @@ final class MainWindowController: NSWindowController {
 
         setupMenu()
         configureControls()
+        configureShortcutHelp()
         refreshRecentMenu()
         layoutControl.selectedSegment = CompareLayout.sideBySideHorizontal.rawValue
         selectedSlot = nil
@@ -462,6 +478,38 @@ final class MainWindowController: NSWindowController {
         }
     }
 
+    private func configureShortcutHelp() {
+        helpButton.target = self
+        helpButton.action = #selector(toggleShortcutHelp)
+        helpButton.isBordered = false
+        helpButton.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+        helpButton.contentTintColor = .labelColor
+        helpButton.wantsLayer = true
+        helpButton.layer?.cornerRadius = 13
+        helpButton.layer?.borderWidth = 1
+        helpButton.layer?.borderColor = NSColor.separatorColor.cgColor
+        helpButton.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+
+        shortcutHelpPanel.wantsLayer = true
+        shortcutHelpPanel.layer?.cornerRadius = 8
+        shortcutHelpPanel.layer?.backgroundColor = NSColor(calibratedWhite: 0.06, alpha: 0.92).cgColor
+        shortcutHelpPanel.layer?.borderWidth = 1
+        shortcutHelpPanel.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.16).cgColor
+        shortcutHelpPanel.isHidden = true
+
+        shortcutHelpLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        shortcutHelpLabel.textColor = NSColor(calibratedWhite: 0.94, alpha: 1)
+        shortcutHelpLabel.backgroundColor = .clear
+        shortcutHelpLabel.drawsBackground = false
+        shortcutHelpLabel.lineBreakMode = .byWordWrapping
+        shortcutHelpLabel.maximumNumberOfLines = 0
+        shortcutHelpPanel.addSubview(shortcutHelpLabel)
+    }
+
+    @objc private func toggleShortcutHelp() {
+        shortcutHelpPanel.isHidden.toggle()
+    }
+
     private func setupMenu() {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
@@ -515,6 +563,17 @@ final class MainWindowController: NSWindowController {
         let groupX = max(pad, floor((w - layoutWidth) / 2))
         let toolbarY = max(pad, h - pad - rowH)
         place(layoutControl, x: groupX, y: toolbarY, width: layoutWidth)
+        helpButton.frame = NSRect(x: w - pad - 26, y: toolbarY + 1, width: 26, height: 26)
+
+        let helpW: CGFloat = 420
+        let helpH: CGFloat = 214
+        shortcutHelpPanel.frame = NSRect(
+            x: max(pad, w - pad - helpW),
+            y: max(pad, toolbarY - helpH - 8),
+            width: min(helpW, w - pad * 2),
+            height: helpH
+        )
+        shortcutHelpLabel.frame = shortcutHelpPanel.bounds.insetBy(dx: 14, dy: 12)
 
         syncTimeline.frame = NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78)
 
@@ -1280,13 +1339,14 @@ final class MainWindowController: NSWindowController {
               let content = window?.contentView else { return false }
         let point = content.convert(event.locationInWindow, from: nil)
         guard canvas.frame.contains(point) else { return false }
-        let canvasPoint = canvas.convert(point, from: content)
-        let slot = selectedSlot ?? canvas.selectSlot(at: canvasPoint)
-        guard let slot else { return false }
-        selectedSlot = slot
         let rawDelta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.deltaY
         let dz = max(-0.25, min(0.25, Double(rawDelta) * 0.01))
-        adjustTransform(slot: slot, dx: 0, dy: 0, dz: dz)
+        if let selectedSlot {
+            adjustTransform(slot: selectedSlot, dx: 0, dy: 0, dz: dz)
+        } else {
+            adjustTransform(slot: .a, dx: 0, dy: 0, dz: dz)
+            adjustTransform(slot: .b, dx: 0, dy: 0, dz: dz)
+        }
         return true
     }
 
