@@ -12,10 +12,9 @@ enum Diagnostics {
     }()
 
     static func log(_ message: String) {
+        guard enabled else { return }
         let line = "[VideoCompare] \(String(format: "%.3f", Date().timeIntervalSince1970)) \(message)\n"
-        if enabled {
-            FileHandle.standardError.write(Data(line.utf8))
-        }
+        FileHandle.standardError.write(Data(line.utf8))
         lock.lock()
         defer { lock.unlock() }
         do {
@@ -31,9 +30,7 @@ enum Diagnostics {
             try handle.write(contentsOf: Data(line.utf8))
             try handle.close()
         } catch {
-            if enabled {
-                FileHandle.standardError.write(Data("[VideoCompare] log write failed: \(error)\n".utf8))
-            }
+            FileHandle.standardError.write(Data("[VideoCompare] log write failed: \(error)\n".utf8))
         }
     }
 }

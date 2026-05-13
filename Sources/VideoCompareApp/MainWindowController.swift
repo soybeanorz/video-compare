@@ -254,6 +254,9 @@ final class MainWindowController: NSWindowController {
     private var disableSubtitlesMenuItem: NSMenuItem?
     private let recentMenu = NSMenu(title: "最近视频组")
     private var statusRefreshPending = false
+    private let syncScrub = ScrubSeekCoordinator()
+    private let videoAScrub = ScrubSeekCoordinator()
+    private let videoBScrub = ScrubSeekCoordinator()
     private var isTrackingTimeSlider = false
     private var isTrackingVideoASlider = false
     private var isTrackingVideoBSlider = false
@@ -303,6 +306,39 @@ final class MainWindowController: NSWindowController {
         super.windowDidLoad()
     }
 
+    private func configureScrubCoordinators() {
+        syncScrub.onSeek = { [weak self] seconds, exact in
+            guard let self else { return }
+            self.pauseBothIfNeeded()
+            self.seekToBaseTime(seconds, exact: exact)
+        }
+        syncScrub.isDecoderIdle = { [weak self] in
+            guard let self else { return true }
+            return self.playerA.isSeekIdle && self.playerB.isSeekIdle
+        }
+
+        videoAScrub.onSeek = { [weak self] seconds, exact in
+            self?.seekIndividualVideo(slot: .a, targetTime: seconds, exact: exact)
+        }
+        videoAScrub.isDecoderIdle = { [weak self] in
+            self?.playerA.isSeekIdle ?? true
+        }
+
+        videoBScrub.onSeek = { [weak self] seconds, exact in
+            self?.seekIndividualVideo(slot: .b, targetTime: seconds, exact: exact)
+        }
+        videoBScrub.isDecoderIdle = { [weak self] in
+            self?.playerB.isSeekIdle ?? true
+        }
+    }
+
+    private func recordSeekCompleted(exact: Bool, elapsed: TimeInterval) {
+        guard exact else { return }
+        syncScrub.recordExactSeekCost(elapsed)
+        videoAScrub.recordExactSeekCost(elapsed)
+        videoBScrub.recordExactSeekCost(elapsed)
+    }
+
     private func setup() {
         guard let content = window?.contentView else { return }
         content.wantsLayer = true
@@ -318,6 +354,9 @@ final class MainWindowController: NSWindowController {
         playerB.onVisibilityChanged = { [weak self] slot, visible in self?.canvas.renderer.setVisible(visible, slot: slot) }
         playerA.onOpenFailed = { [weak self] slot, message in self?.showLoadError(slot: slot, message: message) }
         playerB.onOpenFailed = { [weak self] slot, message in self?.showLoadError(slot: slot, message: message) }
+        playerA.onSeekCompleted = { [weak self] _, exact, elapsed in self?.recordSeekCompleted(exact: exact, elapsed: elapsed) }
+        playerB.onSeekCompleted = { [weak self] _, exact, elapsed in self?.recordSeekCompleted(exact: exact, elapsed: elapsed) }
+        configureScrubCoordinators()
 
         canvas.containerA.onFileDropped = { [weak self] _, url in self?.load(url: url, slot: .a) }
         canvas.containerB.onFileDropped = { [weak self] _, url in self?.load(url: url, slot: .b) }
@@ -444,8 +483,11 @@ final class MainWindowController: NSWindowController {
         timeSlider.onTrackingChanged = { [weak self] tracking in
             guard let self else { return }
             self.isTrackingTimeSlider = tracking
+            if tracking {
+                self.syncScrub.beginTracking()
+            }
             if !tracking {
-                self.seekToSliderPosition(exact: true)
+                self.syncScrub.endTracking(seconds: self.currentSliderBaseTime(), fps: self.syncScrubFPS())
             }
         }
         timeSlider.onLoopRangeSelected = { [weak self] range in
@@ -460,8 +502,11 @@ final class MainWindowController: NSWindowController {
         videoASlider.onTrackingChanged = { [weak self] tracking in
             guard let self else { return }
             self.isTrackingVideoASlider = tracking
+            if tracking {
+                self.videoAScrub.beginTracking()
+            }
             if !tracking {
-                self.seekIndividualVideo(slot: .a, exact: true)
+                self.videoAScrub.endTracking(seconds: self.individualSliderTime(slot: .a), fps: self.playerA.fps)
                 self.saveState()
             }
         }
@@ -471,8 +516,11 @@ final class MainWindowController: NSWindowController {
         videoBSlider.onTrackingChanged = { [weak self] tracking in
             guard let self else { return }
             self.isTrackingVideoBSlider = tracking
+            if tracking {
+                self.videoBScrub.beginTracking()
+            }
             if !tracking {
-                self.seekIndividualVideo(slot: .b, exact: true)
+                self.videoBScrub.endTracking(seconds: self.individualSliderTime(slot: .b), fps: self.playerB.fps)
                 self.saveState()
             }
         }
@@ -845,6 +893,23 @@ final class MainWindowController: NSWindowController {
         return max(0, round(seconds * fps) / fps)
     }
 
+    private func syncScrubFPS() -> Double {
+        max(1, max(playerA.fps, playerB.fps))
+    }
+
+    private func currentSliderBaseTime() -> Double {
+        let duration = max(playerA.duration, playerB.duration)
+        guard duration > 0 else { return 0 }
+        return frameAlignedBaseTime(timeSlider.doubleValue * duration)
+    }
+
+    private func individualSliderTime(slot: VideoSlot) -> Double {
+        let player = slot == .a ? playerA! : playerB!
+        let slider = slot == .a ? videoASlider : videoBSlider
+        guard player.duration > 0 else { return 0 }
+        return frameAlignedTime(slider.doubleValue * player.duration, fps: player.fps)
+    }
+
     private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true) {
         let hasContent = seconds >= 0 && (player.duration <= 0 || seconds <= player.duration)
         Diagnostics.log("display slot=\(player.slot.rawValue) target=\(debugTime(seconds)) exact=\(exact) hasContent=\(hasContent) duration=\(debugTime(player.duration))")
@@ -860,25 +925,36 @@ final class MainWindowController: NSWindowController {
 
     @objc private func sliderChanged() {
         Diagnostics.log("slider.sync.changed value=\(timeSlider.doubleValue) tracking=\(isTrackingTimeSlider)")
-        seekToSliderPosition(exact: !isTrackingTimeSlider)
+        if isTrackingTimeSlider {
+            syncScrub.updateTarget(seconds: currentSliderBaseTime(), fps: syncScrubFPS())
+        } else {
+            seekToSliderPosition(exact: true)
+        }
     }
 
     @objc private func videoASliderChanged() {
-        seekIndividualVideo(slot: .a, exact: !isTrackingVideoASlider)
+        if isTrackingVideoASlider {
+            videoAScrub.updateTarget(seconds: individualSliderTime(slot: .a), fps: playerA.fps)
+        } else {
+            seekIndividualVideo(slot: .a, exact: true)
+        }
     }
 
     @objc private func videoBSliderChanged() {
-        seekIndividualVideo(slot: .b, exact: !isTrackingVideoBSlider)
+        if isTrackingVideoBSlider {
+            videoBScrub.updateTarget(seconds: individualSliderTime(slot: .b), fps: playerB.fps)
+        } else {
+            seekIndividualVideo(slot: .b, exact: true)
+        }
     }
 
     private func seekToSliderPosition(exact: Bool) {
         let duration = max(playerA.duration, playerB.duration)
         guard duration > 0 else { return }
         pauseBothIfNeeded()
-        let base = frameAlignedBaseTime(timeSlider.doubleValue * duration)
+        let base = currentSliderBaseTime()
         Diagnostics.log("slider.sync.seek value=\(timeSlider.doubleValue) duration=\(debugTime(duration)) exactArg=\(exact) base=\(debugTime(base))")
-        _ = exact
-        seekToBaseTime(base, exact: true)
+        seekToBaseTime(base, exact: exact)
     }
 
     private func setSyncLoopRange(fromFractions range: ClosedRange<Double>) {
@@ -907,18 +983,19 @@ final class MainWindowController: NSWindowController {
     }
 
     private func seekIndividualVideo(slot: VideoSlot, exact: Bool) {
+        seekIndividualVideo(slot: slot, targetTime: individualSliderTime(slot: slot), exact: exact)
+    }
+
+    private func seekIndividualVideo(slot: VideoSlot, targetTime: Double, exact: Bool) {
         stopSynchronizedBarrierPlayback()
         let player = slot == .a ? playerA! : playerB!
-        let slider = slot == .a ? videoASlider : videoBSlider
         guard player.duration > 0 else { return }
         if !player.isPaused {
             player.setPause(true)
         }
-        let targetTime = frameAlignedTime(slider.doubleValue * player.duration, fps: player.fps)
         updateOffsetAfterIndividualSeek(slot: slot, targetTime: targetTime)
         player.setVideoVisible(targetTime >= 0 && targetTime <= player.duration)
-        _ = exact
-        player.seekAbsolute(targetTime, exact: true)
+        player.seekAbsolute(targetTime, exact: exact)
         refreshStatus()
     }
 

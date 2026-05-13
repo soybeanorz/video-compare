@@ -2,6 +2,7 @@ import AppKit
 import CFFmpeg
 import CoreVideo
 import Foundation
+import QuartzCore
 
 final class NativeVideoFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
@@ -24,10 +25,13 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private var pendingSeek: (seconds: Double, exact: Bool, generation: Int)?
     private var isSeeking = false
     private var seekGeneration = 0
+    private let seekCancelGeneration = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
     private var playbackGeneration = 0
     private var visible = true
     private var frameHistory: [NativeVideoFrame] = []
     private var frameHistoryIndex: Int?
+    private var frameCache: [Int: NativeVideoFrame] = [:]
+    private var frameCacheOrder: [Int] = []
 
     private(set) var fileURL: URL?
     private(set) var timePosition: Double = 0
@@ -39,20 +43,34 @@ final class NativeVideoPlayer: @unchecked Sendable {
     var onFrameDecoded: ((VideoSlot, CVPixelBuffer, Double) -> Void)?
     var onVisibilityChanged: ((VideoSlot, Bool) -> Void)?
     var onOpenFailed: ((VideoSlot, String) -> Void)?
+    var onSeekCompleted: ((VideoSlot, Bool, TimeInterval) -> Void)?
 
     init(slot: VideoSlot) {
         self.slot = slot
         self.queue = DispatchQueue(label: "VideoCompare.native.decode.\(slot.rawValue)", qos: .userInitiated)
+        seekCancelGeneration.initialize(to: 0)
     }
 
     deinit {
         let decoder = self.decoder
         self.decoder = nil
+        seekCancelGeneration.pointee = Int32.max
+        let cancelGeneration = seekCancelGeneration
         if let decoder {
             queue.async {
                 vc_decoder_close(decoder)
+                cancelGeneration.deallocate()
             }
+        } else {
+            cancelGeneration.deallocate()
         }
+    }
+
+    var isSeekIdle: Bool {
+        stateLock.lock()
+        let idle = !isSeeking && pendingSeek == nil
+        stateLock.unlock()
+        return idle
     }
 
     func load(url: URL) {
@@ -60,6 +78,10 @@ final class NativeVideoPlayer: @unchecked Sendable {
         fileURL = url
         isPaused = true
         playbackGeneration += 1
+        frameHistory.removeAll(keepingCapacity: true)
+        frameHistoryIndex = nil
+        frameCache.removeAll(keepingCapacity: true)
+        frameCacheOrder.removeAll(keepingCapacity: true)
         let path = url.path
         queue.async {
             if let old = self.decoder {
@@ -112,13 +134,20 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func seekAbsolute(_ seconds: Double, exact: Bool = true) {
+        stateLock.lock()
+        seekGeneration += 1
+        let generation = seekGeneration
+        seekCancelGeneration.pointee = Int32(generation)
+        if exact, Thread.isMainThread, let cached = cachedFrame(at: seconds) {
+            pendingSeek = nil
+            stateLock.unlock()
+            presentHistoricalFrame(cached)
+            return
+        }
         DispatchQueue.main.async {
             self.frameHistory.removeAll(keepingCapacity: true)
             self.frameHistoryIndex = nil
         }
-        stateLock.lock()
-        seekGeneration += 1
-        let generation = seekGeneration
         pendingSeek = (max(0, seconds), exact, generation)
         Diagnostics.log("player.\(slot.rawValue).seek.request generation=\(generation) seconds=\(String(format: "%.6f", max(0, seconds))) exact=\(exact) isSeeking=\(isSeeking)")
         guard !isSeeking else {
@@ -278,6 +307,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     private func record(_ frame: NativeVideoFrame) {
+        cache(frame)
         if let current = frameHistoryIndex, current < frameHistory.count - 1 {
             frameHistory.removeSubrange((current + 1)..<frameHistory.count)
         }
@@ -295,6 +325,26 @@ final class NativeVideoPlayer: @unchecked Sendable {
                 frameHistoryIndex = max(0, index - removed)
             }
         }
+    }
+
+    private func cache(_ frame: NativeVideoFrame) {
+        let key = frameNumber(frame.pts)
+        if frameCache[key] == nil {
+            frameCacheOrder.append(key)
+        }
+        frameCache[key] = frame
+        while frameCacheOrder.count > 180 {
+            let removed = frameCacheOrder.removeFirst()
+            frameCache.removeValue(forKey: removed)
+        }
+    }
+
+    private func cachedFrame(at seconds: Double) -> NativeVideoFrame? {
+        frameCache[frameNumber(seconds)]
+    }
+
+    private func frameNumber(_ seconds: Double) -> Int {
+        max(0, Int(round(seconds * max(1, fps))))
     }
 
     private func startPlaybackLoop() {
@@ -326,10 +376,22 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private func decodeSeek(seconds: Double, exact: Bool, publishStale: Bool, seekGeneration: Int? = nil) {
         guard let decoder else { return }
         var frame = VCDecodedFrame()
-        let result = vc_decoder_seek(decoder, seconds, exact ? 1 : 0, &frame)
+        let started = CACurrentMediaTime()
+        let result: Int32
+        if let seekGeneration {
+            result = vc_decoder_seek_cancelable(decoder, seconds, exact ? 1 : 0, &frame, seekCancelGeneration, Int32(seekGeneration))
+        } else {
+            result = vc_decoder_seek(decoder, seconds, exact ? 1 : 0, &frame)
+        }
+        let elapsed = CACurrentMediaTime() - started
         guard result > 0, let unmanagedPixelBuffer = frame.pixelBuffer else {
             vc_frame_release(&frame)
             return
+        }
+        if exact {
+            DispatchQueue.main.async {
+                self.onSeekCompleted?(self.slot, exact, elapsed)
+            }
         }
         let pixelBuffer = unmanagedPixelBuffer.takeRetainedValue()
         Diagnostics.log("player.\(slot.rawValue).seek.decoded generation=\(seekGeneration.map(String.init) ?? "nil") requested=\(String(format: "%.6f", seconds)) pts=\(String(format: "%.6f", frame.pts)) exact=\(exact)")

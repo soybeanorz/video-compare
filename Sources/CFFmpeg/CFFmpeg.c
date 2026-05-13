@@ -241,7 +241,7 @@ VCDecoder *vc_decoder_open(const char *path, char *error, int error_len) {
     return decoder;
 }
 
-int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame) {
+int vc_decoder_seek_cancelable(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame, volatile int *seek_generation, int generation) {
     if (!decoder || !out_frame) {
         return AVERROR(EINVAL);
     }
@@ -262,12 +262,20 @@ int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFram
     }
 
     while ((result = vc_decoder_next(decoder, out_frame)) > 0) {
+        if (seek_generation && *seek_generation != generation) {
+            vc_frame_release(out_frame);
+            return AVERROR_EXIT;
+        }
         if (!exact || out_frame->pts + 0.0001 >= threshold) {
             return 1;
         }
         vc_frame_release(out_frame);
     }
     return result;
+}
+
+int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame) {
+    return vc_decoder_seek_cancelable(decoder, seconds, exact, out_frame, NULL, 0);
 }
 
 void vc_decoder_close(VCDecoder *decoder) {

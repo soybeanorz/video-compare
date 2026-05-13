@@ -25,6 +25,7 @@ int vc_decoder_width(VCDecoder *decoder);
 int vc_decoder_height(VCDecoder *decoder);
 
 int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame);
+int vc_decoder_seek_cancelable(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame, volatile int *seek_generation, int generation);
 int vc_decoder_next(VCDecoder *decoder, VCDecodedFrame *out_frame);
 void vc_frame_release(VCDecodedFrame *frame);
 
