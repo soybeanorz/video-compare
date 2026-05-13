@@ -4,6 +4,11 @@ import UniformTypeIdentifiers
 
 final class ContinuousSeekSlider: NSControl {
     var onTrackingChanged: ((Bool) -> Void)?
+    var onLoopRangeSelected: ((ClosedRange<Double>) -> Void)?
+    var onLoopRangeCancelled: (() -> Void)?
+    var loopRange: ClosedRange<Double>? {
+        didSet { needsDisplay = true }
+    }
     private var value: Double = 0
 
     convenience init(value: Double, minValue: Double, maxValue: Double, target: AnyObject?, action: Selector?) {
@@ -45,11 +50,26 @@ final class ContinuousSeekSlider: NSControl {
         NSColor(calibratedWhite: 0.86, alpha: 0.95).setFill()
         NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY, width: progressW, height: track.height), xRadius: 2, yRadius: 2).fill()
 
+        if let loopRange {
+            let x1 = bounds.width * CGFloat(loopRange.lowerBound)
+            let x2 = bounds.width * CGFloat(loopRange.upperBound)
+            let rangeRect = NSRect(x: min(x1, x2), y: track.minY - 5, width: max(2, abs(x2 - x1)), height: track.height + 10)
+            NSColor.systemYellow.withAlphaComponent(0.28).setFill()
+            NSBezierPath(roundedRect: rangeRect, xRadius: 2, yRadius: 2).fill()
+            NSColor.systemYellow.withAlphaComponent(0.95).setFill()
+            NSBezierPath(rect: NSRect(x: rangeRect.minX, y: rangeRect.minY - 2, width: 2, height: rangeRect.height + 4)).fill()
+            NSBezierPath(rect: NSRect(x: rangeRect.maxX - 2, y: rangeRect.minY - 2, width: 2, height: rangeRect.height + 4)).fill()
+        }
+
         let thumbX = min(bounds.width - thumbW, max(0, progressW - thumbW / 2))
         NSBezierPath(roundedRect: NSRect(x: thumbX, y: floor((bounds.height - thumbH) / 2), width: thumbW, height: thumbH), xRadius: 1.5, yRadius: 1.5).fill()
     }
 
     override func mouseDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command) {
+            trackLoopRange(from: event)
+            return
+        }
         onTrackingChanged?(true)
         updateValue(with: event)
         while true {
@@ -60,10 +80,36 @@ final class ContinuousSeekSlider: NSControl {
         onTrackingChanged?(false)
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        guard let loopRange else { return }
+        let fraction = fraction(for: event)
+        if loopRange.contains(fraction) {
+            onLoopRangeCancelled?()
+        }
+    }
+
     private func updateValue(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        doubleValue = bounds.width <= 0 ? 0 : Double(point.x / bounds.width)
+        doubleValue = fraction(for: event)
         sendAction(action, to: target)
+    }
+
+    private func trackLoopRange(from event: NSEvent) {
+        let start = fraction(for: event)
+        var end = start
+        loopRange = min(start, end)...max(start, end)
+        while true {
+            guard let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else { break }
+            end = fraction(for: next)
+            loopRange = min(start, end)...max(start, end)
+            if next.type == .leftMouseUp { break }
+        }
+        onLoopRangeSelected?(min(start, end)...max(start, end))
+    }
+
+    private func fraction(for event: NSEvent) -> Double {
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.width > 0 else { return 0 }
+        return min(1, max(0, Double(point.x / bounds.width)))
     }
 }
 
@@ -191,17 +237,18 @@ final class MainWindowController: NSWindowController {
 
     private var syncState = SyncState()
     private var currentPair: VideoPairIdentity?
+    private var normalizedOffsetPair: VideoPairIdentity?
     private var disableSubtitlesMenuItem: NSMenuItem?
     private let recentMenu = NSMenu(title: "最近视频组")
     private var statusRefreshPending = false
     private var isTrackingTimeSlider = false
     private var isTrackingVideoASlider = false
     private var isTrackingVideoBSlider = false
-    private var pendingCoalescedSeek: Double?
-    private var coalescedSeekScheduled = false
-    private var coalescedSeekGeneration = 0
+    private var syncBaseTime: Double = 0
+    private var syncLoopRange: ClosedRange<Double>?
     private var isSynchronizedPlaying = false
     private var synchronizedPlaybackToken = 0
+    private var synchronizedDebugFrameCount = 0
     private var selectedSlot: VideoSlot? {
         didSet {
             canvas.selectedSlot = selectedSlot
@@ -385,6 +432,12 @@ final class MainWindowController: NSWindowController {
                 self.seekToSliderPosition(exact: true)
             }
         }
+        timeSlider.onLoopRangeSelected = { [weak self] range in
+            self?.setSyncLoopRange(fromFractions: range)
+        }
+        timeSlider.onLoopRangeCancelled = { [weak self] in
+            self?.clearSyncLoopRange()
+        }
         videoASlider.target = self
         videoASlider.action = #selector(videoASliderChanged)
         videoASlider.isContinuous = true
@@ -512,6 +565,10 @@ final class MainWindowController: NSWindowController {
 
     private func load(url: URL, slot: VideoSlot) {
         Diagnostics.log("load \(slot.rawValue): \(url.path)")
+        syncBaseTime = 0
+        normalizedOffsetPair = nil
+        clearSyncLoopRange()
+        debugTimelineState("load.reset slot=\(slot.rawValue)")
         switch slot {
         case .a:
             canvas.labelA.stringValue = "A: \(url.path)"
@@ -528,6 +585,9 @@ final class MainWindowController: NSWindowController {
         let pair = VideoPairIdentity(a: FileIdentity(url: a), b: FileIdentity(url: b))
         currentPair = pair
         syncState = PersistenceStore.shared.loadState(for: pair)
+        Diagnostics.log("pair.state.loaded key=\(pair.key) offsetA=\(syncState.offsetFramesA) offsetB=\(syncState.offsetFramesB) transformA=(\(syncState.transformA.panX),\(syncState.transformA.panY),\(syncState.transformA.zoom)) transformB=(\(syncState.transformB.panX),\(syncState.transformB.panY),\(syncState.transformB.zoom))")
+        debugTimelineState("pair.loaded")
+        normalizeLoadedOffsetsIfReady()
         playerA.applyTransform(syncState.transformA)
         playerB.applyTransform(syncState.transformB)
         canvas.renderer.transformA = syncState.transformA
@@ -539,6 +599,11 @@ final class MainWindowController: NSWindowController {
 
     @objc private func layoutChanged() {
         guard let layout = CompareLayout(rawValue: layoutControl.selectedSegment) else { return }
+        applyLayout(layout)
+    }
+
+    private func applyLayout(_ layout: CompareLayout) {
+        layoutControl.selectedSegment = layout.rawValue
         canvas.layoutMode = layout
         canvas.needsDisplay = true
         layoutContent()
@@ -637,7 +702,8 @@ final class MainWindowController: NSWindowController {
         case .a: syncState.offsetFramesA += delta
         case .b: syncState.offsetFramesB += delta
         }
-        seekToBaseTime(base)
+        let baseShift = normalizeSyncOffsets(adjustBaseTime: false)
+        seekToBaseTime(base + baseShift)
         saveState()
         refreshStatus()
     }
@@ -674,10 +740,7 @@ final class MainWindowController: NSWindowController {
     }
 
     private func currentBaseTime() -> Double {
-        if playerA.fileURL != nil {
-            return max(0, playerA.timePosition - seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps))
-        }
-        return max(0, playerB.timePosition - seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps))
+        syncBaseTime
     }
 
     private func seekPlayersToCurrentBase() {
@@ -686,10 +749,13 @@ final class MainWindowController: NSWindowController {
 
     private func seekToBaseTime(_ base: Double, exact: Bool = true) {
         let alignedBase = frameAlignedBaseTime(base)
+        syncBaseTime = alignedBase
         let aTime = alignedBase + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
         let bTime = alignedBase + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
+        Diagnostics.log("sync.seekToBase requested=\(debugTime(base)) aligned=\(debugTime(alignedBase)) exact=\(exact) aTarget=\(debugTime(aTime)) bTarget=\(debugTime(bTime))")
         display(playerA, at: aTime, exact: exact)
         display(playerB, at: bTime, exact: exact)
+        debugTimelineState("sync.seekToBase.issued")
     }
 
     private func baseTimeAnchoredOpposite(of slot: VideoSlot) -> Double {
@@ -708,11 +774,17 @@ final class MainWindowController: NSWindowController {
 
     private func frameAlignedBaseTime(_ base: Double) -> Double {
         let fps = max(1, max(playerA.fps, playerB.fps))
-        return max(0, round(base * fps) / fps)
+        return frameAlignedTime(base, fps: fps)
+    }
+
+    private func frameAlignedTime(_ seconds: Double, fps: Double) -> Double {
+        let fps = max(1, fps)
+        return max(0, round(seconds * fps) / fps)
     }
 
     private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true) {
         let hasContent = seconds >= 0 && (player.duration <= 0 || seconds <= player.duration)
+        Diagnostics.log("display slot=\(player.slot.rawValue) target=\(debugTime(seconds)) exact=\(exact) hasContent=\(hasContent) duration=\(debugTime(player.duration))")
         player.setVideoVisible(hasContent)
         if hasContent {
             player.seekAbsolute(seconds, exact: exact)
@@ -724,6 +796,7 @@ final class MainWindowController: NSWindowController {
     }
 
     @objc private func sliderChanged() {
+        Diagnostics.log("slider.sync.changed value=\(timeSlider.doubleValue) tracking=\(isTrackingTimeSlider)")
         seekToSliderPosition(exact: !isTrackingTimeSlider)
     }
 
@@ -740,27 +813,34 @@ final class MainWindowController: NSWindowController {
         guard duration > 0 else { return }
         pauseBothIfNeeded()
         let base = frameAlignedBaseTime(timeSlider.doubleValue * duration)
-        if exact {
-            pendingCoalescedSeek = nil
-            coalescedSeekGeneration += 1
-            seekToBaseTime(base, exact: true)
-        } else {
-            coalesceFastSeek(to: base)
-        }
+        Diagnostics.log("slider.sync.seek value=\(timeSlider.doubleValue) duration=\(debugTime(duration)) exactArg=\(exact) base=\(debugTime(base))")
+        _ = exact
+        seekToBaseTime(base, exact: true)
     }
 
-    private func coalesceFastSeek(to base: Double) {
-        pendingCoalescedSeek = base
-        let generation = coalescedSeekGeneration
-        guard !coalescedSeekScheduled else { return }
-        coalescedSeekScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.033) {
-            self.coalescedSeekScheduled = false
-            guard generation == self.coalescedSeekGeneration else { return }
-            guard let base = self.pendingCoalescedSeek else { return }
-            self.pendingCoalescedSeek = nil
-            self.seekToBaseTime(base, exact: false)
+    private func setSyncLoopRange(fromFractions range: ClosedRange<Double>) {
+        let duration = max(playerA.duration, playerB.duration)
+        guard duration > 0 else {
+            clearSyncLoopRange()
+            return
         }
+        let frameInterval = 1.0 / max(1, max(playerA.fps, playerB.fps))
+        let lower = frameAlignedBaseTime(range.lowerBound * duration)
+        var upper = frameAlignedBaseTime(range.upperBound * duration)
+        if upper <= lower {
+            upper = min(duration, lower + frameInterval)
+        }
+        syncLoopRange = lower...upper
+        timeSlider.loopRange = (lower / duration)...(upper / duration)
+        Diagnostics.log("loop.set fractions=(\(range.lowerBound),\(range.upperBound)) seconds=\(debugRange(syncLoopRange))")
+        debugTimelineState("loop.set")
+    }
+
+    private func clearSyncLoopRange() {
+        Diagnostics.log("loop.clear previous=\(debugRange(syncLoopRange))")
+        syncLoopRange = nil
+        timeSlider.loopRange = nil
+        debugTimelineState("loop.clear")
     }
 
     private func seekIndividualVideo(slot: VideoSlot, exact: Bool) {
@@ -771,10 +851,11 @@ final class MainWindowController: NSWindowController {
         if !player.isPaused {
             player.setPause(true)
         }
-        let targetTime = slider.doubleValue * player.duration
+        let targetTime = frameAlignedTime(slider.doubleValue * player.duration, fps: player.fps)
         updateOffsetAfterIndividualSeek(slot: slot, targetTime: targetTime)
         player.setVideoVisible(targetTime >= 0 && targetTime <= player.duration)
-        player.seekAbsolute(targetTime, exact: exact)
+        _ = exact
+        player.seekAbsolute(targetTime, exact: true)
         refreshStatus()
     }
 
@@ -785,12 +866,48 @@ final class MainWindowController: NSWindowController {
                 ? playerB.timePosition - seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
                 : 0
             syncState.offsetFramesA = Int(round((targetTime - base) * max(1, playerA.fps)))
+            syncBaseTime = base + normalizeSyncOffsets(adjustBaseTime: false)
         case .b:
             let base = playerA.fileURL != nil
                 ? playerA.timePosition - seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
                 : 0
             syncState.offsetFramesB = Int(round((targetTime - base) * max(1, playerB.fps)))
+            syncBaseTime = base + normalizeSyncOffsets(adjustBaseTime: false)
         }
+    }
+
+    private func normalizeLoadedOffsetsIfReady() {
+        guard let pair = currentPair,
+              normalizedOffsetPair != pair,
+              playerA.fileURL != nil,
+              playerB.fileURL != nil,
+              playerA.duration > 0,
+              playerB.duration > 0 else { return }
+        normalizedOffsetPair = pair
+        if normalizeSyncOffsets(adjustBaseTime: false) != 0 {
+            PersistenceStore.shared.saveState(syncState, for: pair)
+        }
+        debugTimelineState("pair.offsets.normalized")
+    }
+
+    @discardableResult
+    private func normalizeSyncOffsets(adjustBaseTime: Bool) -> Double {
+        guard playerA.fileURL != nil, playerB.fileURL != nil else { return 0 }
+        let fpsA = max(1, playerA.fps)
+        let fpsB = max(1, playerB.fps)
+        let offsetASeconds = seconds(forFrames: syncState.offsetFramesA, fps: fpsA)
+        let offsetBSeconds = seconds(forFrames: syncState.offsetFramesB, fps: fpsB)
+        let common = min(offsetASeconds, offsetBSeconds)
+        guard abs(common) >= 0.5 / max(fpsA, fpsB) else { return 0 }
+        let oldA = syncState.offsetFramesA
+        let oldB = syncState.offsetFramesB
+        syncState.offsetFramesA = Int(round((offsetASeconds - common) * fpsA))
+        syncState.offsetFramesB = Int(round((offsetBSeconds - common) * fpsB))
+        if adjustBaseTime {
+            syncBaseTime += common
+        }
+        Diagnostics.log("offset.normalize common=\(debugTime(common)) oldA=\(oldA) oldB=\(oldB) newA=\(syncState.offsetFramesA) newB=\(syncState.offsetFramesB) adjustBase=\(adjustBaseTime) syncBase=\(debugTime(syncBaseTime))")
+        return common
     }
 
     @objc private func zoomOut() {
@@ -894,6 +1011,7 @@ final class MainWindowController: NSWindowController {
     }
 
     private func refreshStatus() {
+        normalizeLoadedOffsetsIfReady()
         let duration = max(playerA.duration, playerB.duration)
         if duration > 0 && !isTrackingTimeSlider {
             timeSlider.doubleValue = min(1, max(0, currentBaseTime() / duration))
@@ -919,6 +1037,26 @@ final class MainWindowController: NSWindowController {
         guard seconds.isFinite && seconds >= 0 else { return "00:00" }
         let totalSeconds = Int(seconds.rounded(.down))
         return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+
+    private func debugTime(_ seconds: Double?) -> String {
+        guard let seconds, seconds.isFinite else { return "nil" }
+        return String(format: "%.6f", seconds)
+    }
+
+    private func debugRange(_ range: ClosedRange<Double>?) -> String {
+        guard let range else { return "nil" }
+        return "\(debugTime(range.lowerBound))...\(debugTime(range.upperBound))"
+    }
+
+    private func debugTimelineState(_ event: String) {
+        let duration = max(playerA?.duration ?? 0, playerB?.duration ?? 0)
+        Diagnostics.log(
+            "state.\(event) syncBase=\(debugTime(syncBaseTime)) loop=\(debugRange(syncLoopRange)) slider=\(timeSlider.doubleValue) duration=\(debugTime(duration)) " +
+            "A(time=\(debugTime(playerA?.timePosition)),dur=\(debugTime(playerA?.duration)),fps=\(debugTime(playerA?.fps)),paused=\(playerA?.isPaused.description ?? "nil")) " +
+            "B(time=\(debugTime(playerB?.timePosition)),dur=\(debugTime(playerB?.duration)),fps=\(debugTime(playerB?.fps)),paused=\(playerB?.isPaused.description ?? "nil")) " +
+            "offsetA=\(syncState.offsetFramesA) offsetB=\(syncState.offsetFramesB) syncPlaying=\(isSynchronizedPlaying)"
+        )
     }
 
     private func formatTime(_ seconds: Double) -> String {
@@ -953,9 +1091,19 @@ final class MainWindowController: NSWindowController {
         if !playerB.isPaused { playerB.setPause(true) }
         isSynchronizedPlaying = true
         synchronizedPlaybackToken += 1
+        synchronizedDebugFrameCount = 0
         let token = synchronizedPlaybackToken
         playerA.setSynchronizedPlaybackActive(true)
         playerB.setSynchronizedPlaybackActive(true)
+        Diagnostics.log("sync.play.start token=\(token) loop=\(debugRange(syncLoopRange))")
+        debugTimelineState("sync.play.start")
+        if let loopRange = syncLoopRange {
+            let base = currentBaseTime()
+            if base < loopRange.lowerBound || base > loopRange.upperBound {
+                Diagnostics.log("sync.play.loopClamp token=\(token) base=\(debugTime(base)) loop=\(debugRange(syncLoopRange))")
+                seekToBaseTime(loopRange.lowerBound, exact: true)
+            }
+        }
         scheduleSynchronizedFrame(token: token)
     }
 
@@ -963,6 +1111,8 @@ final class MainWindowController: NSWindowController {
         guard isSynchronizedPlaying else { return }
         isSynchronizedPlaying = false
         synchronizedPlaybackToken += 1
+        Diagnostics.log("sync.play.stop token=\(synchronizedPlaybackToken)")
+        debugTimelineState("sync.play.stop")
         playerA.setSynchronizedPlaybackActive(false)
         playerB.setSynchronizedPlaybackActive(false)
     }
@@ -978,6 +1128,17 @@ final class MainWindowController: NSWindowController {
             callbacks += 1
             guard callbacks == 2 else { return }
             guard self.isSynchronizedPlaying, token == self.synchronizedPlaybackToken else { return }
+
+            if let loopRange = self.syncLoopRange,
+               let nextBase = self.baseTime(frameA: frameA, frameB: frameB),
+               nextBase > loopRange.upperBound + (0.5 / max(1, max(self.playerA.fps, self.playerB.fps))) {
+                Diagnostics.log("sync.loop.wrap token=\(token) nextBase=\(self.debugTime(nextBase)) loop=\(self.debugRange(self.syncLoopRange)) frameA=\(self.debugTime(frameA?.pts)) frameB=\(self.debugTime(frameB?.pts))")
+                self.seekToBaseTime(loopRange.lowerBound, exact: true)
+                DispatchQueue.main.async {
+                    self.scheduleSynchronizedFrame(token: token)
+                }
+                return
+            }
 
             if let frameA {
                 self.playerA.setVideoVisible(true)
@@ -998,6 +1159,14 @@ final class MainWindowController: NSWindowController {
                 return
             }
 
+            if let nextBase = self.baseTime(frameA: frameA, frameB: frameB) {
+                self.syncBaseTime = nextBase
+            }
+            self.synchronizedDebugFrameCount += 1
+            if self.synchronizedDebugFrameCount <= 12 || self.synchronizedDebugFrameCount % 60 == 0 {
+                Diagnostics.log("sync.play.frame token=\(token) count=\(self.synchronizedDebugFrameCount) nextBase=\(self.debugTime(self.syncBaseTime)) frameA=\(self.debugTime(frameA?.pts)) frameB=\(self.debugTime(frameB?.pts)) loop=\(self.debugRange(self.syncLoopRange))")
+            }
+
             let frameInterval = 1.0 / max(1, max(self.playerA.fps, self.playerB.fps))
             let elapsed = CACurrentMediaTime() - started
             DispatchQueue.main.asyncAfter(deadline: .now() + max(0, frameInterval - elapsed)) {
@@ -1013,6 +1182,16 @@ final class MainWindowController: NSWindowController {
             frameB = frame
             finishIfReady()
         }
+    }
+
+    private func baseTime(frameA: NativeVideoFrame?, frameB: NativeVideoFrame?) -> Double? {
+        if let frameA {
+            return max(0, frameA.pts - seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps))
+        }
+        if let frameB {
+            return max(0, frameB.pts - seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps))
+        }
+        return nil
     }
 
     private func updateEndVisibility() {
@@ -1046,6 +1225,29 @@ final class MainWindowController: NSWindowController {
     }
 
     private func handleKey(_ event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+           let key = event.charactersIgnoringModifiers?.lowercased() {
+            switch key {
+            case "q":
+                applyLayout(.sideBySideHorizontal)
+                return true
+            case "w":
+                applyLayout(.overlapToggle)
+                return true
+            case "e":
+                applyLayout(.overlapWipe)
+                return true
+            case "1":
+                selectedSlot = .a
+                return true
+            case "2":
+                selectedSlot = .b
+                return true
+            default:
+                break
+            }
+        }
+
         switch event.keyCode {
         case 53:
             selectedSlot = nil

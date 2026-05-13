@@ -21,8 +21,9 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private let queue: DispatchQueue
     private let stateLock = NSLock()
     private var decoder: OpaquePointer?
-    private var pendingSeek: (seconds: Double, exact: Bool)?
+    private var pendingSeek: (seconds: Double, exact: Bool, generation: Int)?
     private var isSeeking = false
+    private var seekGeneration = 0
     private var playbackGeneration = 0
     private var visible = true
     private var frameHistory: [NativeVideoFrame] = []
@@ -55,6 +56,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func load(url: URL) {
+        Diagnostics.log("player.\(slot.rawValue).load path=\(url.path)")
         fileURL = url
         isPaused = true
         playbackGeneration += 1
@@ -77,6 +79,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
             self.decoder = opened
             let duration = vc_decoder_duration(opened)
             let fps = vc_decoder_fps(opened)
+            Diagnostics.log("player.\(self.slot.rawValue).opened duration=\(String(format: "%.6f", duration)) fps=\(String(format: "%.6f", fps))")
             DispatchQueue.main.async {
                 self.duration = duration
                 self.fps = fps > 1 ? fps : 60
@@ -114,7 +117,10 @@ final class NativeVideoPlayer: @unchecked Sendable {
             self.frameHistoryIndex = nil
         }
         stateLock.lock()
-        pendingSeek = (max(0, seconds), exact)
+        seekGeneration += 1
+        let generation = seekGeneration
+        pendingSeek = (max(0, seconds), exact, generation)
+        Diagnostics.log("player.\(slot.rawValue).seek.request generation=\(generation) seconds=\(String(format: "%.6f", max(0, seconds))) exact=\(exact) isSeeking=\(isSeeking)")
         guard !isSeeking else {
             stateLock.unlock()
             return
@@ -132,7 +138,8 @@ final class NativeVideoPlayer: @unchecked Sendable {
                 }
                 self.pendingSeek = nil
                 self.stateLock.unlock()
-                self.decodeSeek(seconds: request.seconds, exact: request.exact, publishStale: false)
+                Diagnostics.log("player.\(self.slot.rawValue).seek.start generation=\(request.generation) seconds=\(String(format: "%.6f", request.seconds)) exact=\(request.exact)")
+                self.decodeSeek(seconds: request.seconds, exact: request.exact, publishStale: false, seekGeneration: request.generation)
             }
         }
     }
@@ -316,7 +323,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
         }
     }
 
-    private func decodeSeek(seconds: Double, exact: Bool, publishStale: Bool) {
+    private func decodeSeek(seconds: Double, exact: Bool, publishStale: Bool, seekGeneration: Int? = nil) {
         guard let decoder else { return }
         var frame = VCDecodedFrame()
         let result = vc_decoder_seek(decoder, seconds, exact ? 1 : 0, &frame)
@@ -325,15 +332,30 @@ final class NativeVideoPlayer: @unchecked Sendable {
             return
         }
         let pixelBuffer = unmanagedPixelBuffer.takeRetainedValue()
-        publish(frame: frame, pixelBuffer: pixelBuffer)
-        _ = publishStale
+        Diagnostics.log("player.\(slot.rawValue).seek.decoded generation=\(seekGeneration.map(String.init) ?? "nil") requested=\(String(format: "%.6f", seconds)) pts=\(String(format: "%.6f", frame.pts)) exact=\(exact)")
+        publish(frame: frame, pixelBuffer: pixelBuffer, publishStale: publishStale, seekGeneration: seekGeneration)
     }
 
-    private func publish(frame: VCDecodedFrame, pixelBuffer: CVPixelBuffer) {
+    private func publish(frame: VCDecodedFrame, pixelBuffer: CVPixelBuffer, publishStale: Bool = true, seekGeneration: Int? = nil) {
+        let pts = frame.pts
         let videoFrame = NativeVideoFrame(pixelBuffer: pixelBuffer, pts: frame.pts, duration: frame.duration)
         DispatchQueue.main.async {
+            if !publishStale, let seekGeneration, !self.isLatestCompletedSeek(seekGeneration) {
+                Diagnostics.log("player.\(self.slot.rawValue).seek.dropStale generation=\(seekGeneration) pts=\(String(format: "%.6f", pts))")
+                return
+            }
+            if let seekGeneration {
+                Diagnostics.log("player.\(self.slot.rawValue).seek.publish generation=\(seekGeneration) pts=\(String(format: "%.6f", pts))")
+            }
             self.presentSynchronizedFrame(videoFrame)
         }
+    }
+
+    private func isLatestCompletedSeek(_ generation: Int) -> Bool {
+        stateLock.lock()
+        let latest = generation == seekGeneration && pendingSeek == nil
+        stateLock.unlock()
+        return latest
     }
 
     private func notifyStatus() {
