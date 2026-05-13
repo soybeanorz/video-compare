@@ -105,22 +105,27 @@ static int add_keyframe(VCDecoder *decoder, double seconds) {
     return 0;
 }
 
-static void build_keyframe_index(VCDecoder *decoder) {
-    if (!decoder || !decoder->format || decoder->stream_index < 0 || !decoder->packet) {
+static void build_keyframe_index(VCDecoder *decoder, AVStream *stream) {
+    if (!decoder || !stream) {
         return;
     }
 
-    AVPacket *packet = decoder->packet;
-    while (av_read_frame(decoder->format, packet) >= 0) {
-        if (packet->stream_index == decoder->stream_index && (packet->flags & AV_PKT_FLAG_KEY)) {
-            int64_t timestamp = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
-            add_keyframe(decoder, timestamp_to_seconds(timestamp, decoder->time_base));
+#if LIBAVFORMAT_VERSION_MAJOR >= 58
+    int entry_count = avformat_index_get_entries_count(stream);
+    for (int index = 0; index < entry_count; index++) {
+        const AVIndexEntry *entry = avformat_index_get_entry(stream, index);
+        if (entry && (entry->flags & AVINDEX_KEYFRAME)) {
+            add_keyframe(decoder, timestamp_to_seconds(entry->timestamp, decoder->time_base));
         }
-        av_packet_unref(packet);
     }
-
-    av_seek_frame(decoder->format, decoder->stream_index, 0, AVSEEK_FLAG_BACKWARD);
-    avcodec_flush_buffers(decoder->codec);
+#else
+    for (int index = 0; index < stream->nb_index_entries; index++) {
+        const AVIndexEntry *entry = &stream->index_entries[index];
+        if (entry && (entry->flags & AVINDEX_KEYFRAME)) {
+            add_keyframe(decoder, timestamp_to_seconds(entry->timestamp, decoder->time_base));
+        }
+    }
+#endif
     add_keyframe(decoder, 0);
 }
 
@@ -280,7 +285,7 @@ VCDecoder *vc_decoder_open(const char *path, char *error, int error_len) {
         decoder->duration = 0;
     }
 
-    build_keyframe_index(decoder);
+    build_keyframe_index(decoder, stream);
     return decoder;
 }
 
@@ -373,7 +378,13 @@ int vc_decoder_keyframe_count(VCDecoder *decoder) {
 }
 
 double vc_decoder_keyframe_before(VCDecoder *decoder, double seconds) {
-    if (!decoder || decoder->keyframe_count <= 0 || seconds <= 0) {
+    if (!decoder) {
+        return seconds;
+    }
+    if (decoder->keyframe_count <= 0) {
+        return seconds;
+    }
+    if (seconds <= 0) {
         return 0;
     }
     int low = 0;
