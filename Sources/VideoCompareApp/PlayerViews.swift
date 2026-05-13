@@ -88,9 +88,6 @@ final class VideoCanvasView: NSView {
     var wipeFraction: CGFloat = 0.5 {
         didSet { needsLayout = true }
     }
-    var showingAInToggle = true {
-        didSet { needsLayout = true }
-    }
     var onToggleChanged: (() -> Void)?
     var onWipeChanged: ((CGFloat) -> Void)?
     var onPanDragged: ((VideoSlot, CGFloat, CGFloat) -> Void)?
@@ -111,7 +108,7 @@ final class VideoCanvasView: NSView {
     private var panSlot: VideoSlot?
 
     var allowsAlignmentAdjustment: Bool {
-        layoutMode == .overlapToggle || layoutMode == .overlapWipe
+        layoutMode == .overlapWipe
     }
 
     override init(frame frameRect: NSRect) {
@@ -162,19 +159,6 @@ final class VideoCanvasView: NSView {
             containerB.frame = NSRect(x: leftWidth + 1, y: oneLabel, width: max(0, b.width - leftWidth - 1), height: max(0, b.height - oneLabel))
             rectA = containerA.frame
             rectB = containerB.frame
-        case .overlapToggle:
-            labelA.isHidden = !showingAInToggle
-            labelB.isHidden = showingAInToggle
-            divider.isHidden = true
-            labelA.frame = NSRect(x: 0, y: 0, width: b.width, height: oneLabel)
-            labelB.frame = NSRect(x: 0, y: 0, width: b.width, height: oneLabel)
-            let content = NSRect(x: 0, y: oneLabel, width: b.width, height: max(0, b.height - oneLabel))
-            containerA.frame = content
-            containerB.frame = content
-            containerA.isHidden = !showingAInToggle
-            containerB.isHidden = showingAInToggle
-            rectA = content
-            rectB = content
         case .overlapWipe:
             labelA.isHidden = false
             labelB.isHidden = false
@@ -196,7 +180,6 @@ final class VideoCanvasView: NSView {
             rectB = content
         }
         renderer.layoutMode = layoutMode
-        renderer.showingAInToggle = showingAInToggle
         renderer.wipeFraction = wipeFraction
         renderer.rectA = rectA
         renderer.rectB = rectB
@@ -256,11 +239,11 @@ final class VideoCanvasView: NSView {
         }
     }
 
-    func toggleOverlapDisplay() {
-        guard layoutMode == .overlapToggle else { return }
-        showingAInToggle.toggle()
-        renderer.showingAInToggle = showingAInToggle
-        selectedSlot = showingAInToggle ? .a : .b
+    func toggleWipeEdge() {
+        guard layoutMode == .overlapWipe else { return }
+        wipeFraction = wipeFraction < 0.5 ? 1 : 0
+        renderer.wipeFraction = wipeFraction
+        selectedSlot = wipeFraction >= 0.5 ? .a : .b
         onToggleChanged?()
     }
 
@@ -282,7 +265,7 @@ final class VideoCanvasView: NSView {
 
     private func activeContentBounds() -> NSRect {
         switch layoutMode {
-        case .overlapToggle, .overlapWipe:
+        case .overlapWipe:
             return NSRect(x: 0, y: labelHeight, width: bounds.width, height: max(0, bounds.height - labelHeight))
         default:
             return bounds
@@ -294,11 +277,6 @@ final class VideoCanvasView: NSView {
         case .sideBySideHorizontal:
             if containerA.frame.contains(point) || labelA.frame.contains(point) { return .a }
             if containerB.frame.contains(point) || labelB.frame.contains(point) { return .b }
-        case .overlapToggle:
-            let content = activeContentBounds()
-            if content.contains(point) || labelA.frame.contains(point) || labelB.frame.contains(point) {
-                return showingAInToggle ? .a : .b
-            }
         case .overlapWipe:
             let content = activeContentBounds()
             if content.contains(point) {

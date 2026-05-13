@@ -321,7 +321,7 @@ final class MainWindowController: NSWindowController {
             self?.adjustTransform(slot: slot, dx: 0, dy: 0, dz: dz)
         }
         canvas.onAlignmentGestureEnded = { [weak self] in
-            self?.saveState()
+            self?.refreshStatus()
         }
         canvas.onToggleChanged = { [weak self] in
             self?.refreshStatus()
@@ -474,10 +474,10 @@ final class MainWindowController: NSWindowController {
         let fileItem = NSMenuItem()
         mainMenu.addItem(fileItem)
         let fileMenu = NSMenu(title: "文件")
-        let loadAItem = NSMenuItem(title: "加载 A...", action: #selector(openA), keyEquivalent: "1")
+        let loadAItem = NSMenuItem(title: "加载 A...", action: #selector(openA), keyEquivalent: "")
         loadAItem.target = self
         fileMenu.addItem(loadAItem)
-        let loadBItem = NSMenuItem(title: "加载 B...", action: #selector(openB), keyEquivalent: "2")
+        let loadBItem = NSMenuItem(title: "加载 B...", action: #selector(openB), keyEquivalent: "")
         loadBItem.target = self
         fileMenu.addItem(loadBItem)
         fileMenu.addItem(.separator())
@@ -585,7 +585,9 @@ final class MainWindowController: NSWindowController {
         let pair = VideoPairIdentity(a: FileIdentity(url: a), b: FileIdentity(url: b))
         currentPair = pair
         syncState = PersistenceStore.shared.loadState(for: pair)
-        Diagnostics.log("pair.state.loaded key=\(pair.key) offsetA=\(syncState.offsetFramesA) offsetB=\(syncState.offsetFramesB) transformA=(\(syncState.transformA.panX),\(syncState.transformA.panY),\(syncState.transformA.zoom)) transformB=(\(syncState.transformB.panX),\(syncState.transformB.panY),\(syncState.transformB.zoom))")
+        Diagnostics.log("pair.state.loaded key=\(pair.key) offsetA=\(syncState.offsetFramesA) offsetB=\(syncState.offsetFramesB) ignoredTransformA=(\(syncState.transformA.panX),\(syncState.transformA.panY),\(syncState.transformA.zoom)) ignoredTransformB=(\(syncState.transformB.panX),\(syncState.transformB.panY),\(syncState.transformB.zoom))")
+        syncState.transformA = TransformState()
+        syncState.transformB = TransformState()
         debugTimelineState("pair.loaded")
         normalizeLoadedOffsetsIfReady()
         playerA.applyTransform(syncState.transformA)
@@ -913,13 +915,13 @@ final class MainWindowController: NSWindowController {
     @objc private func zoomOut() {
         guard canvas.allowsAlignmentAdjustment else { return }
         adjustTransform(dx: 0, dy: 0, dz: -0.05)
-        saveState()
+        refreshStatus()
     }
 
     @objc private func zoomIn() {
         guard canvas.allowsAlignmentAdjustment else { return }
         adjustTransform(dx: 0, dy: 0, dz: 0.05)
-        saveState()
+        refreshStatus()
     }
 
     @objc private func toggleDisableSubtitles() {
@@ -1204,17 +1206,10 @@ final class MainWindowController: NSWindowController {
 
     private func saveState() {
         guard let pair = currentPair else { return }
-        PersistenceStore.shared.saveState(syncState, for: pair)
-    }
-
-    private func seekVisibleToggleFrame() {
-        guard canvas.layoutMode == .overlapToggle else { return }
-        let base = currentBaseTime()
-        if canvas.showingAInToggle {
-            display(playerA, at: base + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps), exact: false)
-        } else {
-            display(playerB, at: base + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps), exact: false)
-        }
+        var persistedState = syncState
+        persistedState.transformA = TransformState()
+        persistedState.transformB = TransformState()
+        PersistenceStore.shared.saveState(persistedState, for: pair)
     }
 
     private func showLoadError(slot: VideoSlot, message: String) {
@@ -1225,18 +1220,26 @@ final class MainWindowController: NSWindowController {
     }
 
     private func handleKey(_ event: NSEvent) -> Bool {
+        if let key = event.charactersIgnoringModifiers?.lowercased() {
+            let commandOnly = event.modifierFlags.contains(.command)
+                && event.modifierFlags.intersection([.control, .option]).isEmpty
+            if commandOnly {
+                switch key {
+                case "1":
+                    applyLayout(.sideBySideHorizontal)
+                    return true
+                case "2":
+                    applyLayout(.overlapWipe)
+                    return true
+                default:
+                    break
+                }
+            }
+        }
+
         if event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
            let key = event.charactersIgnoringModifiers?.lowercased() {
             switch key {
-            case "q":
-                applyLayout(.sideBySideHorizontal)
-                return true
-            case "w":
-                applyLayout(.overlapToggle)
-                return true
-            case "e":
-                applyLayout(.overlapWipe)
-                return true
             case "1":
                 selectedSlot = .a
                 return true
@@ -1254,8 +1257,8 @@ final class MainWindowController: NSWindowController {
             canvas.clearSelection()
             return true
         case 48:
-            guard canvas.layoutMode == .overlapToggle else { return false }
-            canvas.toggleOverlapDisplay()
+            guard canvas.layoutMode == .overlapWipe else { return false }
+            canvas.toggleWipeEdge()
             return true
         case 123:
             stepBySelection(-1)
@@ -1284,7 +1287,6 @@ final class MainWindowController: NSWindowController {
         let rawDelta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.deltaY
         let dz = max(-0.25, min(0.25, Double(rawDelta) * 0.01))
         adjustTransform(slot: slot, dx: 0, dy: 0, dz: dz)
-        saveState()
         return true
     }
 

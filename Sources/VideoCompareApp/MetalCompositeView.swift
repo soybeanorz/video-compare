@@ -28,9 +28,6 @@ final class MetalCompositeView: MTKView {
     var layoutMode: CompareLayout = .sideBySideHorizontal {
         didSet { needsDisplay = true }
     }
-    var showingAInToggle = true {
-        didSet { needsDisplay = true }
-    }
     var wipeFraction: CGFloat = 0.5 {
         didSet { needsDisplay = true }
     }
@@ -124,10 +121,6 @@ final class MetalCompositeView: MTKView {
         case .sideBySideHorizontal:
             draw(slot: .a, appRect: scaledTopLeft(rectA, scale: scale), clip: scaledTopLeft(rectA, scale: scale), encoder: encoder, uniforms: &uniforms)
             draw(slot: .b, appRect: scaledTopLeft(rectB, scale: scale), clip: scaledTopLeft(rectB, scale: scale), encoder: encoder, uniforms: &uniforms)
-        case .overlapToggle:
-            let slot: VideoSlot = showingAInToggle ? .a : .b
-            let rect = scaledTopLeft(rectA, scale: scale)
-            draw(slot: slot, appRect: rect, clip: rect, encoder: encoder, uniforms: &uniforms)
         case .overlapWipe:
             let full = scaledTopLeft(rectA, scale: scale)
             let leftClip = CGRect(x: full.minX, y: full.minY, width: full.width * max(0, min(1, wipeFraction)), height: full.height)
