@@ -3,6 +3,12 @@ import AppKit
 final class DropVideoView: NSView {
     var slot: VideoSlot
     var onFileDropped: ((VideoSlot, URL) -> Void)?
+    var showsPlaceholder = true {
+        didSet {
+            placeholderLabel.isHidden = !showsPlaceholder
+        }
+    }
+    private let placeholderLabel = NSTextField(labelWithString: "拖入视频以加载")
 
     init(slot: VideoSlot) {
         self.slot = slot
@@ -11,6 +17,13 @@ final class DropVideoView: NSView {
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.masksToBounds = true
         registerForDraggedTypes([.fileURL])
+
+        placeholderLabel.font = NSFont.systemFont(ofSize: 18, weight: .medium)
+        placeholderLabel.textColor = NSColor(calibratedWhite: 0.78, alpha: 1)
+        placeholderLabel.alignment = .center
+        placeholderLabel.backgroundColor = .clear
+        placeholderLabel.drawsBackground = false
+        addSubview(placeholderLabel)
     }
 
     required init?(coder: NSCoder) {
@@ -25,6 +38,17 @@ final class DropVideoView: NSView {
         guard let url = url(from: sender) else { return false }
         onFileDropped?(slot, url)
         return true
+    }
+
+    override func layout() {
+        super.layout()
+        let width = min(bounds.width - 24, 220)
+        placeholderLabel.frame = NSRect(
+            x: floor((bounds.width - width) / 2),
+            y: floor((bounds.height - 28) / 2),
+            width: max(0, width),
+            height: 28
+        )
     }
 
     private func url(from sender: NSDraggingInfo) -> URL? {

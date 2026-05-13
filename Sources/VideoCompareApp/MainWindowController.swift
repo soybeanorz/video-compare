@@ -234,15 +234,15 @@ final class MainWindowController: NSWindowController {
     private let helpButton = NSButton(title: "?", target: nil, action: nil)
     private let shortcutHelpPanel = NSView()
     private let shortcutHelpLabel = NSTextField(labelWithString: """
-    - 1 / 2: 选择视频 A / B
-    - Cmd+1 / Cmd+2: 切换左右对比 / 拖动遮罩
-    - Tab: 拖动遮罩分界线切到最左或最右
-    - ← / →: 未选中时同步逐帧；选中 A/B 时只调整该视频
-    - Space: 未选中时同步播放/暂停；选中 A/B 时按当前模式控制播放
-    - Esc: 取消当前选中
-    - Cmd+滚轮: 未选中时同步缩放；选中 A/B 时只缩放选中视频
-    - Cmd+拖动同步进度条: 创建循环片段
-    - 右键循环片段: 取消循环
+    • 1 / 2: 选择视频 A / B
+    • Cmd+1 / Cmd+2: 切换左右对比 / 拖动遮罩
+    • Tab: 拖动遮罩分界线切到最左或最右
+    • ← / →: 未选中时同步逐帧；选中 A/B 时只调整该视频
+    • Space: 未选中时同步播放/暂停；选中 A/B 时按当前模式控制播放
+    • Esc: 取消当前选中
+    • Cmd+滚轮: 未选中时同步缩放；选中 A/B 时只缩放选中视频
+    • Cmd+拖动同步进度条: 创建循环片段
+    • 右键循环片段: 取消循环
     """)
     private var timeSlider: ContinuousSeekSlider { syncTimeline.slider }
     private var videoASlider: ContinuousSeekSlider { videoATimeline.slider }
@@ -631,9 +631,11 @@ final class MainWindowController: NSWindowController {
         switch slot {
         case .a:
             canvas.labelA.stringValue = "A: \(url.path)"
+            canvas.containerA.showsPlaceholder = false
             playerA.load(url: url)
         case .b:
             canvas.labelB.stringValue = "B: \(url.path)"
+            canvas.containerB.showsPlaceholder = false
             playerB.load(url: url)
         }
         loadPairStateIfReady()
@@ -1272,6 +1274,10 @@ final class MainWindowController: NSWindowController {
     }
 
     private func showLoadError(slot: VideoSlot, message: String) {
+        switch slot {
+        case .a: canvas.containerA.showsPlaceholder = true
+        case .b: canvas.containerB.showsPlaceholder = true
+        }
         let alert = NSAlert()
         alert.messageText = "加载 \(slot.rawValue.uppercased()) 失败"
         alert.informativeText = message
