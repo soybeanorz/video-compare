@@ -130,6 +130,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     private var sortMode: MediaFileSortMode = .none
     private var showsIconView = false
     private var isAnimatingToolbar = false
+    private var lastColumnLayoutWidth: CGFloat = -1
 
     private func rectDebug(_ rect: NSRect) -> String {
         "x=\(String(format: "%.1f", rect.origin.x)) y=\(String(format: "%.1f", rect.origin.y)) w=\(String(format: "%.1f", rect.width)) h=\(String(format: "%.1f", rect.height))"
@@ -174,16 +175,25 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         listScrollView.frame = contentFrame
         iconScrollView.frame = contentFrame
 
-        let nameW = max(190, floor(contentFrame.width * 0.48))
-        outlineView.tableColumn(withIdentifier: .nameColumn)?.width = nameW
-        outlineView.tableColumn(withIdentifier: .dateColumn)?.width = 132
-        outlineView.tableColumn(withIdentifier: .kindColumn)?.width = 92
-        outlineView.tableColumn(withIdentifier: .sizeColumn)?.width = 78
+        if abs(contentFrame.width - lastColumnLayoutWidth) > 0.5 {
+            lastColumnLayoutWidth = contentFrame.width
+            let nameW = max(190, floor(contentFrame.width * 0.48))
+            outlineView.tableColumn(withIdentifier: .nameColumn)?.width = nameW
+            outlineView.tableColumn(withIdentifier: .dateColumn)?.width = 132
+            outlineView.tableColumn(withIdentifier: .kindColumn)?.width = 92
+            outlineView.tableColumn(withIdentifier: .sizeColumn)?.width = 78
+        }
     }
 
     func reload(rootURL: URL, displayURL: URL? = nil) {
-        self.rootURL = rootURL.standardizedFileURL
-        self.displayURL = displayURL?.standardizedFileURL
+        let newRootURL = rootURL.standardizedFileURL
+        let newDisplayURL = displayURL?.standardizedFileURL
+        if self.rootURL == newRootURL, self.displayURL == newDisplayURL, rootEntry.children != nil {
+            refreshPathField()
+            return
+        }
+        self.rootURL = newRootURL
+        self.displayURL = newDisplayURL
         rootEntry = Self.directoryEntry(for: self.rootURL)
         refreshPathField()
         reloadBrowsers()

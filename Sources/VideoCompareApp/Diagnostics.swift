@@ -11,9 +11,9 @@ enum Diagnostics {
             .appendingPathComponent("debug.log")
     }()
 
-    static func log(_ message: String) {
+    static func log(_ message: @autoclosure () -> String) {
         guard enabled else { return }
-        let line = "[VideoCompare] \(String(format: "%.3f", Date().timeIntervalSince1970)) \(message)\n"
+        let line = "[VideoCompare] \(String(format: "%.3f", Date().timeIntervalSince1970)) \(message())\n"
         FileHandle.standardError.write(Data(line.utf8))
         lock.lock()
         defer { lock.unlock() }

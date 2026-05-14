@@ -816,10 +816,6 @@ final class MainWindowController: NSWindowController {
         guard let targetFrames = contentLayoutFrames(expanded: expanded) else { return }
         let startMediaFrame = mediaFileTrees.frame
         let startCanvasFrame = canvas.frame
-        let startLayoutFrame = layoutControl.frame
-        let startHelpFrame = helpButton.frame
-        let startHelpPanelFrame = shortcutHelpPanel.frame
-        let startTimelineFrame = syncTimeline.frame
         Diagnostics.log(
             "fileTree.anim.request expanded=\(expanded) mediaStart=(\(rectDebug(startMediaFrame))) mediaTarget=(\(rectDebug(targetFrames.mediaFileTrees))) canvasStart=(\(rectDebug(startCanvasFrame))) canvasTarget=(\(rectDebug(targetFrames.canvas)))"
         )
@@ -832,17 +828,12 @@ final class MainWindowController: NSWindowController {
         let startTime = CACurrentMediaTime()
         Diagnostics.log("fileTree.anim.manual.start expanded=\(expanded) duration=\(duration)")
         fileTreeAnimationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated { [weak self] in
                 guard let self else { return }
                 let raw = CGFloat((CACurrentMediaTime() - startTime) / duration)
                 let progress = self.easeInOut(raw)
-                self.layoutControl.frame = self.interpolatedRect(from: startLayoutFrame, to: targetFrames.layoutControl, progress: progress)
-                self.helpButton.frame = self.interpolatedRect(from: startHelpFrame, to: targetFrames.helpButton, progress: progress)
-                self.shortcutHelpPanel.frame = self.interpolatedRect(from: startHelpPanelFrame, to: targetFrames.shortcutHelpPanel, progress: progress)
-                self.syncTimeline.frame = self.interpolatedRect(from: startTimelineFrame, to: targetFrames.syncTimeline, progress: progress)
                 self.mediaFileTrees.frame = self.interpolatedRect(from: startMediaFrame, to: targetFrames.mediaFileTrees, progress: progress)
                 self.canvas.frame = self.interpolatedRect(from: startCanvasFrame, to: targetFrames.canvas, progress: progress)
-                self.canvas.layoutSubtreeIfNeeded()
 
                 if raw >= 1 {
                     self.fileTreeAnimationTimer?.invalidate()
@@ -880,9 +871,6 @@ final class MainWindowController: NSWindowController {
         let previous = fileTreesExpanded
         fileTreesExpanded.toggle()
         Diagnostics.log("fileTree.toggle previous=\(previous) next=\(fileTreesExpanded)")
-        if fileTreesExpanded {
-            reloadMediaFileTrees()
-        }
         mediaFileTrees.setExpanded(fileTreesExpanded, animated: true)
         animateFileTreeTransition(to: fileTreesExpanded)
     }
