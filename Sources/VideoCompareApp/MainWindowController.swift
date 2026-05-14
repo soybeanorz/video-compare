@@ -270,6 +270,7 @@ final class MainWindowController: NSWindowController {
     private var syncLoopRange: ClosedRange<Double>?
     private var isSynchronizedPlaying = false
     private var fileTreesExpanded = false
+    private var fileTreeAnimationTimer: Timer?
     private var synchronizedPlaybackToken = 0
     private var synchronizedDebugFrameCount = 0
     private var selectedSlot: VideoSlot? {
@@ -710,22 +711,42 @@ final class MainWindowController: NSWindowController {
         layoutContent(animated: false)
     }
 
-    private func layoutContent(animated: Bool) {
-        guard let content = window?.contentView else { return }
+    private struct ContentLayoutFrames {
+        let layoutControl: NSRect
+        let helpButton: NSRect
+        let shortcutHelpPanel: NSRect
+        let syncTimeline: NSRect
+        let mediaFileTrees: NSRect
+        let canvas: NSRect
+    }
+
+    private func rectDebug(_ rect: NSRect) -> String {
+        "x=\(String(format: "%.1f", rect.origin.x)) y=\(String(format: "%.1f", rect.origin.y)) w=\(String(format: "%.1f", rect.width)) h=\(String(format: "%.1f", rect.height))"
+    }
+
+    private func interpolatedRect(from start: NSRect, to end: NSRect, progress: CGFloat) -> NSRect {
+        let p = max(0, min(1, progress))
+        return NSRect(
+            x: start.origin.x + (end.origin.x - start.origin.x) * p,
+            y: start.origin.y + (end.origin.y - start.origin.y) * p,
+            width: start.width + (end.width - start.width) * p,
+            height: start.height + (end.height - start.height) * p
+        )
+    }
+
+    private func easeInOut(_ progress: CGFloat) -> CGFloat {
+        let p = max(0, min(1, progress))
+        return p * p * (3 - 2 * p)
+    }
+
+    private func contentLayoutFrames(expanded: Bool) -> ContentLayoutFrames? {
+        guard let content = window?.contentView else { return nil }
         let w = content.bounds.width
         let h = content.bounds.height
         let pad: CGFloat = 12
         let rowH: CGFloat = 28
         let gap: CGFloat = 8
-        let fileTreeHeight: CGFloat = fileTreesExpanded ? MediaFileTreesView.expandedHeight : MediaFileTreesView.collapsedHeight
-
-        func setFrame(_ view: NSView, _ frame: NSRect) {
-            if animated {
-                view.animator().frame = frame
-            } else {
-                view.frame = frame
-            }
-        }
+        let fileTreeHeight: CGFloat = expanded ? MediaFileTreesView.expandedHeight : MediaFileTreesView.collapsedHeight
 
         let toolbarY = max(pad, h - pad - rowH)
         let fileTreeTop = toolbarY - gap
@@ -738,46 +759,132 @@ final class MainWindowController: NSWindowController {
 
         let layoutWidth = min(max(300, w * 0.2), 420)
         let layoutX = floor(content.bounds.midX - layoutWidth / 2)
-        layoutControl.setWidth(layoutWidth / 2, forSegment: 0)
-        layoutControl.setWidth(layoutWidth / 2, forSegment: 1)
-        setFrame(layoutControl, NSRect(x: layoutX, y: toolbarY, width: layoutWidth, height: rowH))
-        setFrame(helpButton, NSRect(x: w - pad - 26, y: toolbarY + 1, width: 26, height: 26))
-
+        let syncTimelineFrame = NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78)
+        let canvasY = syncTimelineFrame.maxY + gap
+        let canvasTop = fileTreeFrame.minY - gap
         let helpW: CGFloat = 420
         let helpH: CGFloat = 236
-        setFrame(shortcutHelpPanel, NSRect(
-            x: max(pad, w - pad - helpW),
-            y: max(pad, toolbarY - helpH - 8),
-            width: min(helpW, w - pad * 2),
-            height: helpH
-        ))
+
+        return ContentLayoutFrames(
+            layoutControl: NSRect(x: layoutX, y: toolbarY, width: layoutWidth, height: rowH),
+            helpButton: NSRect(x: w - pad - 26, y: toolbarY + 1, width: 26, height: 26),
+            shortcutHelpPanel: NSRect(
+                x: max(pad, w - pad - helpW),
+                y: max(pad, toolbarY - helpH - 8),
+                width: min(helpW, w - pad * 2),
+                height: helpH
+            ),
+            syncTimeline: syncTimelineFrame,
+            mediaFileTrees: fileTreeFrame,
+            canvas: NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY))
+        )
+    }
+
+    private func layoutContent(animated: Bool) {
+        guard let content = window?.contentView else { return }
+        guard let frames = contentLayoutFrames(expanded: fileTreesExpanded) else { return }
+        Diagnostics.log(
+            "layoutContent animated=\(animated) expanded=\(fileTreesExpanded) mediaTarget=(\(rectDebug(frames.mediaFileTrees))) canvasTarget=(\(rectDebug(frames.canvas))) mediaCurrent=(\(rectDebug(mediaFileTrees.frame))) canvasCurrent=(\(rectDebug(canvas.frame)))"
+        )
+
+        func setFrame(_ view: NSView, _ frame: NSRect) {
+            if animated {
+                view.animator().frame = frame
+            } else {
+                view.frame = frame
+            }
+        }
+
+        layoutControl.setWidth(frames.layoutControl.width / 2, forSegment: 0)
+        layoutControl.setWidth(frames.layoutControl.width / 2, forSegment: 1)
+        setFrame(layoutControl, frames.layoutControl)
+        setFrame(helpButton, frames.helpButton)
+        setFrame(shortcutHelpPanel, frames.shortcutHelpPanel)
         shortcutHelpLabel.frame = shortcutHelpPanel.bounds.insetBy(dx: 14, dy: 12)
 
-        setFrame(syncTimeline, NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78))
-
-        let canvasY = syncTimeline.frame.maxY + gap
-        setFrame(mediaFileTrees, fileTreeFrame)
+        setFrame(syncTimeline, frames.syncTimeline)
+        setFrame(mediaFileTrees, frames.mediaFileTrees)
         mediaFileTrees.alphaValue = 1
-
-        let canvasTop = fileTreeFrame.minY - gap
-        setFrame(canvas, NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY)))
+        setFrame(canvas, frames.canvas)
         canvas.layoutSubtreeIfNeeded()
         let hideIndependentTimelines = canvas.layoutMode != .sideBySideHorizontal
         layoutVideoTimeline(videoATimeline, over: canvas.containerA.frame, hidden: hideIndependentTimelines || canvas.containerA.isHidden, in: content)
         layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: hideIndependentTimelines || canvas.containerB.isHidden, in: content)
     }
 
+    private func animateFileTreeTransition(to expanded: Bool) {
+        guard let targetFrames = contentLayoutFrames(expanded: expanded) else { return }
+        let startMediaFrame = mediaFileTrees.frame
+        let startCanvasFrame = canvas.frame
+        let startLayoutFrame = layoutControl.frame
+        let startHelpFrame = helpButton.frame
+        let startHelpPanelFrame = shortcutHelpPanel.frame
+        let startTimelineFrame = syncTimeline.frame
+        Diagnostics.log(
+            "fileTree.anim.request expanded=\(expanded) mediaStart=(\(rectDebug(startMediaFrame))) mediaTarget=(\(rectDebug(targetFrames.mediaFileTrees))) canvasStart=(\(rectDebug(startCanvasFrame))) canvasTarget=(\(rectDebug(targetFrames.canvas)))"
+        )
+        layoutControl.setWidth(targetFrames.layoutControl.width / 2, forSegment: 0)
+        layoutControl.setWidth(targetFrames.layoutControl.width / 2, forSegment: 1)
+        mediaFileTrees.alphaValue = 1
+        fileTreeAnimationTimer?.invalidate()
+
+        let duration: TimeInterval = 0.24
+        let startTime = CACurrentMediaTime()
+        Diagnostics.log("fileTree.anim.manual.start expanded=\(expanded) duration=\(duration)")
+        fileTreeAnimationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let raw = CGFloat((CACurrentMediaTime() - startTime) / duration)
+                let progress = self.easeInOut(raw)
+                self.layoutControl.frame = self.interpolatedRect(from: startLayoutFrame, to: targetFrames.layoutControl, progress: progress)
+                self.helpButton.frame = self.interpolatedRect(from: startHelpFrame, to: targetFrames.helpButton, progress: progress)
+                self.shortcutHelpPanel.frame = self.interpolatedRect(from: startHelpPanelFrame, to: targetFrames.shortcutHelpPanel, progress: progress)
+                self.syncTimeline.frame = self.interpolatedRect(from: startTimelineFrame, to: targetFrames.syncTimeline, progress: progress)
+                self.mediaFileTrees.frame = self.interpolatedRect(from: startMediaFrame, to: targetFrames.mediaFileTrees, progress: progress)
+                self.canvas.frame = self.interpolatedRect(from: startCanvasFrame, to: targetFrames.canvas, progress: progress)
+                self.canvas.layoutSubtreeIfNeeded()
+
+                if raw >= 1 {
+                    self.fileTreeAnimationTimer?.invalidate()
+                    self.fileTreeAnimationTimer = nil
+                    self.layoutControl.frame = targetFrames.layoutControl
+                    self.helpButton.frame = targetFrames.helpButton
+                    self.shortcutHelpPanel.frame = targetFrames.shortcutHelpPanel
+                    self.syncTimeline.frame = targetFrames.syncTimeline
+                    self.mediaFileTrees.frame = targetFrames.mediaFileTrees
+                    self.canvas.frame = targetFrames.canvas
+                    self.canvas.layoutSubtreeIfNeeded()
+                    Diagnostics.log(
+                        "fileTree.anim.manual.complete expanded=\(expanded) mediaActual=(\(self.rectDebug(self.mediaFileTrees.frame))) canvasActual=(\(self.rectDebug(self.canvas.frame)))"
+                    )
+                    self.layoutContent(animated: false)
+                }
+            }
+        }
+        RunLoop.main.add(fileTreeAnimationTimer!, forMode: .common)
+        logFileTreeAnimationSamples(expanded: expanded)
+    }
+
+    private func logFileTreeAnimationSamples(expanded: Bool) {
+        for delay in [0.04, 0.12, 0.22, 0.32] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                Diagnostics.log(
+                    "fileTree.anim.sample expanded=\(expanded) t=\(String(format: "%.2f", delay)) media=(\(self.rectDebug(self.mediaFileTrees.frame))) canvas=(\(self.rectDebug(self.canvas.frame)))"
+                )
+            }
+        }
+    }
+
     @objc private func toggleMediaFileTrees() {
+        let previous = fileTreesExpanded
         fileTreesExpanded.toggle()
+        Diagnostics.log("fileTree.toggle previous=\(previous) next=\(fileTreesExpanded)")
         if fileTreesExpanded {
             reloadMediaFileTrees()
         }
         mediaFileTrees.setExpanded(fileTreesExpanded, animated: true)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.22
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            layoutContent(animated: true)
-        }
+        animateFileTreeTransition(to: fileTreesExpanded)
     }
 
     private func reloadMediaFileTrees() {

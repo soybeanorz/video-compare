@@ -131,6 +131,10 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     private var showsIconView = false
     private var isAnimatingToolbar = false
 
+    private func rectDebug(_ rect: NSRect) -> String {
+        "x=\(String(format: "%.1f", rect.origin.x)) y=\(String(format: "%.1f", rect.origin.y)) w=\(String(format: "%.1f", rect.width)) h=\(String(format: "%.1f", rect.height))"
+    }
+
     init(slot: VideoSlot, rootURL: URL) {
         self.slot = slot
         self.rootURL = rootURL.standardizedFileURL
@@ -155,6 +159,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         super.layout()
         let toolbarHeight = Self.collapsedHeight
         toolbarView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: toolbarHeight)
+        Diagnostics.log("fileTree.\(slot.rawValue).layout expanded=\(isExpanded) animatingToolbar=\(isAnimatingToolbar) bounds=(\(rectDebug(bounds))) pathBefore=(\(rectDebug(pathField.frame)))")
 
         if !isAnimatingToolbar {
             let frames = toolbarFrames(expanded: isExpanded)
@@ -162,6 +167,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
             sortButton.frame = frames.sort
             viewModeControl.frame = frames.viewMode
             pathField.frame = frames.path
+            Diagnostics.log("fileTree.\(slot.rawValue).layout.applyToolbar path=(\(rectDebug(frames.path)))")
         }
 
         let contentFrame = NSRect(x: 0, y: toolbarHeight, width: bounds.width, height: isExpanded ? max(0, bounds.height - toolbarHeight) : 0)
@@ -189,22 +195,13 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         let startFrames = toolbarFrames(expanded: isExpanded)
         let targetFrames = toolbarFrames(expanded: expanded)
         let controls = [upButton, viewModeControl, sortButton]
-
-        if expanded {
-            controls.forEach {
-                $0.isHidden = false
-                $0.alphaValue = 0
-            }
-        }
-        isAnimatingToolbar = animated
-        isExpanded = expanded
-        pathField.frame = startFrames.path
-        upButton.frame = startFrames.up
-        viewModeControl.frame = startFrames.viewMode
-        sortButton.frame = startFrames.sort
+        Diagnostics.log(
+            "fileTree.\(slot.rawValue).toolbar.request from=\(isExpanded) to=\(expanded) animated=\(animated) pathStart=(\(rectDebug(startFrames.path))) pathTarget=(\(rectDebug(targetFrames.path))) currentPath=(\(rectDebug(pathField.frame)))"
+        )
 
         guard animated else {
             isAnimatingToolbar = false
+            isExpanded = expanded
             pathField.frame = targetFrames.path
             upButton.frame = targetFrames.up
             viewModeControl.frame = targetFrames.viewMode
@@ -216,25 +213,90 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
             return
         }
 
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.22
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            pathField.animator().frame = targetFrames.path
-            upButton.animator().frame = targetFrames.up
-            viewModeControl.animator().frame = targetFrames.viewMode
-            sortButton.animator().frame = targetFrames.sort
-            controls.forEach { $0.animator().alphaValue = expanded ? 1 : 0 }
-        } completionHandler: {
-            self.pathField.frame = targetFrames.path
-            self.upButton.frame = targetFrames.up
-            self.viewModeControl.frame = targetFrames.viewMode
-            self.sortButton.frame = targetFrames.sort
-            self.isAnimatingToolbar = false
+        isAnimatingToolbar = true
+        pathField.frame = startFrames.path
+        upButton.frame = startFrames.up
+        viewModeControl.frame = startFrames.viewMode
+        sortButton.frame = startFrames.sort
+
+        if expanded {
+            isExpanded = true
             controls.forEach {
-                $0.alphaValue = 1
-                $0.isHidden = !expanded
+                $0.isHidden = false
+                $0.alphaValue = 0
             }
-            self.needsLayout = true
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.expand.path.start duration=\(context.duration)")
+                pathField.animator().frame = targetFrames.path
+                upButton.animator().frame = targetFrames.up
+                viewModeControl.animator().frame = targetFrames.viewMode
+                sortButton.animator().frame = targetFrames.sort
+            } completionHandler: {
+                Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.expand.path.complete actual=(\(self.rectDebug(self.pathField.frame)))")
+                self.pathField.frame = targetFrames.path
+                self.upButton.frame = targetFrames.up
+                self.viewModeControl.frame = targetFrames.viewMode
+                self.sortButton.frame = targetFrames.sort
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.08
+                    context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.expand.controls.start duration=\(context.duration)")
+                    controls.forEach { $0.animator().alphaValue = 1 }
+                } completionHandler: {
+                    Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.expand.controls.complete pathActual=(\(self.rectDebug(self.pathField.frame)))")
+                    self.isAnimatingToolbar = false
+                    controls.forEach {
+                        $0.alphaValue = 1
+                        $0.isHidden = false
+                    }
+                    self.needsLayout = true
+                }
+            }
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.08
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.collapse.controls.start duration=\(context.duration)")
+            controls.forEach { $0.animator().alphaValue = 0 }
+        } completionHandler: {
+            Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.collapse.controls.complete pathBefore=(\(self.rectDebug(self.pathField.frame)))")
+            self.isExpanded = false
+            controls.forEach { $0.isHidden = true }
+            self.pathField.frame = startFrames.path
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.collapse.path.start duration=\(context.duration) from=(\(self.rectDebug(startFrames.path))) to=(\(self.rectDebug(targetFrames.path)))")
+                self.pathField.animator().frame = targetFrames.path
+            } completionHandler: {
+                Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.collapse.path.complete actual=(\(self.rectDebug(self.pathField.frame)))")
+                self.pathField.frame = targetFrames.path
+                self.upButton.frame = targetFrames.up
+                self.viewModeControl.frame = targetFrames.viewMode
+                self.sortButton.frame = targetFrames.sort
+                self.isAnimatingToolbar = false
+                controls.forEach {
+                    $0.alphaValue = 1
+                    $0.isHidden = true
+                }
+                self.needsLayout = true
+            }
+        }
+        logToolbarAnimationSamples(expanded: expanded)
+    }
+
+    private func logToolbarAnimationSamples(expanded: Bool) {
+        for delay in [0.04, 0.12, 0.22, 0.32] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                Diagnostics.log(
+                    "fileTree.\(self.slot.rawValue).toolbar.sample expanded=\(expanded) t=\(String(format: "%.2f", delay)) path=(\(self.rectDebug(self.pathField.frame))) upHidden=\(self.upButton.isHidden) viewHidden=\(self.viewModeControl.isHidden) sortHidden=\(self.sortButton.isHidden)"
+                )
+            }
         }
     }
 
