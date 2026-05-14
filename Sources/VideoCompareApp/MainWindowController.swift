@@ -454,8 +454,7 @@ final class MainWindowController: NSWindowController {
         }
         syncTimeline.showsBackground = false
         syncTimeline.showsTimeLabels = false
-        mediaFileTrees.isHidden = true
-        mediaFileTrees.alphaValue = 0
+        mediaFileTrees.setExpanded(fileTreesExpanded)
         mediaFileTrees.treeA.onFileOpened = { [weak self] slot, url in self?.load(url: url, slot: slot) }
         mediaFileTrees.treeB.onFileOpened = { [weak self] slot, url in self?.load(url: url, slot: slot) }
 
@@ -483,6 +482,9 @@ final class MainWindowController: NSWindowController {
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender)
         layoutContent()
+        DispatchQueue.main.async { [weak self] in
+            self?.window?.makeFirstResponder(nil)
+        }
     }
 
     func loadInitial(a: URL, b: URL) {
@@ -715,7 +717,7 @@ final class MainWindowController: NSWindowController {
         let pad: CGFloat = 12
         let rowH: CGFloat = 28
         let gap: CGFloat = 8
-        let fileTreeHeight: CGFloat = fileTreesExpanded ? 220 : 0
+        let fileTreeHeight: CGFloat = fileTreesExpanded ? MediaFileTreesView.expandedHeight : MediaFileTreesView.collapsedHeight
 
         func setFrame(_ view: NSView, _ frame: NSRect) {
             if animated {
@@ -755,11 +757,7 @@ final class MainWindowController: NSWindowController {
 
         let canvasY = syncTimeline.frame.maxY + gap
         setFrame(mediaFileTrees, fileTreeFrame)
-        if animated {
-            mediaFileTrees.animator().alphaValue = fileTreesExpanded ? 1 : 0
-        } else {
-            mediaFileTrees.alphaValue = fileTreesExpanded ? 1 : 0
-        }
+        mediaFileTrees.alphaValue = 1
 
         let canvasTop = fileTreeFrame.minY - gap
         setFrame(canvas, NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY)))
@@ -773,26 +771,31 @@ final class MainWindowController: NSWindowController {
         fileTreesExpanded.toggle()
         if fileTreesExpanded {
             reloadMediaFileTrees()
-            mediaFileTrees.isHidden = false
         }
+        mediaFileTrees.setExpanded(fileTreesExpanded, animated: true)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.22
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             layoutContent(animated: true)
-        } completionHandler: {
-            if !self.fileTreesExpanded {
-                self.mediaFileTrees.isHidden = true
-            }
         }
     }
 
     private func reloadMediaFileTrees() {
-        mediaFileTrees.reload(rootA: mediaRoot(for: .a), rootB: mediaRoot(for: .b))
+        mediaFileTrees.reload(
+            rootA: mediaRoot(for: .a),
+            displayA: mediaDisplayURL(for: .a),
+            rootB: mediaRoot(for: .b),
+            displayB: mediaDisplayURL(for: .b)
+        )
     }
 
     private func mediaRoot(for slot: VideoSlot) -> URL {
         let url = slot == .a ? playerA?.fileURL : playerB?.fileURL
         return url?.deletingLastPathComponent() ?? FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    private func mediaDisplayURL(for slot: VideoSlot) -> URL? {
+        slot == .a ? playerA?.fileURL : playerB?.fileURL
     }
 
     private func layoutVideoTimeline(_ timeline: TimelineControl, over canvasRect: NSRect, hidden: Bool, in content: NSView) {
@@ -849,11 +852,9 @@ final class MainWindowController: NSWindowController {
         debugTimelineState("load.reset slot=\(slot.rawValue)")
         switch slot {
         case .a:
-            canvas.labelA.stringValue = "A: \(url.path)"
             canvas.containerA.showsPlaceholder = false
             playerA.load(url: url)
         case .b:
-            canvas.labelB.stringValue = "B: \(url.path)"
             canvas.containerB.showsPlaceholder = false
             playerB.load(url: url)
         }
@@ -1570,6 +1571,7 @@ final class MainWindowController: NSWindowController {
 
         switch event.keyCode {
         case 53:
+            _ = mediaFileTrees.endPathEditingIfNeeded()
             selectedSlot = nil
             canvas.clearSelection()
             return true

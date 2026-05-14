@@ -138,7 +138,7 @@ final class VideoCanvasView: NSView {
     let labelA = NSTextField(labelWithString: "A: 未加载")
     let labelB = NSTextField(labelWithString: "B: 未加载")
     private let divider = WipeDividerView()
-    private let labelHeight: CGFloat = 24
+    private let labelHeight: CGFloat = 0
 
     var layoutMode: CompareLayout = .sideBySideHorizontal {
         didSet { needsLayout = true }
@@ -180,6 +180,7 @@ final class VideoCanvasView: NSView {
         addSubview(labelB)
         addSubview(divider)
         for label in [labelA, labelB] {
+            label.isHidden = true
             label.lineBreakMode = .byTruncatingMiddle
             label.maximumNumberOfLines = 1
             label.textColor = NSColor(calibratedWhite: 0.88, alpha: 1)
@@ -209,8 +210,8 @@ final class VideoCanvasView: NSView {
             containerA.isHidden = false
             containerB.isHidden = false
             divider.isHidden = true
-            labelA.isHidden = false
-            labelB.isHidden = false
+            labelA.isHidden = true
+            labelB.isHidden = true
             labelA.frame = NSRect(x: 0, y: 0, width: leftWidth, height: oneLabel)
             labelB.frame = NSRect(x: leftWidth + 1, y: 0, width: max(0, b.width - leftWidth - 1), height: oneLabel)
             containerA.frame = NSRect(x: 0, y: oneLabel, width: leftWidth, height: max(0, b.height - oneLabel))
@@ -218,8 +219,8 @@ final class VideoCanvasView: NSView {
             rectA = containerA.frame
             rectB = containerB.frame
         case .overlapWipe:
-            labelA.isHidden = false
-            labelB.isHidden = false
+            labelA.isHidden = true
+            labelB.isHidden = true
             labelA.alignment = .left
             labelB.alignment = .right
             labelA.frame = NSRect(x: 0, y: 0, width: floor(b.width / 2), height: oneLabel)
