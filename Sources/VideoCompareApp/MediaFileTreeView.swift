@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 private enum MediaFileSortMode: Int, CaseIterable {
     case none
@@ -130,7 +131,9 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     private var sortMode: MediaFileSortMode = .none
     private var showsIconView = false
     private var isAnimatingToolbar = false
+    private var suppressesBrowserContent = false
     private var lastColumnLayoutWidth: CGFloat = -1
+    private var iconCache: [String: NSImage] = [:]
 
     private func rectDebug(_ rect: NSRect) -> String {
         "x=\(String(format: "%.1f", rect.origin.x)) y=\(String(format: "%.1f", rect.origin.y)) w=\(String(format: "%.1f", rect.width)) h=\(String(format: "%.1f", rect.height))"
@@ -197,6 +200,12 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         rootEntry = Self.directoryEntry(for: self.rootURL)
         refreshPathField()
         reloadBrowsers()
+    }
+
+    func setBrowserContentSuppressed(_ suppressed: Bool) {
+        guard suppressesBrowserContent != suppressed else { return }
+        suppressesBrowserContent = suppressed
+        updateExpandedState()
     }
 
     func setExpanded(_ expanded: Bool, animated: Bool) {
@@ -340,7 +349,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
             let cell = outlineView.makeView(withIdentifier: id, owner: self) as? MediaNameCellView ?? MediaNameCellView()
             cell.identifier = id
             let imageView = cell.imageView ?? NSImageView()
-            imageView.image = NSWorkspace.shared.icon(forFile: entry.url.path)
+            imageView.image = icon(for: entry)
             imageView.imageScaling = .scaleProportionallyDown
             if imageView.superview == nil {
                 cell.addSubview(imageView)
@@ -398,7 +407,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         let item = collectionView.makeItem(withIdentifier: NSUserInterfaceItemIdentifier("iconItem"), for: indexPath)
         guard let iconItem = item as? MediaIconItem, iconEntries.indices.contains(indexPath.item) else { return item }
         let entry = iconEntries[indexPath.item]
-        iconItem.imageView?.image = NSWorkspace.shared.icon(forFile: entry.url.path)
+        iconItem.imageView?.image = icon(for: entry)
         iconItem.textField?.stringValue = entry.name
         return iconItem
     }
@@ -611,8 +620,9 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         upButton.isHidden = !isExpanded
         viewModeControl.isHidden = !isExpanded
         sortButton.isHidden = !isExpanded
-        listScrollView.isHidden = !isExpanded || showsIconView
-        iconScrollView.isHidden = !isExpanded || !showsIconView
+        let showsBrowser = isExpanded && !suppressesBrowserContent
+        listScrollView.isHidden = !showsBrowser || showsIconView
+        iconScrollView.isHidden = !showsBrowser || !showsIconView
     }
 
     private func refreshPathField() {
@@ -645,6 +655,22 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         let loaded = loadEntries(in: entry.url)
         entry.children = loaded
         return loaded
+    }
+
+    private func icon(for entry: MediaEntry) -> NSImage {
+        let fileExtension = entry.url.pathExtension.lowercased()
+        let key = entry.isDirectory ? "folder" : (fileExtension.isEmpty ? "file" : "ext:\(fileExtension)")
+        if let cached = iconCache[key] {
+            return cached
+        }
+        let image: NSImage
+        if entry.isDirectory {
+            image = NSWorkspace.shared.icon(for: .folder)
+        } else {
+            image = NSWorkspace.shared.icon(for: UTType(filenameExtension: fileExtension) ?? .data)
+        }
+        iconCache[key] = image
+        return image
     }
 
     private func loadEntries(in url: URL) -> [MediaEntry] {
@@ -767,6 +793,11 @@ final class MediaFileTreesView: NSView {
         treeA.setExpanded(expanded, animated: animated)
         treeB.setExpanded(expanded, animated: animated)
         needsLayout = true
+    }
+
+    func setBrowserContentSuppressed(_ suppressed: Bool) {
+        treeA.setBrowserContentSuppressed(suppressed)
+        treeB.setBrowserContentSuppressed(suppressed)
     }
 
     func endPathEditingIfNeeded() -> Bool {

@@ -812,7 +812,7 @@ final class MainWindowController: NSWindowController {
         layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: hideIndependentTimelines || canvas.containerB.isHidden, in: content)
     }
 
-    private func animateFileTreeTransition(to expanded: Bool) {
+    private func animateFileTreeTransition(to expanded: Bool, completion: (@MainActor @Sendable () -> Void)? = nil) {
         guard let targetFrames = contentLayoutFrames(expanded: expanded) else { return }
         let startMediaFrame = mediaFileTrees.frame
         let startCanvasFrame = canvas.frame
@@ -849,6 +849,7 @@ final class MainWindowController: NSWindowController {
                         "fileTree.anim.manual.complete expanded=\(expanded) mediaActual=(\(self.rectDebug(self.mediaFileTrees.frame))) canvasActual=(\(self.rectDebug(self.canvas.frame)))"
                     )
                     self.layoutContent(animated: false)
+                    completion?()
                 }
             }
         }
@@ -871,8 +872,12 @@ final class MainWindowController: NSWindowController {
         let previous = fileTreesExpanded
         fileTreesExpanded.toggle()
         Diagnostics.log("fileTree.toggle previous=\(previous) next=\(fileTreesExpanded)")
-        mediaFileTrees.setExpanded(fileTreesExpanded, animated: true)
-        animateFileTreeTransition(to: fileTreesExpanded)
+        let targetExpanded = fileTreesExpanded
+        mediaFileTrees.setBrowserContentSuppressed(true)
+        mediaFileTrees.setExpanded(targetExpanded, animated: true)
+        animateFileTreeTransition(to: targetExpanded) { [weak self] in
+            self?.mediaFileTrees.setBrowserContentSuppressed(!targetExpanded)
+        }
     }
 
     private func reloadMediaFileTrees() {
