@@ -1388,20 +1388,53 @@ final class MainWindowController: NSWindowController {
     }
 
     private func adjustTransform(slot: VideoSlot, dx: Double, dy: Double, dz: Double) {
+        adjustTransform(slot: slot, dx: dx, dy: dy, dz: dz, anchor: nil)
+    }
+
+    private func adjustTransform(slot: VideoSlot, dx: Double, dy: Double, dz: Double, anchor: CGPoint?) {
         guard canvas.allowsAlignmentAdjustment else { return }
         if slot == .a {
             syncState.transformA.panX += dx
             syncState.transformA.panY += dy
-            syncState.transformA.zoom += dz
+            applyZoom(dz, to: &syncState.transformA, slot: slot, anchor: anchor)
             canvas.renderer.transformA = syncState.transformA
             playerA.applyTransform(syncState.transformA)
         } else {
             syncState.transformB.panX += dx
             syncState.transformB.panY += dy
-            syncState.transformB.zoom += dz
+            applyZoom(dz, to: &syncState.transformB, slot: slot, anchor: anchor)
             canvas.renderer.transformB = syncState.transformB
             playerB.applyTransform(syncState.transformB)
         }
+    }
+
+    private func applyZoom(_ dz: Double, to transform: inout TransformState, slot: VideoSlot, anchor: CGPoint?) {
+        guard dz != 0 else { return }
+        guard let anchor else {
+            transform.zoom += dz
+            return
+        }
+        let rect = canvas.videoRect(for: slot)
+        guard rect.width > 0, rect.height > 0 else {
+            transform.zoom += dz
+            return
+        }
+        let zoomRatio = CGFloat(pow(2.0, dz))
+        let oldCenter = CGPoint(
+            x: rect.midX + CGFloat(transform.panX) * rect.width / 2,
+            y: rect.midY + CGFloat(transform.panY) * rect.height / 2
+        )
+        let anchorPoint = CGPoint(
+            x: rect.minX + anchor.x * rect.width,
+            y: rect.minY + anchor.y * rect.height
+        )
+        let newCenter = CGPoint(
+            x: zoomRatio * oldCenter.x + (1 - zoomRatio) * anchorPoint.x,
+            y: zoomRatio * oldCenter.y + (1 - zoomRatio) * anchorPoint.y
+        )
+        transform.panX = Double((newCenter.x - rect.midX) * 2 / rect.width)
+        transform.panY = Double((newCenter.y - rect.midY) * 2 / rect.height)
+        transform.zoom += dz
     }
 
     @objc private func resetTransform() {
@@ -1737,14 +1770,20 @@ final class MainWindowController: NSWindowController {
               canvas.allowsAlignmentAdjustment,
               let content = window?.contentView else { return false }
         let point = content.convert(event.locationInWindow, from: nil)
-        guard canvas.frame.contains(point) else { return false }
+        let anchor: (slot: VideoSlot, relativePoint: CGPoint)?
+        if canvas.frame.contains(point) {
+            anchor = canvas.videoAnchor(at: canvas.convert(point, from: content))
+        } else {
+            anchor = nil
+        }
+        let relativeAnchor = anchor?.relativePoint ?? CGPoint(x: 0.5, y: 0.5)
         let rawDelta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.deltaY
         let dz = max(-0.25, min(0.25, Double(rawDelta) * 0.01))
         if let selectedSlot {
-            adjustTransform(slot: selectedSlot, dx: 0, dy: 0, dz: dz)
+            adjustTransform(slot: selectedSlot, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
         } else {
-            adjustTransform(slot: .a, dx: 0, dy: 0, dz: dz)
-            adjustTransform(slot: .b, dx: 0, dy: 0, dz: dz)
+            adjustTransform(slot: .a, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
+            adjustTransform(slot: .b, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
         }
         return true
     }

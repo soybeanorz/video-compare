@@ -310,6 +310,29 @@ final class VideoCanvasView: NSView {
         selectedSlot = nil
     }
 
+    func videoRect(for slot: VideoSlot) -> NSRect {
+        layoutSubtreeIfNeeded()
+        switch layoutMode {
+        case .sideBySideHorizontal:
+            return slot == .a ? containerA.frame : containerB.frame
+        case .overlapWipe:
+            return activeContentBounds()
+        }
+    }
+
+    func videoAnchor(at point: NSPoint) -> (slot: VideoSlot, relativePoint: CGPoint)? {
+        guard let slot = slot(at: point) else { return nil }
+        let rect = videoRect(for: slot)
+        guard rect.width > 0, rect.height > 0, rect.contains(point) else { return nil }
+        return (
+            slot,
+            CGPoint(
+                x: max(0, min(1, (point.x - rect.minX) / rect.width)),
+                y: max(0, min(1, (point.y - rect.minY) / rect.height))
+            )
+        )
+    }
+
     @discardableResult
     func selectSlot(at point: NSPoint) -> VideoSlot? {
         let slot = slot(at: point)
