@@ -1,6 +1,7 @@
 import AppKit
 import CoreVideo
 import Foundation
+import QuartzCore
 import UniformTypeIdentifiers
 
 final class ContinuousSeekSlider: NSControl {
@@ -233,10 +234,12 @@ final class MainWindowController: NSWindowController {
     private let videoATimeline = TimelineControl()
     private let videoBTimeline = TimelineControl()
     private let helpButton = NSButton(title: "?", target: nil, action: nil)
+    private let mediaFileTrees = MediaFileTreesView(defaultRoot: FileManager.default.homeDirectoryForCurrentUser)
     private let shortcutHelpPanel = NSView()
     private let shortcutHelpLabel = NSTextField(labelWithString: """
     • 1 / 2: 选择视频 A / B
     • Cmd+1 / Cmd+2: 切换左右对比 / 拖动遮罩
+    • Cmd+B: 展开/收起 A/B 文件树
     • Tab: 拖动遮罩分界线切到最左或最右
     • ← / →: 未选中时同步逐帧；选中 A/B 时只调整该视频
     • Space: 未选中时同步播放/暂停；选中 A/B 时按当前模式控制播放
@@ -266,6 +269,7 @@ final class MainWindowController: NSWindowController {
     private var syncBaseTime: Double = 0
     private var syncLoopRange: ClosedRange<Double>?
     private var isSynchronizedPlaying = false
+    private var fileTreesExpanded = false
     private var synchronizedPlaybackToken = 0
     private var synchronizedDebugFrameCount = 0
     private var selectedSlot: VideoSlot? {
@@ -450,11 +454,16 @@ final class MainWindowController: NSWindowController {
         }
         syncTimeline.showsBackground = false
         syncTimeline.showsTimeLabels = false
+        mediaFileTrees.isHidden = true
+        mediaFileTrees.alphaValue = 0
+        mediaFileTrees.treeA.onFileOpened = { [weak self] slot, url in self?.load(url: url, slot: slot) }
+        mediaFileTrees.treeB.onFileOpened = { [weak self] slot, url in self?.load(url: url, slot: slot) }
 
         let controls = [
             layoutControl,
             helpButton,
             shortcutHelpPanel,
+            mediaFileTrees,
             syncTimeline,
             videoATimeline,
             videoBTimeline
@@ -675,6 +684,11 @@ final class MainWindowController: NSWindowController {
         let recentItem = NSMenuItem(title: "最近视频组", action: nil, keyEquivalent: "")
         recentItem.submenu = recentMenu
         fileMenu.addItem(recentItem)
+        fileMenu.addItem(.separator())
+        let toggleTreeItem = NSMenuItem(title: "展开/收起文件树", action: #selector(toggleMediaFileTrees), keyEquivalent: "b")
+        toggleTreeItem.keyEquivalentModifierMask = [.command]
+        toggleTreeItem.target = self
+        fileMenu.addItem(toggleTreeItem)
         fileItem.submenu = fileMenu
 
         let playbackItem = NSMenuItem()
@@ -691,42 +705,94 @@ final class MainWindowController: NSWindowController {
     }
 
     private func layoutContent() {
+        layoutContent(animated: false)
+    }
+
+    private func layoutContent(animated: Bool) {
         guard let content = window?.contentView else { return }
         let w = content.bounds.width
         let h = content.bounds.height
         let pad: CGFloat = 12
         let rowH: CGFloat = 28
         let gap: CGFloat = 8
+        let fileTreeHeight: CGFloat = fileTreesExpanded ? 220 : 0
 
-        func place(_ view: NSView, x: CGFloat, y: CGFloat, width: CGFloat) {
-            view.frame = NSRect(x: x, y: y, width: width, height: rowH)
+        func setFrame(_ view: NSView, _ frame: NSRect) {
+            if animated {
+                view.animator().frame = frame
+            } else {
+                view.frame = frame
+            }
         }
 
-        let layoutWidth: CGFloat = 300
-        let groupX = max(pad, floor((w - layoutWidth) / 2))
         let toolbarY = max(pad, h - pad - rowH)
-        place(layoutControl, x: groupX, y: toolbarY, width: layoutWidth)
-        helpButton.frame = NSRect(x: w - pad - 26, y: toolbarY + 1, width: 26, height: 26)
+        let fileTreeTop = toolbarY - gap
+        let fileTreeFrame = NSRect(
+            x: pad,
+            y: fileTreeTop - fileTreeHeight,
+            width: max(100, w - pad * 2),
+            height: fileTreeHeight
+        )
+
+        let layoutWidth = min(max(300, w * 0.2), 420)
+        let layoutX = floor(content.bounds.midX - layoutWidth / 2)
+        layoutControl.setWidth(layoutWidth / 2, forSegment: 0)
+        layoutControl.setWidth(layoutWidth / 2, forSegment: 1)
+        setFrame(layoutControl, NSRect(x: layoutX, y: toolbarY, width: layoutWidth, height: rowH))
+        setFrame(helpButton, NSRect(x: w - pad - 26, y: toolbarY + 1, width: 26, height: 26))
 
         let helpW: CGFloat = 420
-        let helpH: CGFloat = 214
-        shortcutHelpPanel.frame = NSRect(
+        let helpH: CGFloat = 236
+        setFrame(shortcutHelpPanel, NSRect(
             x: max(pad, w - pad - helpW),
             y: max(pad, toolbarY - helpH - 8),
             width: min(helpW, w - pad * 2),
             height: helpH
-        )
+        ))
         shortcutHelpLabel.frame = shortcutHelpPanel.bounds.insetBy(dx: 14, dy: 12)
 
-        syncTimeline.frame = NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78)
+        setFrame(syncTimeline, NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78))
 
         let canvasY = syncTimeline.frame.maxY + gap
-        let canvasTop = toolbarY - gap
-        canvas.frame = NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY))
+        setFrame(mediaFileTrees, fileTreeFrame)
+        if animated {
+            mediaFileTrees.animator().alphaValue = fileTreesExpanded ? 1 : 0
+        } else {
+            mediaFileTrees.alphaValue = fileTreesExpanded ? 1 : 0
+        }
+
+        let canvasTop = fileTreeFrame.minY - gap
+        setFrame(canvas, NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY)))
         canvas.layoutSubtreeIfNeeded()
         let hideIndependentTimelines = canvas.layoutMode != .sideBySideHorizontal
         layoutVideoTimeline(videoATimeline, over: canvas.containerA.frame, hidden: hideIndependentTimelines || canvas.containerA.isHidden, in: content)
         layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: hideIndependentTimelines || canvas.containerB.isHidden, in: content)
+    }
+
+    @objc private func toggleMediaFileTrees() {
+        fileTreesExpanded.toggle()
+        if fileTreesExpanded {
+            reloadMediaFileTrees()
+            mediaFileTrees.isHidden = false
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.22
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layoutContent(animated: true)
+        } completionHandler: {
+            if !self.fileTreesExpanded {
+                self.mediaFileTrees.isHidden = true
+            }
+        }
+    }
+
+    private func reloadMediaFileTrees() {
+        mediaFileTrees.reload(rootA: mediaRoot(for: .a), rootB: mediaRoot(for: .b))
+    }
+
+    private func mediaRoot(for slot: VideoSlot) -> URL {
+        let url = slot == .a ? playerA?.fileURL : playerB?.fileURL
+        return url?.deletingLastPathComponent() ?? FileManager.default.homeDirectoryForCurrentUser
     }
 
     private func layoutVideoTimeline(_ timeline: TimelineControl, over canvasRect: NSRect, hidden: Bool, in content: NSView) {
@@ -791,6 +857,7 @@ final class MainWindowController: NSWindowController {
             canvas.containerB.showsPlaceholder = false
             playerB.load(url: url)
         }
+        reloadMediaFileTrees()
         loadPairStateIfReady()
     }
 
@@ -1478,6 +1545,9 @@ final class MainWindowController: NSWindowController {
                 case "2":
                     applyLayout(.overlapWipe)
                     return true
+                case "b":
+                    toggleMediaFileTrees()
+                    return true
                 default:
                     break
                 }
@@ -1573,7 +1643,8 @@ final class MainWindowController: NSWindowController {
             layoutControl,
             syncTimeline,
             videoATimeline,
-            videoBTimeline
+            videoBTimeline,
+            mediaFileTrees
         ].contains(where: { $0.frame.contains(point) }) {
             return
         } else {
