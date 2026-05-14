@@ -6,8 +6,8 @@ VideoCompare 是一个面向画质、机位和视频版本对比的 macOS 本地
 
 ### 视频加载和播放管线
 
-- A/B 两路视频分别加载，支持文件选择、Finder 拖入和已挂载的 SMB 网络盘路径。
-- 支持 `mp4`、`mov`、`mkv`，面向 H.264/H.265 硬解码播放；暂不以 HDR/BT.2020 为目标。
+- A/B 两路媒体分别加载，支持文件选择、Finder 拖入和已挂载的 SMB 网络盘路径；一次拖入 2 个受支持文件时会同时加载到 A/B。
+- 视频支持 `mp4`、`mov`、`mkv`，面向 H.264/H.265 硬解码播放；照片支持 `jpg`、`jpeg`、`png`、`heic`、`heif`、`tif`、`tiff`、`bmp`、`gif`、`webp`。暂不以 HDR/BT.2020 为目标。
 - 使用 FFmpeg 解封装、VideoToolbox 硬解码、Metal 合成渲染，两路视频始终在同一个 app 窗口内显示。
 - 默认不加载字幕，播放菜单中可切换。
 

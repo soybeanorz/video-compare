@@ -46,6 +46,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private var frameHistoryIndex: Int?
     private var frameCache: [Int: NativeVideoFrame] = [:]
     private var frameCacheOrder: [Int] = []
+    private var staticImageFrame: NativeVideoFrame?
 
     private(set) var fileURL: URL?
     private(set) var timePosition: Double = 0
@@ -91,6 +92,15 @@ final class NativeVideoPlayer: @unchecked Sendable {
         frameHistoryIndex = nil
         frameCache.removeAll(keepingCapacity: true)
         frameCacheOrder.removeAll(keepingCapacity: true)
+        staticImageFrame = nil
+        duration = 0
+        timePosition = 0
+        fps = 60
+        notifyStatus()
+        if MediaFileSupport.isImage(url) {
+            loadStaticImage(url: url)
+            return
+        }
         let path = url.path
         queue.async {
             if let old = self.decoder {
@@ -123,6 +133,11 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func setPause(_ paused: Bool, force: Bool = false) {
+        if staticImageFrame != nil {
+            isPaused = true
+            notifyStatus()
+            return
+        }
         guard force || isPaused != paused else { return }
         isPaused = paused
         if paused {
@@ -134,6 +149,11 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func setSynchronizedPlaybackActive(_ active: Bool) {
+        if staticImageFrame != nil {
+            isPaused = true
+            notifyStatus()
+            return
+        }
         playbackGeneration += 1
         isPaused = !active
         notifyStatus()
@@ -144,6 +164,10 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func seekAbsolute(_ seconds: Double, exact: Bool = true) {
+        if let staticImageFrame {
+            presentStaticImageFrame(staticImageFrame)
+            return
+        }
         stateLock.lock()
         seekGeneration += 1
         let generation = seekGeneration
@@ -189,6 +213,11 @@ final class NativeVideoPlayer: @unchecked Sendable {
 
     func stepFrame(direction: Int, completion: @escaping (Double?) -> Void) {
         setPause(true)
+        if let staticImageFrame {
+            presentStaticImageFrame(staticImageFrame)
+            completion(staticImageFrame.pts)
+            return
+        }
         if direction < 0, presentPreviousFrameFromHistory(completion: completion) {
             return
         }
@@ -256,6 +285,10 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     func decodeNextFrameForSynchronization(completion: @escaping (NativeVideoFrame?) -> Void) {
+        if let staticImageFrame {
+            completion(staticImageFrame)
+            return
+        }
         queue.async {
             guard self.decoder != nil else {
                 DispatchQueue.main.async { completion(nil) }
@@ -312,6 +345,12 @@ final class NativeVideoPlayer: @unchecked Sendable {
 
     private func presentHistoricalFrame(_ frame: NativeVideoFrame) {
         timePosition = frame.pts
+        onFrameDecoded?(slot, frame.pixelBuffer, frame.pts)
+        notifyStatus()
+    }
+
+    private func presentStaticImageFrame(_ frame: NativeVideoFrame) {
+        timePosition = 0
         onFrameDecoded?(slot, frame.pixelBuffer, frame.pts)
         notifyStatus()
     }
@@ -377,6 +416,11 @@ final class NativeVideoPlayer: @unchecked Sendable {
     }
 
     private func startPlaybackLoop() {
+        guard staticImageFrame == nil else {
+            isPaused = true
+            notifyStatus()
+            return
+        }
         playbackGeneration += 1
         let generation = playbackGeneration
         queue.async {
@@ -466,5 +510,82 @@ final class NativeVideoPlayer: @unchecked Sendable {
                 self.onStatusChanged?()
             }
         }
+    }
+
+    private func loadStaticImage(url: URL) {
+        let path = url.path
+        queue.async {
+            if let old = self.decoder {
+                vc_decoder_close(old)
+                self.decoder = nil
+            }
+            do {
+                let pixelBuffer = try Self.makePixelBuffer(fromImageAt: url)
+                let frame = NativeVideoFrame(pixelBuffer: pixelBuffer, pts: 0, duration: 0)
+                Diagnostics.log("player.\(self.slot.rawValue).image.opened path=\(path) width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer))")
+                DispatchQueue.main.async {
+                    self.staticImageFrame = frame
+                    self.duration = 0
+                    self.fps = 1
+                    self.timePosition = 0
+                    self.presentStaticImageFrame(frame)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.onOpenFailed?(self.slot, error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private static func makePixelBuffer(fromImageAt url: URL) throws -> CVPixelBuffer {
+        guard let image = NSImage(contentsOf: url) else {
+            throw NSError(domain: "VideoCompare.ImageLoad", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法打开照片"])
+        }
+        var proposedRect = NSRect(origin: .zero, size: image.size)
+        guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+            throw NSError(domain: "VideoCompare.ImageLoad", code: 2, userInfo: [NSLocalizedDescriptionKey: "无法解码照片"])
+        }
+        let width = max(1, cgImage.width)
+        let height = max(1, cgImage.height)
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+        ]
+        var pixelBuffer: CVPixelBuffer?
+        let createResult = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            attrs as CFDictionary,
+            &pixelBuffer
+        )
+        guard createResult == kCVReturnSuccess, let pixelBuffer else {
+            throw NSError(domain: "VideoCompare.ImageLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "无法创建照片缓冲区"])
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw NSError(domain: "VideoCompare.ImageLoad", code: 4, userInfo: [NSLocalizedDescriptionKey: "无法写入照片缓冲区"])
+        }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        guard let context = CGContext(
+            data: baseAddress,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            throw NSError(domain: "VideoCompare.ImageLoad", code: 5, userInfo: [NSLocalizedDescriptionKey: "无法渲染照片"])
+        }
+        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return pixelBuffer
     }
 }

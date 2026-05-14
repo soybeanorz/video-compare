@@ -424,6 +424,8 @@ final class MainWindowController: NSWindowController {
 
         canvas.containerA.onFileDropped = { [weak self] _, url in self?.load(url: url, slot: .a) }
         canvas.containerB.onFileDropped = { [weak self] _, url in self?.load(url: url, slot: .b) }
+        canvas.containerA.onFilesDropped = { [weak self] _, urls in self?.loadDroppedFiles(urls) }
+        canvas.containerB.onFilesDropped = { [weak self] _, urls in self?.loadDroppedFiles(urls) }
         canvas.onPanDragged = { [weak self] slot, dx, dy in
             if self?.selectedSlot != slot {
                 self?.selectedSlot = slot
@@ -753,7 +755,7 @@ final class MainWindowController: NSWindowController {
 
     private func open(slot: VideoSlot) {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = ["mp4", "mov", "mkv"].compactMap { UTType(filenameExtension: $0) }
+        panel.allowedContentTypes = MediaFileSupport.allowedContentTypes
         panel.allowsOtherFileTypes = true
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -761,6 +763,16 @@ final class MainWindowController: NSWindowController {
         if panel.runModal() == .OK, let url = panel.url {
             load(url: url, slot: slot)
         }
+    }
+
+    private func loadDroppedFiles(_ urls: [URL]) {
+        guard urls.count >= 2 else {
+            if let url = urls.first {
+                load(url: url, slot: .a)
+            }
+            return
+        }
+        loadInitial(a: urls[0], b: urls[1])
     }
 
     private func load(url: URL, slot: VideoSlot) {

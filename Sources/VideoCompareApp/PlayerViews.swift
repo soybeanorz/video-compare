@@ -3,12 +3,13 @@ import AppKit
 final class DropVideoView: NSView {
     var slot: VideoSlot
     var onFileDropped: ((VideoSlot, URL) -> Void)?
+    var onFilesDropped: ((VideoSlot, [URL]) -> Void)?
     var showsPlaceholder = true {
         didSet {
             placeholderLabel.isHidden = !showsPlaceholder
         }
     }
-    private let placeholderLabel = NSTextField(labelWithString: "拖入视频以加载")
+    private let placeholderLabel = NSTextField(labelWithString: "拖入视频/照片以加载")
 
     init(slot: VideoSlot) {
         self.slot = slot
@@ -16,7 +17,7 @@ final class DropVideoView: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.masksToBounds = true
-        registerForDraggedTypes([.fileURL])
+        registerForDraggedTypes([.fileURL, .URL, .init("NSFilenamesPboardType")])
 
         placeholderLabel.font = NSFont.systemFont(ofSize: 18, weight: .medium)
         placeholderLabel.textColor = NSColor(calibratedWhite: 0.78, alpha: 1)
@@ -31,12 +32,18 @@ final class DropVideoView: NSView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        url(from: sender) == nil ? [] : .copy
+        urls(from: sender).isEmpty ? [] : .copy
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let url = url(from: sender) else { return false }
-        onFileDropped?(slot, url)
+        let urls = urls(from: sender)
+        Diagnostics.log("drop slot=\(slot.rawValue) supportedFiles=\(urls.count) paths=\(urls.map(\.path).joined(separator: " | "))")
+        guard !urls.isEmpty else { return false }
+        if urls.count == 1, let url = urls.first {
+            onFileDropped?(slot, url)
+        } else {
+            onFilesDropped?(slot, Array(urls.prefix(2)))
+        }
         return true
     }
 
@@ -51,13 +58,40 @@ final class DropVideoView: NSView {
         )
     }
 
-    private func url(from sender: NSDraggingInfo) -> URL? {
-        guard let item = sender.draggingPasteboard.pasteboardItems?.first,
-              let value = item.string(forType: .fileURL),
-              let url = URL(string: value) else { return nil }
-        let ext = url.pathExtension.lowercased()
-        return ["mp4", "mov", "mkv"].contains(ext) ? url : nil
+    private func urls(from sender: NSDraggingInfo) -> [URL] {
+        let pasteboard = sender.draggingPasteboard
+        var urls: [URL] = []
+
+        if let readURLs = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] {
+            urls.append(contentsOf: readURLs)
+        }
+
+        if let filenames = pasteboard.propertyList(forType: .init("NSFilenamesPboardType")) as? [String] {
+            urls.append(contentsOf: filenames.map { URL(fileURLWithPath: $0) })
+        }
+
+        if let items = pasteboard.pasteboardItems {
+            urls.append(contentsOf: items.compactMap { item in
+                guard let value = item.string(forType: .fileURL),
+                      let url = URL(string: value) else { return nil }
+                return url
+            })
+        }
+
+        var seen = Set<String>()
+        return urls.compactMap { url in
+            let standardized = url.standardizedFileURL
+            guard MediaFileSupport.isSupported(standardized), seen.insert(standardized.path).inserted else { return nil }
+            return standardized
+        }
     }
+}
+
+private extension NSPasteboard.PasteboardType {
+    static let URL = NSPasteboard.PasteboardType("public.url")
 }
 
 final class WipeDividerView: NSView {
