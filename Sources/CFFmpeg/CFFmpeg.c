@@ -23,6 +23,9 @@ struct VCDecoder {
     double fps;
     int width;
     int height;
+    double *keyframes;
+    int keyframe_count;
+    int keyframe_capacity;
 };
 
 static void set_error(char *error, int error_len, const char *message, int code) {
@@ -80,6 +83,50 @@ static int output_frame(VCDecoder *decoder, VCDecodedFrame *out_frame) {
     out_frame->width = decoder->width;
     out_frame->height = decoder->height;
     return 1;
+}
+
+static int add_keyframe(VCDecoder *decoder, double seconds) {
+    if (!decoder || seconds < 0) {
+        return 0;
+    }
+    if (decoder->keyframe_count > 0 && seconds <= decoder->keyframes[decoder->keyframe_count - 1] + 0.0001) {
+        return 0;
+    }
+    if (decoder->keyframe_count == decoder->keyframe_capacity) {
+        int next_capacity = decoder->keyframe_capacity == 0 ? 256 : decoder->keyframe_capacity * 2;
+        double *next = realloc(decoder->keyframes, sizeof(double) * (size_t)next_capacity);
+        if (!next) {
+            return AVERROR(ENOMEM);
+        }
+        decoder->keyframes = next;
+        decoder->keyframe_capacity = next_capacity;
+    }
+    decoder->keyframes[decoder->keyframe_count++] = seconds;
+    return 0;
+}
+
+static void build_keyframe_index(VCDecoder *decoder, AVStream *stream) {
+    if (!decoder || !stream) {
+        return;
+    }
+
+#if LIBAVFORMAT_VERSION_MAJOR >= 58
+    int entry_count = avformat_index_get_entries_count(stream);
+    for (int index = 0; index < entry_count; index++) {
+        const AVIndexEntry *entry = avformat_index_get_entry(stream, index);
+        if (entry && (entry->flags & AVINDEX_KEYFRAME)) {
+            add_keyframe(decoder, timestamp_to_seconds(entry->timestamp, decoder->time_base));
+        }
+    }
+#else
+    for (int index = 0; index < stream->nb_index_entries; index++) {
+        const AVIndexEntry *entry = &stream->index_entries[index];
+        if (entry && (entry->flags & AVINDEX_KEYFRAME)) {
+            add_keyframe(decoder, timestamp_to_seconds(entry->timestamp, decoder->time_base));
+        }
+    }
+#endif
+    add_keyframe(decoder, 0);
 }
 
 static int receive_available_frame(VCDecoder *decoder, VCDecodedFrame *out_frame) {
@@ -238,10 +285,11 @@ VCDecoder *vc_decoder_open(const char *path, char *error, int error_len) {
         decoder->duration = 0;
     }
 
+    build_keyframe_index(decoder, stream);
     return decoder;
 }
 
-int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame) {
+int vc_decoder_seek_collect(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame, volatile int *seek_generation, int generation, VCFrameCallback callback, void *context) {
     if (!decoder || !out_frame) {
         return AVERROR(EINVAL);
     }
@@ -249,7 +297,8 @@ int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFram
         seconds = 0;
     }
 
-    int64_t timestamp = (int64_t)(seconds / av_q2d(decoder->time_base));
+    double seek_seconds = exact ? seconds : vc_decoder_keyframe_before(decoder, seconds);
+    int64_t timestamp = (int64_t)(seek_seconds / av_q2d(decoder->time_base));
     int result = av_seek_frame(decoder->format, decoder->stream_index, timestamp, AVSEEK_FLAG_BACKWARD);
     if (result < 0) {
         return result;
@@ -262,12 +311,27 @@ int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFram
     }
 
     while ((result = vc_decoder_next(decoder, out_frame)) > 0) {
+        if (seek_generation && *seek_generation != generation) {
+            vc_frame_release(out_frame);
+            return AVERROR_EXIT;
+        }
         if (!exact || out_frame->pts + 0.0001 >= threshold) {
             return 1;
+        }
+        if (callback) {
+            callback(out_frame, context);
         }
         vc_frame_release(out_frame);
     }
     return result;
+}
+
+int vc_decoder_seek_cancelable(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame, volatile int *seek_generation, int generation) {
+    return vc_decoder_seek_collect(decoder, seconds, exact, out_frame, seek_generation, generation, NULL, NULL);
+}
+
+int vc_decoder_seek(VCDecoder *decoder, double seconds, int exact, VCDecodedFrame *out_frame) {
+    return vc_decoder_seek_cancelable(decoder, seconds, exact, out_frame, NULL, 0);
 }
 
 void vc_decoder_close(VCDecoder *decoder) {
@@ -289,6 +353,7 @@ void vc_decoder_close(VCDecoder *decoder) {
     if (decoder->format) {
         avformat_close_input(&decoder->format);
     }
+    free(decoder->keyframes);
     free(decoder);
 }
 
@@ -306,6 +371,34 @@ int vc_decoder_width(VCDecoder *decoder) {
 
 int vc_decoder_height(VCDecoder *decoder) {
     return decoder ? decoder->height : 0;
+}
+
+int vc_decoder_keyframe_count(VCDecoder *decoder) {
+    return decoder ? decoder->keyframe_count : 0;
+}
+
+double vc_decoder_keyframe_before(VCDecoder *decoder, double seconds) {
+    if (!decoder) {
+        return seconds;
+    }
+    if (decoder->keyframe_count <= 0) {
+        return seconds;
+    }
+    if (seconds <= 0) {
+        return 0;
+    }
+    int low = 0;
+    int high = decoder->keyframe_count - 1;
+    while (low <= high) {
+        int mid = low + (high - low) / 2;
+        if (decoder->keyframes[mid] <= seconds) {
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    int index = high < 0 ? 0 : high;
+    return decoder->keyframes[index];
 }
 
 void vc_frame_release(VCDecodedFrame *frame) {
