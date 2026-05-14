@@ -233,13 +233,14 @@ final class MainWindowController: NSWindowController {
     private let syncTimeline = TimelineControl()
     private let videoATimeline = TimelineControl()
     private let videoBTimeline = TimelineControl()
+    private let fileTreeToggleButton = NSButton()
     private let helpButton = NSButton(title: "?", target: nil, action: nil)
     private let mediaFileTrees = MediaFileTreesView(defaultRoot: FileManager.default.homeDirectoryForCurrentUser)
     private let shortcutHelpPanel = NSView()
     private let shortcutHelpLabel = NSTextField(labelWithString: """
     • 1 / 2: 选择视频 A / B
     • Cmd+1 / Cmd+2: 切换左右对比 / 拖动遮罩
-    • Cmd+B: 展开/收起 A/B 文件树
+    • Cmd+B: 展开/收起文件面板
     • Tab: 拖动遮罩分界线切到最左或最右
     • ← / →: 未选中时同步逐帧；选中 A/B 时只调整该视频
     • Space: 未选中时同步播放/暂停；选中 A/B 时按当前模式控制播放
@@ -461,12 +462,13 @@ final class MainWindowController: NSWindowController {
 
         let controls = [
             layoutControl,
+            fileTreeToggleButton,
             helpButton,
-            shortcutHelpPanel,
             mediaFileTrees,
             syncTimeline,
             videoATimeline,
-            videoBTimeline
+            videoBTimeline,
+            shortcutHelpPanel
         ] as [NSView]
         content.addSubview(canvas)
         controls.forEach(content.addSubview)
@@ -634,6 +636,19 @@ final class MainWindowController: NSWindowController {
     }
 
     private func configureShortcutHelp() {
+        fileTreeToggleButton.target = self
+        fileTreeToggleButton.action = #selector(toggleMediaFileTrees)
+        fileTreeToggleButton.isBordered = false
+        fileTreeToggleButton.imagePosition = .imageOnly
+        fileTreeToggleButton.contentTintColor = .labelColor
+        fileTreeToggleButton.toolTip = "展开/收起文件面板 (Cmd+B)"
+        fileTreeToggleButton.wantsLayer = true
+        fileTreeToggleButton.layer?.cornerRadius = 8
+        fileTreeToggleButton.layer?.borderWidth = 1
+        fileTreeToggleButton.layer?.borderColor = NSColor.separatorColor.cgColor
+        fileTreeToggleButton.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        updateFileTreeToggleButton()
+
         helpButton.target = self
         helpButton.action = #selector(toggleShortcutHelp)
         helpButton.isBordered = false
@@ -663,6 +678,17 @@ final class MainWindowController: NSWindowController {
 
     @objc private func toggleShortcutHelp() {
         shortcutHelpPanel.isHidden.toggle()
+        bringShortcutHelpToFront()
+    }
+
+    private func bringShortcutHelpToFront() {
+        guard let content = window?.contentView, shortcutHelpPanel.superview === content else { return }
+        content.addSubview(shortcutHelpPanel, positioned: .above, relativeTo: nil)
+    }
+
+    private func updateFileTreeToggleButton() {
+        let symbolName = fileTreesExpanded ? "chevron.up" : "chevron.down"
+        fileTreeToggleButton.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: fileTreesExpanded ? "Collapse file panel" : "Expand file panel")
     }
 
     private func setupMenu() {
@@ -714,6 +740,7 @@ final class MainWindowController: NSWindowController {
     private struct ContentLayoutFrames {
         let layoutControl: NSRect
         let helpButton: NSRect
+        let fileTreeToggleButton: NSRect
         let shortcutHelpPanel: NSRect
         let syncTimeline: NSRect
         let mediaFileTrees: NSRect
@@ -764,16 +791,20 @@ final class MainWindowController: NSWindowController {
         let canvasTop = fileTreeFrame.minY - gap
         let helpW: CGFloat = 420
         let helpH: CGFloat = 236
+        let helpFrame = NSRect(
+            x: max(pad, w - pad - helpW),
+            y: max(pad, toolbarY - helpH - 8),
+            width: min(helpW, w - pad * 2),
+            height: helpH
+        )
+        let helpButtonFrame = NSRect(x: w - pad - 26, y: toolbarY + 1, width: 26, height: 26)
+        let fileTreeButtonFrame = NSRect(x: helpButtonFrame.minX - 38, y: toolbarY, width: 30, height: 28)
 
         return ContentLayoutFrames(
             layoutControl: NSRect(x: layoutX, y: toolbarY, width: layoutWidth, height: rowH),
-            helpButton: NSRect(x: w - pad - 26, y: toolbarY + 1, width: 26, height: 26),
-            shortcutHelpPanel: NSRect(
-                x: max(pad, w - pad - helpW),
-                y: max(pad, toolbarY - helpH - 8),
-                width: min(helpW, w - pad * 2),
-                height: helpH
-            ),
+            helpButton: helpButtonFrame,
+            fileTreeToggleButton: fileTreeButtonFrame,
+            shortcutHelpPanel: helpFrame,
             syncTimeline: syncTimelineFrame,
             mediaFileTrees: fileTreeFrame,
             canvas: NSRect(x: 0, y: canvasY, width: w, height: max(100, canvasTop - canvasY))
@@ -798,8 +829,10 @@ final class MainWindowController: NSWindowController {
         layoutControl.setWidth(frames.layoutControl.width / 2, forSegment: 0)
         layoutControl.setWidth(frames.layoutControl.width / 2, forSegment: 1)
         setFrame(layoutControl, frames.layoutControl)
+        setFrame(fileTreeToggleButton, frames.fileTreeToggleButton)
         setFrame(helpButton, frames.helpButton)
         setFrame(shortcutHelpPanel, frames.shortcutHelpPanel)
+        bringShortcutHelpToFront()
         shortcutHelpLabel.frame = shortcutHelpPanel.bounds.insetBy(dx: 14, dy: 12)
 
         setFrame(syncTimeline, frames.syncTimeline)
@@ -816,6 +849,7 @@ final class MainWindowController: NSWindowController {
         guard let targetFrames = contentLayoutFrames(expanded: expanded) else { return }
         let startMediaFrame = mediaFileTrees.frame
         let startCanvasFrame = canvas.frame
+        let startHelpFrame = shortcutHelpPanel.frame
         Diagnostics.log(
             "fileTree.anim.request expanded=\(expanded) mediaStart=(\(rectDebug(startMediaFrame))) mediaTarget=(\(rectDebug(targetFrames.mediaFileTrees))) canvasStart=(\(rectDebug(startCanvasFrame))) canvasTarget=(\(rectDebug(targetFrames.canvas)))"
         )
@@ -834,11 +868,15 @@ final class MainWindowController: NSWindowController {
                 let progress = self.easeInOut(raw)
                 self.mediaFileTrees.frame = self.interpolatedRect(from: startMediaFrame, to: targetFrames.mediaFileTrees, progress: progress)
                 self.canvas.frame = self.interpolatedRect(from: startCanvasFrame, to: targetFrames.canvas, progress: progress)
+                if !self.shortcutHelpPanel.isHidden {
+                    self.shortcutHelpPanel.frame = self.interpolatedRect(from: startHelpFrame, to: targetFrames.shortcutHelpPanel, progress: progress)
+                }
 
                 if raw >= 1 {
                     self.fileTreeAnimationTimer?.invalidate()
                     self.fileTreeAnimationTimer = nil
                     self.layoutControl.frame = targetFrames.layoutControl
+                    self.fileTreeToggleButton.frame = targetFrames.fileTreeToggleButton
                     self.helpButton.frame = targetFrames.helpButton
                     self.shortcutHelpPanel.frame = targetFrames.shortcutHelpPanel
                     self.syncTimeline.frame = targetFrames.syncTimeline
@@ -873,6 +911,7 @@ final class MainWindowController: NSWindowController {
         fileTreesExpanded.toggle()
         Diagnostics.log("fileTree.toggle previous=\(previous) next=\(fileTreesExpanded)")
         let targetExpanded = fileTreesExpanded
+        updateFileTreeToggleButton()
         mediaFileTrees.setBrowserContentSuppressed(true)
         mediaFileTrees.setExpanded(targetExpanded, animated: true)
         animateFileTreeTransition(to: targetExpanded) { [weak self] in
@@ -1746,6 +1785,8 @@ final class MainWindowController: NSWindowController {
             syncTimeline,
             videoATimeline,
             videoBTimeline,
+            fileTreeToggleButton,
+            shortcutHelpPanel,
             mediaFileTrees
         ].contains(where: { $0.frame.contains(point) }) {
             return
