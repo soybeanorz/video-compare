@@ -2,6 +2,7 @@ import AppKit
 
 final class VideoCompareWindow: NSWindow {
     var onKeyPressed: ((NSEvent) -> Bool)?
+    var onKeyReleased: ((NSEvent) -> Bool)?
     var onMouseDownInContent: ((NSPoint) -> Void)?
     var onScrollWheelInContent: ((NSEvent) -> Bool)?
 
@@ -16,6 +17,9 @@ final class VideoCompareWindow: NSWindow {
 
     override func sendEvent(_ event: NSEvent) {
         if event.type == .keyDown, onKeyPressed?(event) == true {
+            return
+        }
+        if event.type == .keyUp, onKeyReleased?(event) == true {
             return
         }
         if event.type == .leftMouseDown, let contentView {

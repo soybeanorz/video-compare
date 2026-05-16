@@ -23,6 +23,40 @@ struct TransformState: Codable, Equatable {
     var zoom: Double = 0
 }
 
+struct ColorAdjustmentState: Equatable {
+    var isEnabled = true
+    var exposure: Double = 0
+    var contrast: Double = 0
+    var brightness: Double = 0
+    var saturation: Double = 0
+    var temperature: Double = 0
+    var tint: Double = 0
+    var blackPoint: Double = 0
+    var whitePoint: Double = 1
+    var sharpness: Double = 0
+    var curveShadows: Double = 0.25
+    var curveMidtones: Double = 0.5
+    var curveHighlights: Double = 0.75
+
+    static let histogramBinCount = 64
+
+    static func defaultHistogram() -> [Double] {
+        Array(repeating: 0, count: histogramBinCount)
+    }
+}
+
+struct ColorHistogram: Equatable {
+    var red: [Double] = ColorAdjustmentState.defaultHistogram()
+    var green: [Double] = ColorAdjustmentState.defaultHistogram()
+    var blue: [Double] = ColorAdjustmentState.defaultHistogram()
+
+    static let empty = ColorHistogram()
+
+    var isEmpty: Bool {
+        !red.contains { $0 > 0 } && !green.contains { $0 > 0 } && !blue.contains { $0 > 0 }
+    }
+}
+
 struct SyncState: Codable, Equatable {
     var offsetFramesA: Int = 0
     var offsetFramesB: Int = 0

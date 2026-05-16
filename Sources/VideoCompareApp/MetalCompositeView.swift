@@ -13,6 +13,23 @@ private struct MetalVideoUniforms {
     var viewportSize: SIMD2<Float>
     var fullRange: Float
     var bitDepth: Float
+    var textureSize: SIMD2<Float>
+}
+
+private struct MetalColorAdjustmentUniforms {
+    var enabled: Float
+    var exposure: Float
+    var contrast: Float
+    var brightness: Float
+    var saturation: Float
+    var temperature: Float
+    var tint: Float
+    var blackPoint: Float
+    var whitePoint: Float
+    var sharpness: Float
+    var curveShadows: Float
+    var curveMidtones: Float
+    var curveHighlights: Float
 }
 
 final class MetalCompositeView: MTKView {
@@ -41,6 +58,15 @@ final class MetalCompositeView: MTKView {
         didSet { needsDisplay = true }
     }
     var transformB = TransformState() {
+        didSet { needsDisplay = true }
+    }
+    var colorAdjustmentA = ColorAdjustmentState() {
+        didSet { needsDisplay = true }
+    }
+    var colorAdjustmentB = ColorAdjustmentState() {
+        didSet { needsDisplay = true }
+    }
+    var originalBypassSlot: VideoSlot? {
         didSet { needsDisplay = true }
     }
 
@@ -115,7 +141,7 @@ final class MetalCompositeView: MTKView {
 
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
         let viewport = SIMD2<Float>(Float(bounds.width * scale), Float(bounds.height * scale))
-        var uniforms = MetalVideoUniforms(viewportSize: viewport, fullRange: 0, bitDepth: 8)
+        var uniforms = MetalVideoUniforms(viewportSize: viewport, fullRange: 0, bitDepth: 8, textureSize: SIMD2<Float>(1, 1))
 
         switch layoutMode {
         case .sideBySideHorizontal:
@@ -137,15 +163,18 @@ final class MetalCompositeView: MTKView {
     private func draw(slot: VideoSlot, appRect: CGRect, clip: CGRect, encoder: MTLRenderCommandEncoder, uniforms: inout MetalVideoUniforms) {
         let pixelBuffer: CVPixelBuffer?
         var transform: TransformState
+        let adjustment: ColorAdjustmentState
         let visible: Bool
         switch slot {
         case .a:
             pixelBuffer = frameA
             transform = transformA
+            adjustment = originalBypassSlot == .a ? disabledAdjustment(from: colorAdjustmentA) : colorAdjustmentA
             visible = visibleA
         case .b:
             pixelBuffer = frameB
             transform = transformB
+            adjustment = originalBypassSlot == .b ? disabledAdjustment(from: colorAdjustmentB) : colorAdjustmentB
             visible = visibleB
         }
         guard visible, let pixelBuffer, appRect.width > 1, appRect.height > 1 else { return }
@@ -184,13 +213,13 @@ final class MetalCompositeView: MTKView {
         ]
 
         if CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 {
-            drawYUV(pixelBuffer: pixelBuffer, pixelFormat: pixelFormat, vertices: &vertices, encoder: encoder, uniforms: &uniforms)
+            drawYUV(pixelBuffer: pixelBuffer, pixelFormat: pixelFormat, vertices: &vertices, encoder: encoder, uniforms: &uniforms, adjustment: adjustment)
         } else {
-            drawBGRA(pixelBuffer: pixelBuffer, vertices: &vertices, encoder: encoder, uniforms: &uniforms)
+            drawBGRA(pixelBuffer: pixelBuffer, vertices: &vertices, encoder: encoder, uniforms: &uniforms, adjustment: adjustment)
         }
     }
 
-    private func drawYUV(pixelBuffer: CVPixelBuffer, pixelFormat: OSType, vertices: inout [MetalVideoVertex], encoder: MTLRenderCommandEncoder, uniforms: inout MetalVideoUniforms) {
+    private func drawYUV(pixelBuffer: CVPixelBuffer, pixelFormat: OSType, vertices: inout [MetalVideoVertex], encoder: MTLRenderCommandEncoder, uniforms: inout MetalVideoUniforms, adjustment: ColorAdjustmentState) {
         let is10Bit = pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
         let fullRange = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
         let yFormat: MTLPixelFormat = is10Bit ? .r16Unorm : .r8Unorm
@@ -201,20 +230,27 @@ final class MetalCompositeView: MTKView {
 
         uniforms.fullRange = fullRange ? 1 : 0
         uniforms.bitDepth = is10Bit ? 10 : 8
+        uniforms.textureSize = SIMD2<Float>(Float(CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)), Float(CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)))
+        var adjustmentUniforms = metalAdjustmentUniforms(from: adjustment)
         encoder.setRenderPipelineState(yuvPipeline)
         encoder.setVertexBytes(&vertices, length: MemoryLayout<MetalVideoVertex>.stride * vertices.count, index: 0)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalVideoUniforms>.stride, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalVideoUniforms>.stride, index: 0)
+        encoder.setFragmentBytes(&adjustmentUniforms, length: MemoryLayout<MetalColorAdjustmentUniforms>.stride, index: 1)
         encoder.setFragmentTexture(yTexture, index: 0)
         encoder.setFragmentTexture(uvTexture, index: 1)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: vertices.count)
     }
 
-    private func drawBGRA(pixelBuffer: CVPixelBuffer, vertices: inout [MetalVideoVertex], encoder: MTLRenderCommandEncoder, uniforms: inout MetalVideoUniforms) {
+    private func drawBGRA(pixelBuffer: CVPixelBuffer, vertices: inout [MetalVideoVertex], encoder: MTLRenderCommandEncoder, uniforms: inout MetalVideoUniforms, adjustment: ColorAdjustmentState) {
         guard let texture = texture(from: pixelBuffer, pixelFormat: .bgra8Unorm, plane: 0) else { return }
+        uniforms.textureSize = SIMD2<Float>(Float(CVPixelBufferGetWidth(pixelBuffer)), Float(CVPixelBufferGetHeight(pixelBuffer)))
+        var adjustmentUniforms = metalAdjustmentUniforms(from: adjustment)
         encoder.setRenderPipelineState(bgraPipeline)
         encoder.setVertexBytes(&vertices, length: MemoryLayout<MetalVideoVertex>.stride * vertices.count, index: 0)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalVideoUniforms>.stride, index: 1)
+        encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalVideoUniforms>.stride, index: 0)
+        encoder.setFragmentBytes(&adjustmentUniforms, length: MemoryLayout<MetalColorAdjustmentUniforms>.stride, index: 1)
         encoder.setFragmentTexture(texture, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: vertices.count)
     }
@@ -250,6 +286,30 @@ final class MetalCompositeView: MTKView {
         CGRect(x: rect.minX * scale, y: rect.minY * scale, width: rect.width * scale, height: rect.height * scale)
     }
 
+    private func disabledAdjustment(from adjustment: ColorAdjustmentState) -> ColorAdjustmentState {
+        var disabled = adjustment
+        disabled.isEnabled = false
+        return disabled
+    }
+
+    private func metalAdjustmentUniforms(from adjustment: ColorAdjustmentState) -> MetalColorAdjustmentUniforms {
+        MetalColorAdjustmentUniforms(
+            enabled: adjustment.isEnabled ? 1 : 0,
+            exposure: Float(adjustment.exposure),
+            contrast: Float(adjustment.contrast),
+            brightness: Float(adjustment.brightness),
+            saturation: Float(adjustment.saturation),
+            temperature: Float(adjustment.temperature),
+            tint: Float(adjustment.tint),
+            blackPoint: Float(adjustment.blackPoint),
+            whitePoint: Float(adjustment.whitePoint),
+            sharpness: Float(adjustment.sharpness),
+            curveShadows: Float(adjustment.curveShadows),
+            curveMidtones: Float(adjustment.curveMidtones),
+            curveHighlights: Float(adjustment.curveHighlights)
+        )
+    }
+
     private static let shaderSource = """
     #include <metal_stdlib>
     using namespace metal;
@@ -263,6 +323,23 @@ final class MetalCompositeView: MTKView {
         float2 viewportSize;
         float fullRange;
         float bitDepth;
+        float2 textureSize;
+    };
+
+    struct Adjustments {
+        float enabled;
+        float exposure;
+        float contrast;
+        float brightness;
+        float saturation;
+        float temperature;
+        float tint;
+        float blackPoint;
+        float whitePoint;
+        float sharpness;
+        float curveShadows;
+        float curveMidtones;
+        float curveHighlights;
     };
 
     struct VertexOut {
@@ -284,12 +361,75 @@ final class MetalCompositeView: MTKView {
         return out;
     }
 
+    float toneCurve(float value, constant Adjustments &adjustments) {
+        float v = clamp(value, 0.0, 1.0);
+        float2 p0 = float2(0.0, 0.0);
+        float2 p1 = float2(0.25, clamp(adjustments.curveShadows, 0.0, 1.0));
+        float2 p2 = float2(0.5, clamp(adjustments.curveMidtones, 0.0, 1.0));
+        float2 p3 = float2(0.75, clamp(adjustments.curveHighlights, 0.0, 1.0));
+        float2 p4 = float2(1.0, 1.0);
+        if (v < p1.x) {
+            return mix(p0.y, p1.y, v / max(0.001, p1.x - p0.x));
+        }
+        if (v < p2.x) {
+            return mix(p1.y, p2.y, (v - p1.x) / max(0.001, p2.x - p1.x));
+        }
+        if (v < p3.x) {
+            return mix(p2.y, p3.y, (v - p2.x) / max(0.001, p3.x - p2.x));
+        }
+        return mix(p3.y, p4.y, (v - p3.x) / max(0.001, p4.x - p3.x));
+    }
+
+    float3 applyAdjustments(float3 rgb, constant Adjustments &adjustments) {
+        if (adjustments.enabled < 0.5) {
+            return clamp(rgb, 0.0, 1.0);
+        }
+
+        rgb *= exp2(adjustments.exposure);
+        rgb += adjustments.brightness * 0.35;
+
+        float white = max(adjustments.whitePoint, adjustments.blackPoint + 0.05);
+        rgb = (rgb - adjustments.blackPoint) / max(0.001, white - adjustments.blackPoint);
+
+        float contrast = 1.0 + adjustments.contrast * 1.5;
+        rgb = (rgb - 0.5) * contrast + 0.5;
+
+        rgb.r += adjustments.temperature * 0.08 + adjustments.tint * 0.03;
+        rgb.g -= adjustments.tint * 0.06;
+        rgb.b -= adjustments.temperature * 0.08 - adjustments.tint * 0.03;
+
+        float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+        rgb = mix(float3(luma), rgb, 1.0 + adjustments.saturation);
+        rgb = float3(toneCurve(rgb.r, adjustments), toneCurve(rgb.g, adjustments), toneCurve(rgb.b, adjustments));
+        return clamp(rgb, 0.0, 1.0);
+    }
+
+    float limitedY(texture2d<float, access::sample> yTexture, sampler s, float2 texCoord, constant Uniforms &uniforms) {
+        float y = yTexture.sample(s, texCoord).r;
+        if (uniforms.fullRange > 0.5) {
+            return y;
+        }
+        if (uniforms.bitDepth > 8.5) {
+            return (y - 64.0 / 1023.0) * (1023.0 / 876.0);
+        }
+        return (y - 16.0 / 255.0) * (255.0 / 219.0);
+    }
+
     fragment float4 yuvFragment(VertexOut input [[stage_in]],
                                 constant Uniforms &uniforms [[buffer(0)]],
+                                constant Adjustments &adjustments [[buffer(1)]],
                                 texture2d<float, access::sample> yTexture [[texture(0)]],
                                 texture2d<float, access::sample> uvTexture [[texture(1)]]) {
         constexpr sampler s(address::clamp_to_edge, filter::linear);
-        float y = yTexture.sample(s, input.texCoord).r;
+        float y = limitedY(yTexture, s, input.texCoord, uniforms);
+        if (adjustments.enabled > 0.5 && adjustments.sharpness > 0.001) {
+            float2 texel = float2(1.0) / max(uniforms.textureSize, float2(1.0));
+            float left = limitedY(yTexture, s, input.texCoord - float2(texel.x, 0.0), uniforms);
+            float right = limitedY(yTexture, s, input.texCoord + float2(texel.x, 0.0), uniforms);
+            float up = limitedY(yTexture, s, input.texCoord - float2(0.0, texel.y), uniforms);
+            float down = limitedY(yTexture, s, input.texCoord + float2(0.0, texel.y), uniforms);
+            y = y + (y * 4.0 - left - right - up - down) * adjustments.sharpness * 0.35;
+        }
         float2 uv = uvTexture.sample(s, input.texCoord).rg;
         float cb;
         float cr;
@@ -297,11 +437,9 @@ final class MetalCompositeView: MTKView {
             cb = uv.x - 0.5;
             cr = uv.y - 0.5;
         } else if (uniforms.bitDepth > 8.5) {
-            y = (y - 64.0 / 1023.0) * (1023.0 / 876.0);
             cb = (uv.x - 512.0 / 1023.0) * (1023.0 / 896.0);
             cr = (uv.y - 512.0 / 1023.0) * (1023.0 / 896.0);
         } else {
-            y = (y - 16.0 / 255.0) * (255.0 / 219.0);
             cb = (uv.x - 128.0 / 255.0) * (255.0 / 224.0);
             cr = (uv.y - 128.0 / 255.0) * (255.0 / 224.0);
         }
@@ -309,13 +447,24 @@ final class MetalCompositeView: MTKView {
         rgb.r = y + 1.5748 * cr;
         rgb.g = y - 0.1873 * cb - 0.4681 * cr;
         rgb.b = y + 1.8556 * cb;
-        return float4(clamp(rgb, 0.0, 1.0), 1.0);
+        return float4(applyAdjustments(rgb, adjustments), 1.0);
     }
 
     fragment float4 bgraFragment(VertexOut input [[stage_in]],
+                                 constant Uniforms &uniforms [[buffer(0)]],
+                                 constant Adjustments &adjustments [[buffer(1)]],
                                  texture2d<float, access::sample> texture [[texture(0)]]) {
         constexpr sampler s(address::clamp_to_edge, filter::linear);
-        return texture.sample(s, input.texCoord);
+        float3 rgb = texture.sample(s, input.texCoord).rgb;
+        if (adjustments.enabled > 0.5 && adjustments.sharpness > 0.001) {
+            float2 texel = float2(1.0) / max(uniforms.textureSize, float2(1.0));
+            float3 left = texture.sample(s, input.texCoord - float2(texel.x, 0.0)).rgb;
+            float3 right = texture.sample(s, input.texCoord + float2(texel.x, 0.0)).rgb;
+            float3 up = texture.sample(s, input.texCoord - float2(0.0, texel.y)).rgb;
+            float3 down = texture.sample(s, input.texCoord + float2(0.0, texel.y)).rgb;
+            rgb = rgb + (rgb * 4.0 - left - right - up - down) * adjustments.sharpness * 0.35;
+        }
+        return float4(applyAdjustments(rgb, adjustments), 1.0);
     }
     """
 }
