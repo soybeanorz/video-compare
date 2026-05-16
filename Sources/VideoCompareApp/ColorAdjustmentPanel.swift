@@ -176,7 +176,7 @@ final class CurveHistogramView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard bounds.width > 32, bounds.height > 42 else { return }
+        guard bounds.width > 32, bounds.height > 36 else { return }
         let plot = plotRect
 
         NSColor.white.setFill()
@@ -186,7 +186,7 @@ final class CurveHistogramView: NSView {
             drawHistogram(histogram, in: plot)
         }
 
-        drawToneRegions(in: plot)
+        drawActiveRegionOverlay(in: plot)
 
         NSColor(calibratedWhite: 0.42, alpha: 0.48).setStroke()
         let curve = curvePath(in: plot)
@@ -212,31 +212,14 @@ final class CurveHistogramView: NSView {
     }
 
     private var plotRect: NSRect {
-        NSRect(x: 10, y: 0, width: bounds.width - 20, height: bounds.height - 26)
+        NSRect(x: 10, y: 0, width: bounds.width - 20, height: bounds.height - 10)
     }
 
-    private func drawToneRegions(in plot: NSRect) {
-        let regions = ToneCurveState.regions
-        let labelAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 8.5, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(isInteractive ? 0.96 : 0.54)
-        ]
-        for (index, region) in regions.enumerated() {
-            let rect = regionRect(index: index, in: plot)
-            let isHot = activeRegion == index || hoverRegion == index
-            let white = 0.10 + CGFloat(index) * 0.12
-            NSColor(calibratedWhite: white, alpha: isHot ? 0.82 : (isInteractive ? 0.58 : 0.30)).setFill()
-            NSBezierPath(rect: rect).fill()
-            NSColor(calibratedWhite: 1, alpha: isHot ? 0.82 : 0.36).setStroke()
-            let outline = NSBezierPath(rect: rect)
-            outline.lineWidth = 0.8
-            outline.stroke()
-
-            let label = region.shortTitle as NSString
-            let size = label.size(withAttributes: labelAttributes)
-            let x = rect.midX - size.width / 2
-            label.draw(at: NSPoint(x: x, y: rect.midY - size.height / 2), withAttributes: labelAttributes)
-        }
+    private func drawActiveRegionOverlay(in plot: NSRect) {
+        guard isInteractive, let index = activeRegion ?? hoverRegion else { return }
+        let rect = regionOverlayRect(index: index, in: plot)
+        NSColor(calibratedWhite: 0.18, alpha: activeRegion == index ? 0.30 : 0.20).setFill()
+        NSBezierPath(rect: rect).fill()
     }
 
     private func drawHistogram(_ histogram: ColorHistogram, in plot: NSRect) {
@@ -295,21 +278,29 @@ final class CurveHistogramView: NSView {
 
     private func hitRegion(at point: NSPoint) -> Int? {
         let plot = plotRect
+        guard plot.contains(point) else { return nil }
         for index in ToneCurveState.regions.indices.reversed() {
-            if regionRect(index: index, in: plot).insetBy(dx: -4, dy: -3).contains(point) {
+            if regionHitRect(index: index, in: plot).contains(point) {
                 return index
             }
         }
         return nil
     }
 
-    private func regionRect(index: Int, in plot: NSRect) -> NSRect {
+    private func regionOverlayRect(index: Int, in plot: NSRect) -> NSRect {
         let region = ToneCurveState.regions[index]
         let start = adjustment.toneCurve.sample(region.inputStart)
         let end = adjustment.toneCurve.sample(region.inputEnd)
         let x0 = plot.minX + plot.width * CGFloat(start)
         let x1 = plot.minX + plot.width * CGFloat(end)
-        return NSRect(x: min(x0, x1), y: plot.maxY + 5, width: max(7, abs(x1 - x0)), height: 13)
+        return NSRect(x: min(x0, x1), y: plot.minY, width: max(1, abs(x1 - x0)), height: plot.height)
+    }
+
+    private func regionHitRect(index: Int, in plot: NSRect) -> NSRect {
+        let rect = regionOverlayRect(index: index, in: plot)
+        let minWidth: CGFloat = 10
+        let extra = max(0, minWidth - rect.width) / 2
+        return rect.insetBy(dx: -extra, dy: 0).intersection(plot)
     }
 }
 
