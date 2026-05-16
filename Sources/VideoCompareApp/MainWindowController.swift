@@ -1662,11 +1662,6 @@ final class MainWindowController: NSWindowController {
         var g = g * pow(2, adjustment.exposure) + adjustment.brightness * 0.35
         var b = b * pow(2, adjustment.exposure) + adjustment.brightness * 0.35
 
-        let white = max(adjustment.whitePoint, adjustment.blackPoint + 0.05)
-        r = (r - adjustment.blackPoint) / max(0.001, white - adjustment.blackPoint)
-        g = (g - adjustment.blackPoint) / max(0.001, white - adjustment.blackPoint)
-        b = (b - adjustment.blackPoint) / max(0.001, white - adjustment.blackPoint)
-
         let contrast = 1 + adjustment.contrast * 1.5
         r = (r - 0.5) * contrast + 0.5
         g = (g - 0.5) * contrast + 0.5
@@ -1682,31 +1677,20 @@ final class MainWindowController: NSWindowController {
         g = luma + (g - luma) * saturation
         b = luma + (b - luma) * saturation
 
-        return (
-            clamp01(toneCurve(r, adjustment: adjustment)),
-            clamp01(toneCurve(g, adjustment: adjustment)),
-            clamp01(toneCurve(b, adjustment: adjustment))
-        )
-    }
-
-    private static func toneCurve(_ value: Double, adjustment: ColorAdjustmentState) -> Double {
-        let v = clamp01(value)
-        let points = [
-            (0.0, 0.0),
-            (0.25, clamp01(adjustment.curveShadows)),
-            (0.5, clamp01(adjustment.curveMidtones)),
-            (0.75, clamp01(adjustment.curveHighlights)),
-            (1.0, 1.0)
-        ]
-        for index in 0..<(points.count - 1) {
-            let left = points[index]
-            let right = points[index + 1]
-            if v <= right.0 {
-                let t = (v - left.0) / max(0.001, right.0 - left.0)
-                return left.1 + (right.1 - left.1) * t
-            }
+        let adjustedLuma = r * 0.2126 + g * 0.7152 + b * 0.0722
+        let mappedLuma = ToneCurveState.sampleLUT(adjustment.toneCurveLUT, input: adjustedLuma)
+        if adjustedLuma < 0.0001 {
+            r = mappedLuma
+            g = mappedLuma
+            b = mappedLuma
+        } else {
+            let scale = mappedLuma / adjustedLuma
+            r *= scale
+            g *= scale
+            b *= scale
         }
-        return v
+
+        return (clamp01(r), clamp01(g), clamp01(b))
     }
 
     private static func clamp01(_ value: Double) -> Double {

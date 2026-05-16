@@ -131,6 +131,19 @@ final class CurveHistogramView: NSView {
     var showsHistogramBars = false {
         didSet { needsDisplay = true }
     }
+    var isInteractive = false {
+        didSet { needsDisplay = true }
+    }
+    var onToneCurveChanged: ((ToneCurveState) -> Void)?
+    private var hoverRegion: Int? {
+        didSet { needsDisplay = true }
+    }
+    private var activeRegion: Int? {
+        didSet { needsDisplay = true }
+    }
+    private var dragStartPoint: NSPoint = .zero
+    private var dragStartCurve = ToneCurveState()
+    private var trackingArea: NSTrackingArea?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -144,10 +157,27 @@ final class CurveHistogramView: NSView {
 
     override var isFlipped: Bool { true }
 
+    override var acceptsFirstResponder: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard bounds.width > 32, bounds.height > 36 else { return }
-        let plot = NSRect(x: 10, y: 0, width: bounds.width - 20, height: bounds.height - 18)
+        guard bounds.width > 32, bounds.height > 42 else { return }
+        let plot = plotRect
 
         NSColor.white.setFill()
         NSBezierPath(rect: plot).fill()
@@ -156,28 +186,22 @@ final class CurveHistogramView: NSView {
             drawHistogram(histogram, in: plot)
         }
 
+        drawToneRegions(in: plot)
+
         NSColor(calibratedWhite: 0.42, alpha: 0.48).setStroke()
         let curve = curvePath(in: plot)
         curve.lineWidth = 2
         curve.stroke()
-
-        drawLevelHandle(x: plot.minX, y: plot.maxY + 2, fill: .black)
-        drawLevelHandle(x: plot.midX, y: plot.maxY + 2, fill: NSColor(calibratedWhite: 0.50, alpha: 1))
-        drawLevelHandle(x: plot.maxX, y: plot.maxY + 2, fill: .white)
     }
 
     private func curvePath(in plot: NSRect) -> NSBezierPath {
-        let points: [(Double, Double)] = [
-            (0, 0),
-            (0.25, adjustment.curveShadows),
-            (0.5, adjustment.curveMidtones),
-            (0.75, adjustment.curveHighlights),
-            (1, 1)
-        ]
         let path = NSBezierPath()
-        for (index, point) in points.enumerated() {
-            let x = plot.minX + plot.width * CGFloat(point.0)
-            let y = plot.maxY - plot.height * CGFloat(max(0, min(1, point.1)))
+        let samples = 96
+        for index in 0...samples {
+            let input = Double(index) / Double(samples)
+            let output = adjustment.toneCurve.sample(input)
+            let x = plot.minX + plot.width * CGFloat(output)
+            let y = plot.maxY - plot.height * CGFloat(input)
             if index == 0 {
                 path.move(to: NSPoint(x: x, y: y))
             } else {
@@ -187,19 +211,32 @@ final class CurveHistogramView: NSView {
         return path
     }
 
-    private func drawLevelHandle(x: CGFloat, y: CGFloat, fill: NSColor) {
-        let path = NSBezierPath()
-        path.move(to: NSPoint(x: x, y: y))
-        path.line(to: NSPoint(x: x - 4, y: y + 5))
-        path.line(to: NSPoint(x: x - 4, y: y + 10))
-        path.line(to: NSPoint(x: x + 4, y: y + 10))
-        path.line(to: NSPoint(x: x + 4, y: y + 5))
-        path.close()
-        fill.setFill()
-        NSColor.white.setStroke()
-        path.lineWidth = 1.25
-        path.fill()
-        path.stroke()
+    private var plotRect: NSRect {
+        NSRect(x: 10, y: 0, width: bounds.width - 20, height: bounds.height - 26)
+    }
+
+    private func drawToneRegions(in plot: NSRect) {
+        let regions = ToneCurveState.regions
+        let labelAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 8.5, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(isInteractive ? 0.96 : 0.54)
+        ]
+        for (index, region) in regions.enumerated() {
+            let rect = regionRect(index: index, in: plot)
+            let isHot = activeRegion == index || hoverRegion == index
+            let white = 0.10 + CGFloat(index) * 0.12
+            NSColor(calibratedWhite: white, alpha: isHot ? 0.82 : (isInteractive ? 0.58 : 0.30)).setFill()
+            NSBezierPath(rect: rect).fill()
+            NSColor(calibratedWhite: 1, alpha: isHot ? 0.82 : 0.36).setStroke()
+            let outline = NSBezierPath(rect: rect)
+            outline.lineWidth = 0.8
+            outline.stroke()
+
+            let label = region.shortTitle as NSString
+            let size = label.size(withAttributes: labelAttributes)
+            let x = rect.midX - size.width / 2
+            label.draw(at: NSPoint(x: x, y: rect.midY - size.height / 2), withAttributes: labelAttributes)
+        }
     }
 
     private func drawHistogram(_ histogram: ColorHistogram, in plot: NSRect) {
@@ -221,6 +258,59 @@ final class CurveHistogramView: NSView {
         }
     }
 
+    override func mouseMoved(with event: NSEvent) {
+        guard isInteractive else {
+            hoverRegion = nil
+            return
+        }
+        hoverRegion = hitRegion(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoverRegion = nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isInteractive else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard let region = hitRegion(at: point) else { return }
+        window?.makeFirstResponder(self)
+        activeRegion = region
+        dragStartPoint = point
+        dragStartCurve = adjustment.toneCurve
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isInteractive, let activeRegion else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        let delta = Double((point.x - dragStartPoint.x) / max(1, plotRect.width))
+        let toneCurve = dragStartCurve.movingRegion(activeRegion, by: delta)
+        onToneCurveChanged?(toneCurve)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        activeRegion = nil
+        hoverRegion = isInteractive ? hitRegion(at: convert(event.locationInWindow, from: nil)) : nil
+    }
+
+    private func hitRegion(at point: NSPoint) -> Int? {
+        let plot = plotRect
+        for index in ToneCurveState.regions.indices.reversed() {
+            if regionRect(index: index, in: plot).insetBy(dx: -4, dy: -3).contains(point) {
+                return index
+            }
+        }
+        return nil
+    }
+
+    private func regionRect(index: Int, in plot: NSRect) -> NSRect {
+        let region = ToneCurveState.regions[index]
+        let start = adjustment.toneCurve.sample(region.inputStart)
+        let end = adjustment.toneCurve.sample(region.inputEnd)
+        let x0 = plot.minX + plot.width * CGFloat(start)
+        let x1 = plot.minX + plot.width * CGFloat(end)
+        return NSRect(x: min(x0, x1), y: plot.maxY + 5, width: max(7, abs(x1 - x0)), height: 13)
+    }
 }
 
 final class ColorAdjustmentPanelController: NSWindowController {
@@ -298,6 +388,12 @@ final class ColorAdjustmentPanelController: NSWindowController {
         autoLevelsButton.action = #selector(autoLevelsClicked)
         resetButton.target = self
         resetButton.action = #selector(resetClicked)
+        curveView.onToneCurveChanged = { [weak self] toneCurve in
+            guard let self, !self.isSyncing, self.currentSlot != nil else { return }
+            self.state.toneCurve = toneCurve
+            self.curveView.adjustment = self.state
+            self.onStateChanged?(self.state)
+        }
 
         for separator in [separatorTone, separatorColor, separatorDetail, separatorReset] {
             separator.boxType = .separator
@@ -309,15 +405,10 @@ final class ColorAdjustmentPanelController: NSWindowController {
         addRow("exposure", title: "Exposure:", value: 0, range: -2...2, left: .symbol("camera.aperture", .white), right: .symbol("camera.aperture", .white))
         addRow("contrast", title: "Contrast:", value: 0, range: -1...1, left: .colorDot(.black), right: .symbol("circle.lefthalf.filled", .white))
         addRow("brightness", title: "Brightness:", value: 0, range: -1...1, left: .symbol("sun.min", .systemYellow), right: .symbol("sun.max.fill", .systemYellow))
-        addRow("blackPoint", title: "Black:", value: 0, range: 0...0.45, left: .colorDot(.black), right: .symbol("square.fill", .black))
-        addRow("whitePoint", title: "White:", value: 1, range: 0.55...1, left: .symbol("square.fill", NSColor(calibratedWhite: 0.82, alpha: 1)), right: .symbol("square.fill", .white))
         addRow("saturation", title: "Saturation:", value: 0, range: -1...1, left: .grayscale, right: .rgb)
         addRow("temperature", title: "Temp:", value: 0, range: -1...1, left: .symbol("thermometer.low", NSColor(calibratedRed: 0.68, green: 0.86, blue: 1, alpha: 1)), right: .symbol("thermometer.high", NSColor(calibratedRed: 1, green: 0.45, blue: 0.28, alpha: 1)))
         addRow("tint", title: "Tint:", value: 0, range: -1...1, left: .colorDot(.systemGreen), right: .colorDot(.systemPink))
         addRow("sharpness", title: "Sharpness:", value: 0, range: 0...1, left: .symbol("square", .white), right: .symbol("square.fill", .white))
-        addRow("curveShadows", title: "Curve Low:", value: 0.25, range: 0...1, left: .symbol("square.fill", .black), right: .symbol("square.fill", NSColor(calibratedWhite: 0.5, alpha: 1)))
-        addRow("curveMidtones", title: "Curve Mid:", value: 0.5, range: 0...1, left: .symbol("square.fill", NSColor(calibratedWhite: 0.38, alpha: 1)), right: .symbol("square.fill", NSColor(calibratedWhite: 0.62, alpha: 1)))
-        addRow("curveHighlights", title: "Curve High:", value: 0.75, range: 0...1, left: .symbol("square.fill", NSColor(calibratedWhite: 0.5, alpha: 1)), right: .symbol("square.fill", .white))
     }
 
     private func addRow(_ key: String, title: String, value: Double, range: ClosedRange<Double>, left: EndpointIcon, right: EndpointIcon) {
@@ -334,6 +425,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
         let hasSlot = currentSlot != nil
         window?.title = currentSlot.map { "Adjust Color - \($0.rawValue.uppercased())" } ?? "Adjust Color"
         curveView.showsHistogramBars = hasSlot
+        curveView.isInteractive = hasSlot && state.isEnabled
         enabledButton.state = state.isEnabled ? .on : .off
         enabledButton.isEnabled = hasSlot
         autoLevelsButton.isEnabled = hasSlot && state.isEnabled
@@ -344,12 +436,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
         rows["saturation"]?.setValue(state.saturation)
         rows["temperature"]?.setValue(state.temperature)
         rows["tint"]?.setValue(state.tint)
-        rows["blackPoint"]?.setValue(state.blackPoint)
-        rows["whitePoint"]?.setValue(state.whitePoint)
         rows["sharpness"]?.setValue(state.sharpness)
-        rows["curveShadows"]?.setValue(state.curveShadows)
-        rows["curveMidtones"]?.setValue(state.curveMidtones)
-        rows["curveHighlights"]?.setValue(state.curveHighlights)
         curveView.adjustment = state
         rows.values.forEach { $0.rowEnabled = hasSlot && state.isEnabled }
         isSyncing = false
@@ -364,18 +451,13 @@ final class ColorAdjustmentPanelController: NSWindowController {
         enabledButton.frame = NSRect(x: bounds.width - pad - 50, y: 167, width: 50, height: 20)
 
         separatorTone.frame = NSRect(x: pad - 8, y: 216, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
-        layoutRows(["exposure", "contrast", "brightness", "blackPoint", "whitePoint"], startY: 232)
+        layoutRows(["exposure", "contrast", "brightness"], startY: 232)
 
-        separatorColor.frame = NSRect(x: pad - 8, y: 356, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
-        layoutRows(["saturation", "temperature", "tint"], startY: 372)
+        separatorColor.frame = NSRect(x: pad - 8, y: 316, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
+        layoutRows(["saturation", "temperature", "tint"], startY: 332)
 
-        separatorDetail.frame = NSRect(x: pad - 8, y: 456, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
-        layoutRows(["sharpness"], startY: 472)
-
-        let shouldHideCurveRows = true
-        for key in ["curveShadows", "curveMidtones", "curveHighlights"] {
-            rows[key]?.isHidden = shouldHideCurveRows
-        }
+        separatorDetail.frame = NSRect(x: pad - 8, y: 416, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
+        layoutRows(["sharpness"], startY: 432)
 
         let resetY = bounds.height - 32
         separatorReset.frame = NSRect(x: pad - 8, y: resetY - 16, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
@@ -396,6 +478,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
         guard !isSyncing, currentSlot != nil else { return }
         state.isEnabled = enabledButton.state == .on
         curveView.adjustment = state
+        curveView.isInteractive = state.isEnabled
         autoLevelsButton.isEnabled = state.isEnabled
         rows.values.forEach { $0.rowEnabled = state.isEnabled }
         onStateChanged?(state)
@@ -403,11 +486,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
 
     @objc private func autoLevelsClicked() {
         guard currentSlot != nil else { return }
-        state.blackPoint = 0
-        state.whitePoint = 1
-        state.curveShadows = 0.25
-        state.curveMidtones = 0.5
-        state.curveHighlights = 0.75
+        state.toneCurve = ToneCurveState()
         syncControls()
         onStateChanged?(state)
     }
@@ -426,12 +505,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
         case "saturation": state.saturation = value
         case "temperature": state.temperature = value
         case "tint": state.tint = value
-        case "blackPoint": state.blackPoint = value
-        case "whitePoint": state.whitePoint = value
         case "sharpness": state.sharpness = value
-        case "curveShadows": state.curveShadows = value
-        case "curveMidtones": state.curveMidtones = value
-        case "curveHighlights": state.curveHighlights = value
         default: break
         }
         curveView.adjustment = state

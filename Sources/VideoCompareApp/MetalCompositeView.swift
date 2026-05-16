@@ -24,12 +24,7 @@ private struct MetalColorAdjustmentUniforms {
     var saturation: Float
     var temperature: Float
     var tint: Float
-    var blackPoint: Float
-    var whitePoint: Float
     var sharpness: Float
-    var curveShadows: Float
-    var curveMidtones: Float
-    var curveHighlights: Float
 }
 
 final class MetalCompositeView: MTKView {
@@ -237,6 +232,7 @@ final class MetalCompositeView: MTKView {
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalVideoUniforms>.stride, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalVideoUniforms>.stride, index: 0)
         encoder.setFragmentBytes(&adjustmentUniforms, length: MemoryLayout<MetalColorAdjustmentUniforms>.stride, index: 1)
+        setToneCurveLUT(adjustment.toneCurveLUT, encoder: encoder)
         encoder.setFragmentTexture(yTexture, index: 0)
         encoder.setFragmentTexture(uvTexture, index: 1)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: vertices.count)
@@ -251,6 +247,7 @@ final class MetalCompositeView: MTKView {
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalVideoUniforms>.stride, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalVideoUniforms>.stride, index: 0)
         encoder.setFragmentBytes(&adjustmentUniforms, length: MemoryLayout<MetalColorAdjustmentUniforms>.stride, index: 1)
+        setToneCurveLUT(adjustment.toneCurveLUT, encoder: encoder)
         encoder.setFragmentTexture(texture, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: vertices.count)
     }
@@ -301,13 +298,15 @@ final class MetalCompositeView: MTKView {
             saturation: Float(adjustment.saturation),
             temperature: Float(adjustment.temperature),
             tint: Float(adjustment.tint),
-            blackPoint: Float(adjustment.blackPoint),
-            whitePoint: Float(adjustment.whitePoint),
-            sharpness: Float(adjustment.sharpness),
-            curveShadows: Float(adjustment.curveShadows),
-            curveMidtones: Float(adjustment.curveMidtones),
-            curveHighlights: Float(adjustment.curveHighlights)
+            sharpness: Float(adjustment.sharpness)
         )
+    }
+
+    private func setToneCurveLUT(_ lut: [Float], encoder: MTLRenderCommandEncoder) {
+        lut.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            encoder.setFragmentBytes(baseAddress, length: bytes.count, index: 2)
+        }
     }
 
     private static let shaderSource = """
@@ -334,12 +333,7 @@ final class MetalCompositeView: MTKView {
         float saturation;
         float temperature;
         float tint;
-        float blackPoint;
-        float whitePoint;
         float sharpness;
-        float curveShadows;
-        float curveMidtones;
-        float curveHighlights;
     };
 
     struct VertexOut {
@@ -361,35 +355,30 @@ final class MetalCompositeView: MTKView {
         return out;
     }
 
-    float toneCurve(float value, constant Adjustments &adjustments) {
-        float v = clamp(value, 0.0, 1.0);
-        float2 p0 = float2(0.0, 0.0);
-        float2 p1 = float2(0.25, clamp(adjustments.curveShadows, 0.0, 1.0));
-        float2 p2 = float2(0.5, clamp(adjustments.curveMidtones, 0.0, 1.0));
-        float2 p3 = float2(0.75, clamp(adjustments.curveHighlights, 0.0, 1.0));
-        float2 p4 = float2(1.0, 1.0);
-        if (v < p1.x) {
-            return mix(p0.y, p1.y, v / max(0.001, p1.x - p0.x));
-        }
-        if (v < p2.x) {
-            return mix(p1.y, p2.y, (v - p1.x) / max(0.001, p2.x - p1.x));
-        }
-        if (v < p3.x) {
-            return mix(p2.y, p3.y, (v - p2.x) / max(0.001, p3.x - p2.x));
-        }
-        return mix(p3.y, p4.y, (v - p3.x) / max(0.001, p4.x - p3.x));
+    float sampleToneCurve(float value, constant float *toneCurveLUT) {
+        float position = clamp(value, 0.0, 1.0) * 255.0;
+        uint left = uint(floor(position));
+        uint right = min(left + 1, 255u);
+        float t = position - float(left);
+        return mix(toneCurveLUT[left], toneCurveLUT[right], t);
     }
 
-    float3 applyAdjustments(float3 rgb, constant Adjustments &adjustments) {
+    float3 applyToneCurve(float3 rgb, constant float *toneCurveLUT) {
+        float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+        float mapped = sampleToneCurve(luma, toneCurveLUT);
+        if (luma < 0.0001) {
+            return float3(mapped);
+        }
+        return rgb * (mapped / luma);
+    }
+
+    float3 applyAdjustments(float3 rgb, constant Adjustments &adjustments, constant float *toneCurveLUT) {
         if (adjustments.enabled < 0.5) {
             return clamp(rgb, 0.0, 1.0);
         }
 
         rgb *= exp2(adjustments.exposure);
         rgb += adjustments.brightness * 0.35;
-
-        float white = max(adjustments.whitePoint, adjustments.blackPoint + 0.05);
-        rgb = (rgb - adjustments.blackPoint) / max(0.001, white - adjustments.blackPoint);
 
         float contrast = 1.0 + adjustments.contrast * 1.5;
         rgb = (rgb - 0.5) * contrast + 0.5;
@@ -400,7 +389,7 @@ final class MetalCompositeView: MTKView {
 
         float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
         rgb = mix(float3(luma), rgb, 1.0 + adjustments.saturation);
-        rgb = float3(toneCurve(rgb.r, adjustments), toneCurve(rgb.g, adjustments), toneCurve(rgb.b, adjustments));
+        rgb = applyToneCurve(rgb, toneCurveLUT);
         return clamp(rgb, 0.0, 1.0);
     }
 
@@ -418,6 +407,7 @@ final class MetalCompositeView: MTKView {
     fragment float4 yuvFragment(VertexOut input [[stage_in]],
                                 constant Uniforms &uniforms [[buffer(0)]],
                                 constant Adjustments &adjustments [[buffer(1)]],
+                                constant float *toneCurveLUT [[buffer(2)]],
                                 texture2d<float, access::sample> yTexture [[texture(0)]],
                                 texture2d<float, access::sample> uvTexture [[texture(1)]]) {
         constexpr sampler s(address::clamp_to_edge, filter::linear);
@@ -447,12 +437,13 @@ final class MetalCompositeView: MTKView {
         rgb.r = y + 1.5748 * cr;
         rgb.g = y - 0.1873 * cb - 0.4681 * cr;
         rgb.b = y + 1.8556 * cb;
-        return float4(applyAdjustments(rgb, adjustments), 1.0);
+        return float4(applyAdjustments(rgb, adjustments, toneCurveLUT), 1.0);
     }
 
     fragment float4 bgraFragment(VertexOut input [[stage_in]],
                                  constant Uniforms &uniforms [[buffer(0)]],
                                  constant Adjustments &adjustments [[buffer(1)]],
+                                 constant float *toneCurveLUT [[buffer(2)]],
                                  texture2d<float, access::sample> texture [[texture(0)]]) {
         constexpr sampler s(address::clamp_to_edge, filter::linear);
         float3 rgb = texture.sample(s, input.texCoord).rgb;
@@ -464,7 +455,7 @@ final class MetalCompositeView: MTKView {
             float3 down = texture.sample(s, input.texCoord + float2(0.0, texel.y)).rgb;
             rgb = rgb + (rgb * 4.0 - left - right - up - down) * adjustments.sharpness * 0.35;
         }
-        return float4(applyAdjustments(rgb, adjustments), 1.0);
+        return float4(applyAdjustments(rgb, adjustments, toneCurveLUT), 1.0);
     }
     """
 }
