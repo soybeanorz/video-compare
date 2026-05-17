@@ -187,11 +187,6 @@ final class CurveHistogramView: NSView {
         }
 
         drawActiveRegionOverlay(in: plot)
-
-        NSColor(calibratedWhite: 0.42, alpha: 0.48).setStroke()
-        let curve = curvePath(in: plot)
-        curve.lineWidth = 2
-        curve.stroke()
     }
 
     private func curvePath(in plot: NSRect) -> NSBezierPath {
