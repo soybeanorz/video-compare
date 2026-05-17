@@ -137,6 +137,8 @@ final class VideoCanvasView: NSView {
     let renderer = MetalCompositeView()
     let labelA = NSTextField(labelWithString: "A: 未加载")
     let labelB = NSTextField(labelWithString: "B: 未加载")
+    private let frameNumberA = NSTextField(labelWithString: "")
+    private let frameNumberB = NSTextField(labelWithString: "")
     private let divider = WipeDividerView()
     private let labelHeight: CGFloat = 0
 
@@ -179,6 +181,8 @@ final class VideoCanvasView: NSView {
         addSubview(labelA)
         addSubview(labelB)
         addSubview(divider)
+        addSubview(frameNumberA)
+        addSubview(frameNumberB)
         for label in [labelA, labelB] {
             label.isHidden = true
             label.lineBreakMode = .byTruncatingMiddle
@@ -187,6 +191,19 @@ final class VideoCanvasView: NSView {
             label.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1)
             label.drawsBackground = true
             label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        }
+        for label in [frameNumberA, frameNumberB] {
+            label.isHidden = true
+            label.lineBreakMode = .byTruncatingTail
+            label.maximumNumberOfLines = 1
+            label.textColor = NSColor(calibratedWhite: 0.96, alpha: 1)
+            label.backgroundColor = NSColor(calibratedWhite: 0.02, alpha: 0.70)
+            label.drawsBackground = true
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+            label.alignment = .center
+            label.wantsLayer = true
+            label.layer?.cornerRadius = 5
+            label.layer?.masksToBounds = true
         }
         updateSelectionAppearance()
     }
@@ -246,7 +263,21 @@ final class VideoCanvasView: NSView {
             labelA.alignment = .left
             labelB.alignment = .left
         }
+        layoutFrameNumberLabels(rectA: rectA, rectB: rectB)
         updateSelectionAppearance()
+    }
+
+    func setFrameNumberOverlayVisible(_ visible: Bool) {
+        frameNumberA.isHidden = !visible || frameNumberA.stringValue.isEmpty
+        frameNumberB.isHidden = !visible || frameNumberB.stringValue.isEmpty
+    }
+
+    func setFrameNumber(_ text: String?, slot: VideoSlot, visible: Bool) {
+        let label = slot == .a ? frameNumberA : frameNumberB
+        let value = text ?? ""
+        label.stringValue = value
+        label.isHidden = !visible || value.isEmpty
+        needsLayout = true
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -351,6 +382,23 @@ final class VideoCanvasView: NSView {
             return NSRect(x: 0, y: labelHeight, width: bounds.width, height: max(0, bounds.height - labelHeight))
         default:
             return bounds
+        }
+    }
+
+    private func layoutFrameNumberLabels(rectA: NSRect, rectB: NSRect) {
+        let labels: [(VideoSlot, NSTextField, NSRect)] = [(.a, frameNumberA, rectA), (.b, frameNumberB, rectB)]
+        for (slot, label, rect) in labels {
+            guard !label.stringValue.isEmpty else { continue }
+            let size = label.intrinsicContentSize
+            let width = min(max(56, ceil(size.width) + 14), max(56, rect.width - 16))
+            let height: CGFloat = 22
+            let stackedOffset: CGFloat = layoutMode == .overlapWipe && slot == .b ? height + 6 : 0
+            label.frame = NSRect(
+                x: rect.minX + 8,
+                y: rect.minY + 8 + stackedOffset,
+                width: width,
+                height: height
+            )
         }
     }
 

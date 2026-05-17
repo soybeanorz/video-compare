@@ -212,6 +212,145 @@ final class TimelineControl: NSView {
     }
 }
 
+final class ShortcutHelpView: NSView {
+    private struct HelpRow {
+        let key: String
+        let detail: String
+    }
+
+    private struct HelpSection {
+        let title: String
+        let rows: [HelpRow]
+    }
+
+    private let leftSections: [HelpSection] = [
+        HelpSection(title: "播放", rows: [
+            HelpRow(key: "Space", detail: "播放或暂停"),
+            HelpRow(key: "← / →", detail: "逐帧移动")
+        ]),
+        HelpSection(title: "选择与布局", rows: [
+            HelpRow(key: "1 / 2", detail: "选择视频 A / B"),
+            HelpRow(key: "Esc", detail: "取消当前选中"),
+            HelpRow(key: "Cmd+1 / Cmd+2", detail: "切换对比模式"),
+            HelpRow(key: "Tab", detail: "切换遮罩边界")
+        ])
+    ]
+
+    private let rightSections: [HelpSection] = [
+        HelpSection(title: "画面辅助", rows: [
+            HelpRow(key: "F", detail: "显示当前帧序号"),
+            HelpRow(key: "O", detail: "按住查看原始画面"),
+            HelpRow(key: "Opt+Cmd+C", detail: "打开调整面板"),
+            HelpRow(key: "Cmd+Scroll", detail: "缩放画面")
+        ]),
+        HelpSection(title: "文件与片段", rows: [
+            HelpRow(key: "Cmd+B", detail: "展开文件面板"),
+            HelpRow(key: "Cmd+Drag Bar", detail: "创建循环片段"),
+            HelpRow(key: "RightClick Bar", detail: "取消循环片段")
+        ])
+    ]
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let columnGap: CGFloat = 12
+        let columnWidth = floor((bounds.width - columnGap) / 2)
+        drawSections(leftSections, x: 0, width: columnWidth)
+        drawSections(rightSections, x: columnWidth + columnGap, width: columnWidth)
+    }
+
+    private func drawSections(_ sections: [HelpSection], x: CGFloat, width: CGFloat) {
+        var y: CGFloat = 0
+        for section in sections {
+            let height = sectionHeight(section)
+            drawSection(section, in: NSRect(x: x, y: y, width: width, height: height))
+            y += height + 10
+        }
+    }
+
+    private func sectionHeight(_ section: HelpSection) -> CGFloat {
+        31 + CGFloat(section.rows.count) * 22
+    }
+
+    private func drawSection(_ section: HelpSection, in rect: NSRect) {
+        NSColor(calibratedWhite: 1, alpha: 1).setFill()
+        let card = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+        card.fill()
+        NSColor(calibratedWhite: 0.76, alpha: 1).setStroke()
+        card.lineWidth = 1
+        card.stroke()
+
+        let titleParagraph = NSMutableParagraphStyle()
+        titleParagraph.alignment = .center
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+            .foregroundColor: NSColor(calibratedWhite: 0.28, alpha: 1),
+            .paragraphStyle: titleParagraph
+        ]
+        (section.title as NSString).draw(
+            in: NSRect(x: rect.minX + 10, y: rect.minY + 8, width: rect.width - 20, height: 14),
+            withAttributes: titleAttributes
+        )
+
+        var rowY = rect.minY + 29
+        for row in section.rows {
+            drawRow(row, x: rect.minX + 10, y: rowY, width: rect.width - 20)
+            rowY += 22
+        }
+    }
+
+    private func drawRow(_ row: HelpRow, x: CGFloat, y: CGFloat, width: CGFloat) {
+        let keyColumnWidth: CGFloat = 104
+        let keyAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor(calibratedWhite: 0.16, alpha: 1)
+        ]
+        let detailParagraph = NSMutableParagraphStyle()
+        detailParagraph.lineBreakMode = .byTruncatingTail
+        let detailAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .regular),
+            .foregroundColor: NSColor(calibratedWhite: 0.18, alpha: 1),
+            .paragraphStyle: detailParagraph
+        ]
+
+        let keySize = (row.key as NSString).size(withAttributes: keyAttributes)
+        let keyWidth = min(keyColumnWidth, max(32, ceil(keySize.width) + 14))
+        let keyRect = NSRect(
+            x: x + keyColumnWidth - keyWidth,
+            y: y + 1,
+            width: keyWidth,
+            height: 17
+        )
+        NSColor(calibratedWhite: 0.90, alpha: 1).setFill()
+        let keyPath = NSBezierPath(roundedRect: keyRect, xRadius: 4, yRadius: 4)
+        keyPath.fill()
+        NSColor(calibratedWhite: 0.68, alpha: 1).setStroke()
+        keyPath.lineWidth = 1
+        keyPath.stroke()
+        (row.key as NSString).draw(
+            in: keyRect.insetBy(dx: 6, dy: 2),
+            withAttributes: keyAttributes
+        )
+
+        let detailX = x + keyColumnWidth + 10
+        (row.detail as NSString).draw(
+            in: NSRect(x: detailX, y: y + 1, width: max(20, width - (detailX - x)), height: 18),
+            withAttributes: detailAttributes
+        )
+    }
+}
+
 final class MainWindowController: NSWindowController {
     private let canvas = VideoCanvasView()
     private var playerA: NativeVideoPlayer!
@@ -237,18 +376,7 @@ final class MainWindowController: NSWindowController {
     private let helpButton = NSButton(title: "?", target: nil, action: nil)
     private let mediaFileTrees = MediaFileTreesView(defaultRoot: FileManager.default.homeDirectoryForCurrentUser)
     private let shortcutHelpPanel = NSView()
-    private let shortcutHelpLabel = NSTextField(labelWithString: """
-    • 1 / 2: 选择视频 A / B
-    • Cmd+1 / Cmd+2: 切换左右对比 / 拖动遮罩
-    • Cmd+B: 展开/收起文件面板
-    • Tab: 拖动遮罩分界线切到最左或最右
-    • ← / →: 未选中时同步逐帧；选中 A/B 时只调整该视频
-    • Space: 未选中时同步播放/暂停；选中 A/B 时按当前模式控制播放
-    • Esc: 取消当前选中
-    • Cmd+滚轮: 未选中时同步缩放；选中 A/B 时只缩放选中视频
-    • Cmd+拖动同步进度条: 创建循环片段
-    • 右键循环片段: 取消循环
-    """)
+    private let shortcutHelpView = ShortcutHelpView()
     private var timeSlider: ContinuousSeekSlider { syncTimeline.slider }
     private var videoASlider: ContinuousSeekSlider { videoATimeline.slider }
     private var videoBSlider: ContinuousSeekSlider { videoBTimeline.slider }
@@ -283,6 +411,7 @@ final class MainWindowController: NSWindowController {
     private var colorAdjustmentPanel: ColorAdjustmentPanelController?
     private var originalBypassSlot: VideoSlot?
     private var lastHistogramUpdate: TimeInterval = 0
+    private var showsFrameNumbers = false
     private var selectedSlot: VideoSlot? {
         didSet {
             canvas.selectedSlot = selectedSlot
@@ -686,18 +815,12 @@ final class MainWindowController: NSWindowController {
 
         shortcutHelpPanel.wantsLayer = true
         shortcutHelpPanel.layer?.cornerRadius = 8
-        shortcutHelpPanel.layer?.backgroundColor = NSColor(calibratedWhite: 0.06, alpha: 0.92).cgColor
+        shortcutHelpPanel.layer?.backgroundColor = NSColor(calibratedWhite: 0.91, alpha: 1).cgColor
         shortcutHelpPanel.layer?.borderWidth = 1
-        shortcutHelpPanel.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.16).cgColor
+        shortcutHelpPanel.layer?.borderColor = NSColor(calibratedWhite: 0.68, alpha: 1).cgColor
         shortcutHelpPanel.isHidden = true
 
-        shortcutHelpLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        shortcutHelpLabel.textColor = NSColor(calibratedWhite: 0.94, alpha: 1)
-        shortcutHelpLabel.backgroundColor = .clear
-        shortcutHelpLabel.drawsBackground = false
-        shortcutHelpLabel.lineBreakMode = .byWordWrapping
-        shortcutHelpLabel.maximumNumberOfLines = 0
-        shortcutHelpPanel.addSubview(shortcutHelpLabel)
+        shortcutHelpPanel.addSubview(shortcutHelpView)
     }
 
     @objc private func toggleShortcutHelp() {
@@ -825,8 +948,8 @@ final class MainWindowController: NSWindowController {
         let syncTimelineFrame = NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78)
         let canvasY = syncTimelineFrame.maxY + gap
         let canvasTop = fileTreeFrame.minY - gap
-        let helpW: CGFloat = 420
-        let helpH: CGFloat = 236
+        let helpW: CGFloat = 540
+        let helpH: CGFloat = 252
         let helpFrame = NSRect(
             x: max(pad, w - pad - helpW),
             y: max(pad, toolbarY - helpH - 8),
@@ -869,7 +992,7 @@ final class MainWindowController: NSWindowController {
         setFrame(helpButton, frames.helpButton)
         setFrame(shortcutHelpPanel, frames.shortcutHelpPanel)
         bringShortcutHelpToFront()
-        shortcutHelpLabel.frame = shortcutHelpPanel.bounds.insetBy(dx: 14, dy: 12)
+        shortcutHelpView.frame = shortcutHelpPanel.bounds.insetBy(dx: 12, dy: 12)
 
         setFrame(syncTimeline, frames.syncTimeline)
         setFrame(mediaFileTrees, frames.mediaFileTrees)
@@ -1836,6 +1959,7 @@ final class MainWindowController: NSWindowController {
         syncTimeline.setTime(current: formatShortTime(base), duration: formatShortTime(duration))
         videoATimeline.setTime(current: formatShortTime(playerA.timePosition), duration: formatShortTime(playerA.duration))
         videoBTimeline.setTime(current: formatShortTime(playerB.timePosition), duration: formatShortTime(playerB.duration))
+        updateFrameNumberOverlays()
         let synchronizedPlaying = isSynchronizedPlaying || (!playerA.isPaused && !playerB.isPaused)
         syncTimeline.setPlaying(synchronizedPlaying)
         videoATimeline.setPlaying(canvas.allowsAlignmentAdjustment ? synchronizedPlaying : !playerA.isPaused)
@@ -1879,6 +2003,25 @@ final class MainWindowController: NSWindowController {
 
     private func frameNumber(_ seconds: Double, fps: Double) -> Int {
         max(0, Int(round(seconds * max(1, fps))))
+    }
+
+    private func updateFrameNumberOverlays() {
+        canvas.setFrameNumber(
+            playerA.fileURL == nil ? nil : "Frame \(frameNumber(playerA.timePosition, fps: playerA.fps))",
+            slot: .a,
+            visible: showsFrameNumbers
+        )
+        canvas.setFrameNumber(
+            playerB.fileURL == nil ? nil : "Frame \(frameNumber(playerB.timePosition, fps: playerB.fps))",
+            slot: .b,
+            visible: showsFrameNumbers
+        )
+    }
+
+    private func toggleFrameNumbers() {
+        showsFrameNumbers.toggle()
+        updateFrameNumberOverlays()
+        canvas.setFrameNumberOverlayVisible(showsFrameNumbers)
     }
 
     private func pauseBothIfNeeded() {
@@ -2068,6 +2211,9 @@ final class MainWindowController: NSWindowController {
                 return true
             case "2":
                 selectedSlot = .b
+                return true
+            case "f":
+                toggleFrameNumbers()
                 return true
             case "o":
                 guard let selectedSlot else { return false }
