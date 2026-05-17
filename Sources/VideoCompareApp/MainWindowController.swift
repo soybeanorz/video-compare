@@ -1430,9 +1430,9 @@ final class MainWindowController: NSWindowController {
     @objc private func openColorAdjustmentPanel() {
         let panel = colorAdjustmentPanel ?? makeColorAdjustmentPanel()
         colorAdjustmentPanel = panel
-        refreshColorAdjustmentPanel()
         panel.showWindow(nil)
         panel.window?.makeKeyAndOrderFront(nil)
+        refreshColorAdjustmentPanel()
     }
 
     private func makeColorAdjustmentPanel() -> ColorAdjustmentPanelController {
