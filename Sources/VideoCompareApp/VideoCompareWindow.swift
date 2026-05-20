@@ -5,8 +5,18 @@ final class VideoCompareWindow: NSWindow {
     var onKeyReleased: ((NSEvent) -> Bool)?
     var onMouseDownInContent: ((NSPoint) -> Void)?
     var onScrollWheelInContent: ((NSEvent) -> Bool)?
+    var onUndo: (() -> Void)?
+    var onRedo: (() -> Void)?
 
     override var canBecomeKey: Bool { true }
+
+    @objc func undo(_ sender: Any?) {
+        onUndo?()
+    }
+
+    @objc func redo(_ sender: Any?) {
+        onRedo?()
+    }
 
     override func keyDown(with event: NSEvent) {
         if onKeyPressed?(event) == true {

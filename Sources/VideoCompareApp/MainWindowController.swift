@@ -412,6 +412,11 @@ final class MainWindowController: NSWindowController {
     private var originalBypassSlot: VideoSlot?
     private var lastHistogramUpdate: TimeInterval = 0
     private var showsFrameNumbers = false
+    private var undoStack: [PreviewEditState] = []
+    private var redoStack: [PreviewEditState] = []
+    private var pendingUndoSnapshot: PreviewEditState?
+    private var pendingUndoCommitTimer: Timer?
+    private var isApplyingPreviewHistory = false
     private var selectedSlot: VideoSlot? {
         didSet {
             canvas.selectedSlot = selectedSlot
@@ -435,6 +440,13 @@ final class MainWindowController: NSWindowController {
         let expectB: Bool
         var frameA: (CVPixelBuffer, Double)?
         var frameB: (CVPixelBuffer, Double)?
+    }
+
+    private struct PreviewEditState: Equatable {
+        var transformA: TransformState
+        var transformB: TransformState
+        var colorAdjustmentA: ColorAdjustmentState
+        var colorAdjustmentB: ColorAdjustmentState
     }
 
     convenience init() {
@@ -462,6 +474,12 @@ final class MainWindowController: NSWindowController {
         }
         window.onScrollWheelInContent = { [weak self] event in
             self?.handleScrollWheel(event) ?? false
+        }
+        window.onUndo = { [weak self] in
+            self?.undoPreviewEdit()
+        }
+        window.onRedo = { [weak self] in
+            self?.redoPreviewEdit()
         }
         setup()
     }
@@ -585,18 +603,21 @@ final class MainWindowController: NSWindowController {
         canvas.containerA.onFilesDropped = { [weak self] _, urls in self?.loadDroppedFiles(urls) }
         canvas.containerB.onFilesDropped = { [weak self] _, urls in self?.loadDroppedFiles(urls) }
         canvas.onPanDragged = { [weak self] slot, dx, dy in
+            self?.beginPreviewUndoGroup()
             if self?.selectedSlot != slot {
                 self?.selectedSlot = slot
             }
             self?.adjustTransform(slot: slot, dx: dx, dy: dy, dz: 0)
         }
         canvas.onZoomDragged = { [weak self] slot, dz in
+            self?.beginPreviewUndoGroup()
             if self?.selectedSlot != slot {
                 self?.selectedSlot = slot
             }
             self?.adjustTransform(slot: slot, dx: 0, dy: 0, dz: dz)
         }
         canvas.onAlignmentGestureEnded = { [weak self] in
+            self?.commitPreviewUndoGroup()
             self?.refreshStatus()
         }
         canvas.onToggleChanged = { [weak self] in
@@ -849,6 +870,25 @@ final class MainWindowController: NSWindowController {
         appMenu.addItem(closeItem)
         appMenu.addItem(withTitle: "退出 VideoCompare", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
+
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "编辑")
+        let undoItem = NSMenuItem(title: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        undoItem.keyEquivalentModifierMask = [.command]
+        undoItem.target = nil
+        editMenu.addItem(undoItem)
+        let redoItem = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        redoItem.target = nil
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
 
         let fileItem = NSMenuItem()
         mainMenu.addItem(fileItem)
@@ -1145,6 +1185,7 @@ final class MainWindowController: NSWindowController {
 
     private func load(url: URL, slot: VideoSlot) {
         Diagnostics.log("load \(slot.rawValue): \(url.path)")
+        clearPreviewUndoHistory()
         syncBaseTime = 0
         normalizedOffsetPair = nil
         clearSyncLoopRange()
@@ -1532,13 +1573,17 @@ final class MainWindowController: NSWindowController {
 
     @objc private func zoomOut() {
         guard canvas.allowsAlignmentAdjustment else { return }
+        beginPreviewUndoGroup()
         adjustTransform(dx: 0, dy: 0, dz: -0.05)
+        commitPreviewUndoGroup()
         refreshStatus()
     }
 
     @objc private func zoomIn() {
         guard canvas.allowsAlignmentAdjustment else { return }
+        beginPreviewUndoGroup()
         adjustTransform(dx: 0, dy: 0, dz: 0.05)
+        commitPreviewUndoGroup()
         refreshStatus()
     }
 
@@ -1572,6 +1617,10 @@ final class MainWindowController: NSWindowController {
     }
 
     private func setColorAdjustment(_ adjustment: ColorAdjustmentState, slot: VideoSlot) {
+        guard colorAdjustment(for: slot) != adjustment else { return }
+        if !isApplyingPreviewHistory {
+            beginPreviewUndoGroup()
+        }
         switch slot {
         case .a:
             colorAdjustmentA = adjustment
@@ -1582,12 +1631,97 @@ final class MainWindowController: NSWindowController {
         }
         refreshHistogramForCurrentFrame(slot: slot)
         refreshColorAdjustmentPanel()
+        if !isApplyingPreviewHistory {
+            schedulePreviewUndoCommit()
+        }
     }
 
     private func applyColorAdjustmentsToRenderer() {
         canvas.renderer.colorAdjustmentA = colorAdjustmentA
         canvas.renderer.colorAdjustmentB = colorAdjustmentB
         canvas.renderer.originalBypassSlot = originalBypassSlot
+    }
+
+    private func currentPreviewEditState() -> PreviewEditState {
+        PreviewEditState(
+            transformA: syncState.transformA,
+            transformB: syncState.transformB,
+            colorAdjustmentA: colorAdjustmentA,
+            colorAdjustmentB: colorAdjustmentB
+        )
+    }
+
+    private func beginPreviewUndoGroup() {
+        guard !isApplyingPreviewHistory, pendingUndoSnapshot == nil else { return }
+        pendingUndoSnapshot = currentPreviewEditState()
+    }
+
+    private func commitPreviewUndoGroup() {
+        pendingUndoCommitTimer?.invalidate()
+        pendingUndoCommitTimer = nil
+        guard let before = pendingUndoSnapshot else { return }
+        pendingUndoSnapshot = nil
+        guard before != currentPreviewEditState() else { return }
+        undoStack.append(before)
+        redoStack.removeAll()
+    }
+
+    private func schedulePreviewUndoCommit() {
+        guard pendingUndoSnapshot != nil else { return }
+        pendingUndoCommitTimer?.invalidate()
+        pendingUndoCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.commitPreviewUndoGroup()
+            }
+        }
+        RunLoop.main.add(pendingUndoCommitTimer!, forMode: .common)
+    }
+
+    private func clearPreviewUndoHistory() {
+        pendingUndoCommitTimer?.invalidate()
+        pendingUndoCommitTimer = nil
+        pendingUndoSnapshot = nil
+        undoStack.removeAll()
+        redoStack.removeAll()
+    }
+
+    @objc private func undoPreviewEdit() {
+        commitPreviewUndoGroup()
+        guard let previous = undoStack.popLast() else {
+            NSSound.beep()
+            return
+        }
+        redoStack.append(currentPreviewEditState())
+        applyPreviewEditState(previous)
+    }
+
+    @objc private func redoPreviewEdit() {
+        commitPreviewUndoGroup()
+        guard let next = redoStack.popLast() else {
+            NSSound.beep()
+            return
+        }
+        undoStack.append(currentPreviewEditState())
+        applyPreviewEditState(next)
+    }
+
+    private func applyPreviewEditState(_ state: PreviewEditState) {
+        isApplyingPreviewHistory = true
+        syncState.transformA = state.transformA
+        syncState.transformB = state.transformB
+        colorAdjustmentA = state.colorAdjustmentA
+        colorAdjustmentB = state.colorAdjustmentB
+
+        canvas.renderer.transformA = syncState.transformA
+        canvas.renderer.transformB = syncState.transformB
+        playerA.applyTransform(syncState.transformA)
+        playerB.applyTransform(syncState.transformB)
+        applyColorAdjustmentsToRenderer()
+        refreshHistogramForCurrentFrame(slot: .a)
+        refreshHistogramForCurrentFrame(slot: .b)
+        refreshColorAdjustmentPanel()
+        refreshStatus()
+        isApplyingPreviewHistory = false
     }
 
     private func colorAdjustment(for slot: VideoSlot?) -> ColorAdjustmentState {
@@ -1877,6 +2011,7 @@ final class MainWindowController: NSWindowController {
 
     @objc private func resetTransform() {
         guard canvas.allowsAlignmentAdjustment, let slot = selectedSlot else { return }
+        beginPreviewUndoGroup()
         if slot == .a {
             syncState.transformA = TransformState()
             canvas.renderer.transformA = syncState.transformA
@@ -1886,6 +2021,7 @@ final class MainWindowController: NSWindowController {
             canvas.renderer.transformB = syncState.transformB
             playerB.applyTransform(syncState.transformB)
         }
+        commitPreviewUndoGroup()
         saveState()
         refreshStatus()
     }
@@ -2175,6 +2311,14 @@ final class MainWindowController: NSWindowController {
     }
 
     private func handleKey(_ event: NSEvent) -> Bool {
+        if mediaFileTrees.isPathEditing {
+            if event.keyCode == 53 {
+                _ = mediaFileTrees.endPathEditingIfNeeded()
+                return true
+            }
+            return false
+        }
+
         if let key = event.charactersIgnoringModifiers?.lowercased() {
             let commandOption = event.modifierFlags.contains(.command)
                 && event.modifierFlags.contains(.option)
@@ -2188,6 +2332,13 @@ final class MainWindowController: NSWindowController {
                 && event.modifierFlags.intersection([.control, .option]).isEmpty
             if commandOnly {
                 switch key {
+                case "z":
+                    if event.modifierFlags.contains(.shift) {
+                        redoPreviewEdit()
+                    } else {
+                        undoPreviewEdit()
+                    }
+                    return true
                 case "1":
                     applyLayout(.sideBySideHorizontal)
                     return true
@@ -2270,12 +2421,14 @@ final class MainWindowController: NSWindowController {
         let relativeAnchor = anchor?.relativePoint ?? CGPoint(x: 0.5, y: 0.5)
         let rawDelta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.deltaY
         let dz = max(-0.25, min(0.25, Double(rawDelta) * 0.01))
+        beginPreviewUndoGroup()
         if let selectedSlot {
             adjustTransform(slot: selectedSlot, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
         } else {
             adjustTransform(slot: .a, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
             adjustTransform(slot: .b, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
         }
+        schedulePreviewUndoCommit()
         return true
     }
 

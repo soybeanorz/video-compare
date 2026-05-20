@@ -99,6 +99,29 @@ private final class MediaCollectionView: NSCollectionView {
     }
 }
 
+private final class PathTextField: NSTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.command),
+              event.modifierFlags.intersection([.control, .option]).isEmpty,
+              let key = event.charactersIgnoringModifiers?.lowercased() else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        switch key {
+        case "a":
+            return NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: self)
+        case "c":
+            return NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: self)
+        case "v":
+            return NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: self)
+        case "x":
+            return NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: self)
+        default:
+            return super.performKeyEquivalent(with: event)
+        }
+    }
+}
+
 final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSCollectionViewDataSource, NSCollectionViewDelegate {
     static let collapsedHeight: CGFloat = 44
     static let expandedHeight: CGFloat = 220
@@ -115,7 +138,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
 
     private let toolbarView = NSView()
     private let upButton = NSButton()
-    private let pathField = NSTextField(string: "")
+    private let pathField = PathTextField(string: "")
     private let viewModeControl: NSSegmentedControl
     private let sortButton = NSButton()
 
@@ -328,6 +351,14 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         window.makeFirstResponder(nil)
         refreshPathField()
         return true
+    }
+
+    var isPathEditing: Bool {
+        guard let window,
+              let fieldEditor = window.firstResponder as? NSTextView else {
+            return false
+        }
+        return window.fieldEditor(false, for: pathField) === fieldEditor
     }
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
@@ -802,5 +833,9 @@ final class MediaFileTreesView: NSView {
 
     func endPathEditingIfNeeded() -> Bool {
         treeA.endPathEditingIfNeeded() || treeB.endPathEditingIfNeeded()
+    }
+
+    var isPathEditing: Bool {
+        treeA.isPathEditing || treeB.isPathEditing
     }
 }
