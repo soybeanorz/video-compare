@@ -190,7 +190,7 @@ final class VideoCanvasView: NSView {
     }
     var onToggleChanged: (() -> Void)?
     var onWipeChanged: ((CGFloat) -> Void)?
-    var onPanDragged: ((VideoSlot, CGFloat, CGFloat) -> Void)?
+    var onPanDragged: ((VideoSlot?, CGFloat, CGFloat) -> Void)?
     var onZoomDragged: ((VideoSlot, CGFloat) -> Void)?
     var onAlignmentGestureEnded: (() -> Void)?
     var onROIAlignmentRequested: ((VideoSlot, NSRect) -> Void)?
@@ -328,7 +328,7 @@ final class VideoCanvasView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let wantsROISelection = event.modifierFlags.contains(.command)
+        let wantsROISelection = event.modifierFlags.contains(.control)
         if wantsROISelection,
            layoutMode == .overlapWipe,
            activeContentBounds().contains(point),
@@ -376,11 +376,8 @@ final class VideoCanvasView: NSView {
             didPan = true
             let content = activeContentBounds()
             if content.width > 0 && content.height > 0, let panSlot {
-                if event.modifierFlags.contains(.option) {
-                    onZoomDragged?(panSlot, -dy / content.height * 2)
-                } else {
-                    onPanDragged?(panSlot, dx / content.width * 2, dy / content.height * 2)
-                }
+                let targetSlot = event.modifierFlags.contains(.command) ? panSlot : nil
+                onPanDragged?(targetSlot, dx / content.width * 2, dy / content.height * 2)
             }
             self.lastDragPoint = point
         }

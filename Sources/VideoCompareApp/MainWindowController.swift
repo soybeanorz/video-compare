@@ -241,8 +241,11 @@ final class ShortcutHelpView: NSView {
             HelpRow(key: "F", detail: "显示当前帧序号"),
             HelpRow(key: "O", detail: "按住查看原始画面"),
             HelpRow(key: "Opt+Cmd+C", detail: "打开调整面板"),
-            HelpRow(key: "Cmd+Scroll", detail: "缩放画面"),
-            HelpRow(key: "Cmd+Drag", detail: "框选 ROI 自动对齐")
+            HelpRow(key: "Drag", detail: "同步拖动画面"),
+            HelpRow(key: "Cmd+Drag", detail: "单独拖动画面"),
+            HelpRow(key: "Scroll", detail: "同步缩放画面"),
+            HelpRow(key: "Cmd+Scroll", detail: "单独缩放画面"),
+            HelpRow(key: "Ctrl+Drag", detail: "框选 ROI 自动对齐")
         ]),
         HelpSection(title: "文件与片段", rows: [
             HelpRow(key: "Cmd+B", detail: "展开文件面板"),
@@ -660,11 +663,17 @@ final class MainWindowController: NSWindowController {
         canvas.containerA.onFilesDropped = { [weak self] slot, urls in self?.handleDroppedItems(urls, targetSlot: slot) }
         canvas.containerB.onFilesDropped = { [weak self] slot, urls in self?.handleDroppedItems(urls, targetSlot: slot) }
         canvas.onPanDragged = { [weak self] slot, dx, dy in
-            self?.beginPreviewUndoGroup()
-            if self?.selectedSlot != slot {
-                self?.selectedSlot = slot
+            guard let self else { return }
+            self.beginPreviewUndoGroup()
+            if let slot {
+                if self.selectedSlot != slot {
+                    self.selectedSlot = slot
+                }
+                self.adjustTransform(slot: slot, dx: dx, dy: dy, dz: 0)
+            } else {
+                self.adjustTransform(slot: .a, dx: dx, dy: dy, dz: 0)
+                self.adjustTransform(slot: .b, dx: dx, dy: dy, dz: 0)
             }
-            self?.adjustTransform(slot: slot, dx: dx, dy: dy, dz: 0)
         }
         canvas.onZoomDragged = { [weak self] slot, dz in
             self?.beginPreviewUndoGroup()
@@ -1063,7 +1072,7 @@ final class MainWindowController: NSWindowController {
         let canvasY = syncTimelineFrame.maxY + gap
         let canvasTop = fileTreeFrame.minY - gap
         let helpW: CGFloat = 540
-        let helpH: CGFloat = 282
+        let helpH: CGFloat = 340
         let helpFrame = NSRect(
             x: max(pad, w - pad - helpW),
             y: max(pad, toolbarY - helpH - 8),
@@ -3002,22 +3011,20 @@ final class MainWindowController: NSWindowController {
     }
 
     private func handleScrollWheel(_ event: NSEvent) -> Bool {
-        guard event.modifierFlags.contains(.command),
-              canvas.allowsAlignmentAdjustment,
+        guard canvas.allowsAlignmentAdjustment,
               let content = window?.contentView else { return false }
         let point = content.convert(event.locationInWindow, from: nil)
-        let anchor: (slot: VideoSlot, relativePoint: CGPoint)?
-        if canvas.frame.contains(point) {
-            anchor = canvas.videoAnchor(at: canvas.convert(point, from: content))
-        } else {
-            anchor = nil
-        }
+        guard canvas.frame.contains(point) else { return false }
+        let anchor = canvas.videoAnchor(at: canvas.convert(point, from: content))
         let relativeAnchor = anchor?.relativePoint ?? CGPoint(x: 0.5, y: 0.5)
         let rawDelta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.deltaY
         let dz = max(-0.25, min(0.25, Double(rawDelta) * 0.01))
         beginPreviewUndoGroup()
-        if let selectedSlot {
-            adjustTransform(slot: selectedSlot, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
+        if event.modifierFlags.contains(.command), let slot = anchor?.slot {
+            if selectedSlot != slot {
+                selectedSlot = slot
+            }
+            adjustTransform(slot: slot, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
         } else {
             adjustTransform(slot: .a, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
             adjustTransform(slot: .b, dx: 0, dy: 0, dz: dz, anchor: relativeAnchor)
