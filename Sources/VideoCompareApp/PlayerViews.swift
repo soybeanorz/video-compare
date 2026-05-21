@@ -134,6 +134,42 @@ final class WipeDividerView: NSView {
     }
 }
 
+final class ROISelectionOverlayView: NSView {
+    var selectionRect: NSRect? {
+        didSet {
+            isHidden = selectionRect == nil
+            needsDisplay = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let selectionRect else { return }
+        NSColor.systemYellow.withAlphaComponent(0.18).setFill()
+        NSBezierPath(rect: selectionRect).fill()
+        NSColor.systemYellow.withAlphaComponent(0.95).setStroke()
+        let path = NSBezierPath(rect: selectionRect.insetBy(dx: 0.5, dy: 0.5))
+        path.lineWidth = 1.5
+        path.stroke()
+    }
+}
+
 final class VideoCanvasView: NSView {
     let containerA = DropVideoView(slot: .a)
     let containerB = DropVideoView(slot: .b)
@@ -143,6 +179,7 @@ final class VideoCanvasView: NSView {
     private let frameNumberA = NSTextField(labelWithString: "")
     private let frameNumberB = NSTextField(labelWithString: "")
     private let divider = WipeDividerView()
+    private let roiOverlay = ROISelectionOverlayView()
     private let labelHeight: CGFloat = 0
 
     var layoutMode: CompareLayout = .sideBySideHorizontal {
@@ -156,6 +193,7 @@ final class VideoCanvasView: NSView {
     var onPanDragged: ((VideoSlot, CGFloat, CGFloat) -> Void)?
     var onZoomDragged: ((VideoSlot, CGFloat) -> Void)?
     var onAlignmentGestureEnded: (() -> Void)?
+    var onROIAlignmentRequested: ((VideoSlot, NSRect) -> Void)?
     var onSelectionChanged: ((VideoSlot?) -> Void)?
     var selectedSlot: VideoSlot? {
         didSet {
@@ -166,9 +204,12 @@ final class VideoCanvasView: NSView {
     }
     private var isDraggingWipe = false
     private var isPanning = false
+    private var isSelectingROI = false
     private var didPan = false
     private var lastDragPoint: NSPoint?
     private var panSlot: VideoSlot?
+    private var roiStartPoint: NSPoint?
+    private var roiSlot: VideoSlot?
 
     var allowsAlignmentAdjustment: Bool {
         layoutMode == .overlapWipe
@@ -186,6 +227,7 @@ final class VideoCanvasView: NSView {
         addSubview(divider)
         addSubview(frameNumberA)
         addSubview(frameNumberB)
+        addSubview(roiOverlay)
         for label in [labelA, labelB] {
             label.isHidden = true
             label.lineBreakMode = .byTruncatingMiddle
@@ -222,6 +264,7 @@ final class VideoCanvasView: NSView {
         let b = bounds
         let oneLabel = labelHeight
         renderer.frame = b
+        roiOverlay.frame = b
         var rectA = NSRect.zero
         var rectB = NSRect.zero
         switch layoutMode {
@@ -285,6 +328,18 @@ final class VideoCanvasView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        let wantsROISelection = event.modifierFlags.contains(.command)
+        if wantsROISelection,
+           layoutMode == .overlapWipe,
+           activeContentBounds().contains(point),
+           let clickedSlot = slot(at: point) {
+            selectedSlot = clickedSlot
+            isSelectingROI = true
+            roiStartPoint = point
+            roiSlot = clickedSlot
+            roiOverlay.selectionRect = NSRect(origin: point, size: .zero)
+            return
+        }
         isDraggingWipe = layoutMode == .overlapWipe && isNearDivider(point)
         let clickedSlot = slot(at: point)
         if let clickedSlot {
@@ -301,6 +356,15 @@ final class VideoCanvasView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if isSelectingROI, let roiStartPoint {
+            let rect = normalizedRect(from: roiStartPoint, to: point)
+            if let roiSlot {
+                roiOverlay.selectionRect = rect.intersection(visibleRect(for: roiSlot))
+            } else {
+                roiOverlay.selectionRect = rect
+            }
+            return
+        }
         if isDraggingWipe {
             updateWipeFromPoint(point)
             return
@@ -323,6 +387,22 @@ final class VideoCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if isSelectingROI {
+            let point = convert(event.locationInWindow, from: nil)
+            let rawRect = normalizedRect(from: roiStartPoint ?? point, to: point)
+            let slot = roiSlot
+            let rect = slot.map { rawRect.intersection(visibleRect(for: $0)) } ?? rawRect.intersection(activeContentBounds())
+            isSelectingROI = false
+            roiStartPoint = nil
+            roiSlot = nil
+            roiOverlay.selectionRect = nil
+            if let slot, rect.width >= 80, rect.height >= 80 {
+                onROIAlignmentRequested?(slot, rect)
+            } else {
+                NSSound.beep()
+            }
+            return
+        }
         isDraggingWipe = false
         isPanning = false
         panSlot = nil
@@ -388,6 +468,20 @@ final class VideoCanvasView: NSView {
         }
     }
 
+    private func visibleRect(for slot: VideoSlot) -> NSRect {
+        switch layoutMode {
+        case .sideBySideHorizontal:
+            return slot == .a ? containerA.frame : containerB.frame
+        case .overlapWipe:
+            let content = activeContentBounds()
+            let splitX = content.minX + content.width * wipeFraction
+            if slot == .a {
+                return NSRect(x: content.minX, y: content.minY, width: max(0, splitX - content.minX), height: content.height)
+            }
+            return NSRect(x: splitX, y: content.minY, width: max(0, content.maxX - splitX), height: content.height)
+        }
+    }
+
     private func layoutFrameNumberLabels(rectA: NSRect, rectB: NSRect) {
         let labels: [(VideoSlot, NSTextField, NSRect)] = [(.a, frameNumberA, rectA), (.b, frameNumberB, rectB)]
         for (slot, label, rect) in labels {
@@ -434,6 +528,15 @@ final class VideoCanvasView: NSView {
         renderer.wipeFraction = wipeFraction
         needsDisplay = true
         onWipeChanged?(wipeFraction)
+    }
+
+    private func normalizedRect(from start: NSPoint, to end: NSPoint) -> NSRect {
+        NSRect(
+            x: min(start.x, end.x),
+            y: min(start.y, end.y),
+            width: abs(end.x - start.x),
+            height: abs(end.y - start.y)
+        )
     }
 
     private func updateSelectionAppearance() {

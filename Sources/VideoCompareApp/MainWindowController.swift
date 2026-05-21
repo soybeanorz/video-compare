@@ -241,7 +241,8 @@ final class ShortcutHelpView: NSView {
             HelpRow(key: "F", detail: "显示当前帧序号"),
             HelpRow(key: "O", detail: "按住查看原始画面"),
             HelpRow(key: "Opt+Cmd+C", detail: "打开调整面板"),
-            HelpRow(key: "Cmd+Scroll", detail: "缩放画面")
+            HelpRow(key: "Cmd+Scroll", detail: "缩放画面"),
+            HelpRow(key: "Cmd+Drag", detail: "框选 ROI 自动对齐")
         ]),
         HelpSection(title: "文件与片段", rows: [
             HelpRow(key: "Cmd+B", detail: "展开文件面板"),
@@ -377,6 +378,7 @@ final class MainWindowController: NSWindowController {
     private let mediaFileTrees = MediaFileTreesView(defaultRoot: FileManager.default.homeDirectoryForCurrentUser)
     private let shortcutHelpPanel = NSView()
     private let shortcutHelpView = ShortcutHelpView()
+    private let transientMessageLabel = NSTextField(labelWithString: "")
     private var timeSlider: ContinuousSeekSlider { syncTimeline.slider }
     private var videoASlider: ContinuousSeekSlider { videoATimeline.slider }
     private var videoBSlider: ContinuousSeekSlider { videoBTimeline.slider }
@@ -408,6 +410,8 @@ final class MainWindowController: NSWindowController {
     private var colorHistogramB = ColorHistogram.empty
     private var lastPixelBufferA: CVPixelBuffer?
     private var lastPixelBufferB: CVPixelBuffer?
+    private var lastFrameTimeA: Double?
+    private var lastFrameTimeB: Double?
     private var filePanelRootA: URL?
     private var filePanelRootB: URL?
     private var filePanelDisplayA: URL?
@@ -421,6 +425,10 @@ final class MainWindowController: NSWindowController {
     private var pendingUndoSnapshot: PreviewEditState?
     private var pendingUndoCommitTimer: Timer?
     private var isApplyingPreviewHistory = false
+    private let roiAlignmentQueue = DispatchQueue(label: "VideoCompare.roiAlignment", qos: .userInitiated)
+    private var roiAlignmentGeneration = 0
+    private var isROIAlignmentRunning = false
+    private var transientMessageGeneration = 0
     private var selectedSlot: VideoSlot? {
         didSet {
             canvas.selectedSlot = selectedSlot
@@ -451,6 +459,42 @@ final class MainWindowController: NSWindowController {
         var transformB: TransformState
         var colorAdjustmentA: ColorAdjustmentState
         var colorAdjustmentB: ColorAdjustmentState
+    }
+
+    private struct ROIAlignmentSnapshot: @unchecked Sendable {
+        let generation: Int
+        let sourceSlot: VideoSlot
+        let sourcePixelBuffer: CVPixelBuffer
+        let targetPixelBuffer: CVPixelBuffer
+        let sourceFrameTime: Double?
+        let targetFrameTime: Double?
+        let sourceTransform: TransformState
+        let targetTransform: TransformState
+        let sourceCanvasRect: CGRect
+        let contentRect: CGRect
+    }
+
+    private struct GrayImage: Sendable {
+        let width: Int
+        let height: Int
+        let pixels: [Float]
+
+        subscript(x: Int, y: Int) -> Float {
+            pixels[y * width + x]
+        }
+    }
+
+    private struct TemplateMatchResult: Sendable {
+        let targetRect: CGRect
+        let score: Double
+        let scale: Double
+    }
+
+    private struct ROIAlignmentResult: Sendable {
+        let sourceRect: CGRect
+        let targetRect: CGRect
+        let score: Double
+        let scale: Double
     }
 
     private enum DroppedItem {
@@ -546,8 +590,12 @@ final class MainWindowController: NSWindowController {
 
     private func handleFrameDecoded(slot: VideoSlot, pixelBuffer: CVPixelBuffer, pts: Double) {
         switch slot {
-        case .a: lastPixelBufferA = pixelBuffer
-        case .b: lastPixelBufferB = pixelBuffer
+        case .a:
+            lastPixelBufferA = pixelBuffer
+            lastFrameTimeA = pts
+        case .b:
+            lastPixelBufferB = pixelBuffer
+            lastFrameTimeB = pts
         }
         updateHistogramIfNeeded(slot: slot, pixelBuffer: pixelBuffer)
         guard var pending = pendingSyncScrubPresentation else {
@@ -629,6 +677,9 @@ final class MainWindowController: NSWindowController {
             self?.commitPreviewUndoGroup()
             self?.refreshStatus()
         }
+        canvas.onROIAlignmentRequested = { [weak self] slot, rect in
+            self?.performROIAlignment(sourceSlot: slot, sourceCanvasRect: rect)
+        }
         canvas.onToggleChanged = { [weak self] in
             self?.refreshStatus()
         }
@@ -654,10 +705,12 @@ final class MainWindowController: NSWindowController {
         ] as [NSView]
         content.addSubview(canvas)
         controls.forEach(content.addSubview)
+        content.addSubview(transientMessageLabel)
 
         setupMenu()
         configureControls()
         configureShortcutHelp()
+        configureTransientMessage()
         refreshRecentMenu()
         layoutControl.selectedSegment = CompareLayout.sideBySideHorizontal.rawValue
         applyColorAdjustmentsToRenderer()
@@ -853,6 +906,18 @@ final class MainWindowController: NSWindowController {
         shortcutHelpPanel.addSubview(shortcutHelpView)
     }
 
+    private func configureTransientMessage() {
+        transientMessageLabel.isHidden = true
+        transientMessageLabel.alignment = .center
+        transientMessageLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        transientMessageLabel.textColor = .white
+        transientMessageLabel.backgroundColor = NSColor(calibratedWhite: 0.05, alpha: 0.82)
+        transientMessageLabel.drawsBackground = true
+        transientMessageLabel.wantsLayer = true
+        transientMessageLabel.layer?.cornerRadius = 7
+        transientMessageLabel.layer?.masksToBounds = true
+    }
+
     @objc private func toggleShortcutHelp() {
         shortcutHelpPanel.isHidden.toggle()
         bringShortcutHelpToFront()
@@ -998,7 +1063,7 @@ final class MainWindowController: NSWindowController {
         let canvasY = syncTimelineFrame.maxY + gap
         let canvasTop = fileTreeFrame.minY - gap
         let helpW: CGFloat = 540
-        let helpH: CGFloat = 252
+        let helpH: CGFloat = 282
         let helpFrame = NSRect(
             x: max(pad, w - pad - helpW),
             y: max(pad, toolbarY - helpH - 8),
@@ -1048,6 +1113,14 @@ final class MainWindowController: NSWindowController {
         mediaFileTrees.alphaValue = 1
         setFrame(canvas, frames.canvas)
         canvas.layoutSubtreeIfNeeded()
+        let messageWidth = min(420, max(160, frames.canvas.width - 40))
+        transientMessageLabel.frame = NSRect(
+            x: frames.canvas.midX - messageWidth / 2,
+            y: frames.canvas.maxY - 42,
+            width: messageWidth,
+            height: 28
+        )
+        content.addSubview(transientMessageLabel, positioned: .above, relativeTo: nil)
         let hideIndependentTimelines = canvas.layoutMode != .sideBySideHorizontal
         layoutVideoTimeline(videoATimeline, over: canvas.containerA.frame, hidden: hideIndependentTimelines || canvas.containerA.isHidden, in: content)
         layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: hideIndependentTimelines || canvas.containerB.isHidden, in: content)
@@ -1278,12 +1351,14 @@ final class MainWindowController: NSWindowController {
             colorAdjustmentA = ColorAdjustmentState()
             colorHistogramA = ColorHistogram.empty
             lastPixelBufferA = nil
+            lastFrameTimeA = nil
             playerA.load(url: url)
         case .b:
             canvas.containerB.showsPlaceholder = false
             colorAdjustmentB = ColorAdjustmentState()
             colorHistogramB = ColorHistogram.empty
             lastPixelBufferB = nil
+            lastFrameTimeB = nil
             playerB.load(url: url)
         }
         applyColorAdjustmentsToRenderer()
@@ -1806,6 +1881,443 @@ final class MainWindowController: NSWindowController {
         isApplyingPreviewHistory = false
     }
 
+    private func performROIAlignment(sourceSlot: VideoSlot, sourceCanvasRect: NSRect) {
+        guard canvas.layoutMode == .overlapWipe else {
+            rejectROIAlignment("roi.align.reject layout")
+            return
+        }
+        guard playerA.fileURL != nil, playerB.fileURL != nil,
+              let bufferA = lastPixelBufferA,
+              let bufferB = lastPixelBufferB else {
+            rejectROIAlignment("roi.align.reject missing-frame")
+            return
+        }
+        guard !isSynchronizedPlaying, playerA.isPaused, playerB.isPaused else {
+            rejectROIAlignment("roi.align.reject playing")
+            return
+        }
+        guard !isROIAlignmentRunning else {
+            rejectROIAlignment("roi.align.reject busy")
+            return
+        }
+
+        canvas.layoutSubtreeIfNeeded()
+        let contentRect = canvas.videoRect(for: sourceSlot)
+        guard contentRect.width > 1, contentRect.height > 1 else {
+            rejectROIAlignment("roi.align.reject empty-content")
+            return
+        }
+
+        roiAlignmentGeneration += 1
+        isROIAlignmentRunning = true
+        let generation = roiAlignmentGeneration
+        let snapshot = ROIAlignmentSnapshot(
+            generation: generation,
+            sourceSlot: sourceSlot,
+            sourcePixelBuffer: sourceSlot == .a ? bufferA : bufferB,
+            targetPixelBuffer: sourceSlot == .a ? bufferB : bufferA,
+            sourceFrameTime: sourceSlot == .a ? lastFrameTimeA : lastFrameTimeB,
+            targetFrameTime: sourceSlot == .a ? lastFrameTimeB : lastFrameTimeA,
+            sourceTransform: sourceSlot == .a ? syncState.transformA : syncState.transformB,
+            targetTransform: sourceSlot == .a ? syncState.transformB : syncState.transformA,
+            sourceCanvasRect: sourceCanvasRect,
+            contentRect: contentRect
+        )
+
+        Diagnostics.log("roi.align.start slot=\(sourceSlot.rawValue) rect=(\(rectDebug(sourceCanvasRect)))")
+        roiAlignmentQueue.async { [weak self] in
+            let result = Self.computeROIAlignment(snapshot: snapshot)
+            DispatchQueue.main.async {
+                self?.finishROIAlignment(snapshot: snapshot, result: result)
+            }
+        }
+    }
+
+    private func rejectROIAlignment(_ reason: String) {
+        Diagnostics.log(reason)
+        NSSound.beep()
+        showTransientMessage(messageForROIAlignmentRejection(reason))
+    }
+
+    private func messageForROIAlignmentRejection(_ reason: String) -> String {
+        if reason.contains("layout") { return "请先切换到拖动遮罩模式" }
+        if reason.contains("missing-frame") { return "请先加载 A/B 并停在当前帧" }
+        if reason.contains("playing") { return "自动对齐仅在暂停时可用" }
+        if reason.contains("busy") { return "正在计算自动对齐" }
+        if reason.contains("empty-content") { return "当前画面区域不可用" }
+        if reason.contains("no-match") { return "没有找到可靠的匹配区域" }
+        return "无法执行自动对齐"
+    }
+
+    private func showTransientMessage(_ message: String) {
+        transientMessageGeneration += 1
+        let generation = transientMessageGeneration
+        transientMessageLabel.stringValue = message
+        transientMessageLabel.isHidden = false
+        transientMessageLabel.alphaValue = 1
+        transientMessageLabel.superview?.addSubview(transientMessageLabel, positioned: .above, relativeTo: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self, self.transientMessageGeneration == generation else { return }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                self.transientMessageLabel.animator().alphaValue = 0
+            } completionHandler: {
+                guard self.transientMessageGeneration == generation else { return }
+                self.transientMessageLabel.isHidden = true
+                self.transientMessageLabel.alphaValue = 1
+            }
+        }
+    }
+
+    private func finishROIAlignment(snapshot: ROIAlignmentSnapshot, result: ROIAlignmentResult?) {
+        defer { isROIAlignmentRunning = false }
+        guard roiAlignmentGeneration == snapshot.generation,
+              canvas.layoutMode == .overlapWipe,
+              snapshot.sourceTransform == (snapshot.sourceSlot == .a ? syncState.transformA : syncState.transformB),
+              snapshot.targetTransform == (snapshot.sourceSlot == .a ? syncState.transformB : syncState.transformA),
+              snapshot.sourceFrameTime == (snapshot.sourceSlot == .a ? lastFrameTimeA : lastFrameTimeB),
+              snapshot.targetFrameTime == (snapshot.sourceSlot == .a ? lastFrameTimeB : lastFrameTimeA) else {
+            Diagnostics.log("roi.align.discard stale")
+            return
+        }
+        guard let result else {
+            rejectROIAlignment("roi.align.fail no-match")
+            return
+        }
+
+        beginPreviewUndoGroup()
+        applyROIAlignment(snapshot: snapshot, result: result)
+        commitPreviewUndoGroup()
+        refreshStatus()
+        Diagnostics.log("roi.align.applied slot=\(snapshot.sourceSlot.rawValue) score=\(String(format: "%.3f", result.score)) scale=\(String(format: "%.3f", result.scale))")
+    }
+
+    private func applyROIAlignment(snapshot: ROIAlignmentSnapshot, result: ROIAlignmentResult) {
+        var sourceTransform = snapshot.sourceTransform
+        var targetTransform = snapshot.targetTransform
+        let sourceSize = Self.pixelBufferSize(snapshot.sourcePixelBuffer)
+        let targetSize = Self.pixelBufferSize(snapshot.targetPixelBuffer)
+        let sourceFit = Self.fitScale(sourceSize: sourceSize, contentRect: snapshot.contentRect)
+        let targetFit = Self.fitScale(sourceSize: targetSize, contentRect: snapshot.contentRect)
+        let sourceScreenWidth = result.sourceRect.width * sourceFit * pow(2.0, sourceTransform.zoom)
+        let sourceScreenHeight = result.sourceRect.height * sourceFit * pow(2.0, sourceTransform.zoom)
+        let targetScreenWidth = result.targetRect.width * targetFit * pow(2.0, targetTransform.zoom)
+        let targetScreenHeight = result.targetRect.height * targetFit * pow(2.0, targetTransform.zoom)
+        let widthRatio = targetScreenWidth / max(1, sourceScreenWidth)
+        let heightRatio = targetScreenHeight / max(1, sourceScreenHeight)
+        let ratio = sqrt(max(0.01, widthRatio * heightRatio))
+        let zoomDelta = max(-0.2, min(0.2, log2(ratio) / 2))
+        sourceTransform.zoom += zoomDelta
+        targetTransform.zoom -= zoomDelta
+
+        sourceTransform = Self.transformCentering(
+            point: CGPoint(x: result.sourceRect.midX, y: result.sourceRect.midY),
+            pixelBuffer: snapshot.sourcePixelBuffer,
+            contentRect: snapshot.contentRect,
+            transform: sourceTransform
+        )
+        targetTransform = Self.transformCentering(
+            point: CGPoint(x: result.targetRect.midX, y: result.targetRect.midY),
+            pixelBuffer: snapshot.targetPixelBuffer,
+            contentRect: snapshot.contentRect,
+            transform: targetTransform
+        )
+
+        switch snapshot.sourceSlot {
+        case .a:
+            syncState.transformA = sourceTransform
+            syncState.transformB = targetTransform
+        case .b:
+            syncState.transformB = sourceTransform
+            syncState.transformA = targetTransform
+        }
+        canvas.wipeFraction = 0.5
+        canvas.renderer.wipeFraction = 0.5
+        canvas.needsLayout = true
+        canvas.layoutSubtreeIfNeeded()
+        canvas.renderer.transformA = syncState.transformA
+        canvas.renderer.transformB = syncState.transformB
+        playerA.applyTransform(syncState.transformA)
+        playerB.applyTransform(syncState.transformB)
+    }
+
+    nonisolated private static func computeROIAlignment(snapshot: ROIAlignmentSnapshot) -> ROIAlignmentResult? {
+        guard let sourceRect = pixelRect(
+            fromCanvasRect: snapshot.sourceCanvasRect,
+            pixelBuffer: snapshot.sourcePixelBuffer,
+            transform: snapshot.sourceTransform,
+            contentRect: snapshot.contentRect
+        ) else {
+            Diagnostics.log("roi.align.fail source-rect")
+            return nil
+        }
+        guard sourceRect.width >= 24, sourceRect.height >= 24 else {
+            Diagnostics.log("roi.align.fail source-rect-small")
+            return nil
+        }
+        guard let target = makeFullGrayImage(pixelBuffer: snapshot.targetPixelBuffer, maxLongSide: 640) else {
+            Diagnostics.log("roi.align.fail target-gray")
+            return nil
+        }
+
+        let targetScale = CGFloat(target.width) / max(1, CGFloat(CVPixelBufferGetWidth(snapshot.targetPixelBuffer)))
+        let scaleCandidates = [0.80, 0.86, 0.92, 0.98, 1.04, 1.10, 1.17, 1.25]
+        var best: TemplateMatchResult?
+        for candidateScale in scaleCandidates {
+            let templateWidth = Int((sourceRect.width * targetScale * candidateScale).rounded())
+            let templateHeight = Int((sourceRect.height * targetScale * candidateScale).rounded())
+            guard templateWidth >= 18, templateHeight >= 18,
+                  templateWidth < target.width,
+                  templateHeight < target.height,
+                  let template = makeGrayPatch(
+                    pixelBuffer: snapshot.sourcePixelBuffer,
+                    sourceRect: sourceRect,
+                    outputWidth: templateWidth,
+                    outputHeight: templateHeight
+                  ) else { continue }
+            guard let match = matchTemplate(template: template, target: target, targetScale: targetScale, scale: candidateScale) else {
+                continue
+            }
+            if best == nil || match.score > best!.score {
+                best = match
+            }
+        }
+
+        guard let best, best.score >= 0.58 else {
+            Diagnostics.log("roi.align.fail score=\(String(format: "%.3f", best?.score ?? 0))")
+            return nil
+        }
+        return ROIAlignmentResult(sourceRect: sourceRect, targetRect: best.targetRect, score: best.score, scale: best.scale)
+    }
+
+    nonisolated private static func pixelBufferSize(_ pixelBuffer: CVPixelBuffer) -> CGSize {
+        CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+    }
+
+    nonisolated private static func fitScale(sourceSize: CGSize, contentRect: CGRect) -> CGFloat {
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return 1 }
+        return min(contentRect.width / sourceSize.width, contentRect.height / sourceSize.height)
+    }
+
+    nonisolated private static func displayedVideoRect(pixelBuffer: CVPixelBuffer, transform: TransformState, contentRect: CGRect) -> CGRect {
+        let sourceSize = pixelBufferSize(pixelBuffer)
+        let fit = fitScale(sourceSize: sourceSize, contentRect: contentRect)
+        let finalScale = fit * CGFloat(pow(2.0, transform.zoom))
+        let videoSize = CGSize(width: sourceSize.width * finalScale, height: sourceSize.height * finalScale)
+        return CGRect(
+            x: contentRect.midX - videoSize.width / 2 + CGFloat(transform.panX) * contentRect.width / 2,
+            y: contentRect.midY - videoSize.height / 2 + CGFloat(transform.panY) * contentRect.height / 2,
+            width: videoSize.width,
+            height: videoSize.height
+        )
+    }
+
+    nonisolated private static func pixelRect(fromCanvasRect canvasRect: CGRect, pixelBuffer: CVPixelBuffer, transform: TransformState, contentRect: CGRect) -> CGRect? {
+        let videoRect = displayedVideoRect(pixelBuffer: pixelBuffer, transform: transform, contentRect: contentRect)
+        let clipped = canvasRect.intersection(videoRect).intersection(contentRect)
+        guard !clipped.isNull, clipped.width > 1, clipped.height > 1, canvasRect.width > 1, canvasRect.height > 1 else {
+            return nil
+        }
+        let coverage = (clipped.width * clipped.height) / max(1, canvasRect.width * canvasRect.height)
+        guard coverage >= 0.70 else { return nil }
+
+        let sourceWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+        let sourceHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        let x0 = (clipped.minX - videoRect.minX) / max(1, videoRect.width) * sourceWidth
+        let x1 = (clipped.maxX - videoRect.minX) / max(1, videoRect.width) * sourceWidth
+        let y0 = (clipped.minY - videoRect.minY) / max(1, videoRect.height) * sourceHeight
+        let y1 = (clipped.maxY - videoRect.minY) / max(1, videoRect.height) * sourceHeight
+        let rect = CGRect(
+            x: max(0, min(sourceWidth - 1, min(x0, x1))),
+            y: max(0, min(sourceHeight - 1, min(y0, y1))),
+            width: max(1, min(sourceWidth, max(x0, x1)) - max(0, min(x0, x1))),
+            height: max(1, min(sourceHeight, max(y0, y1)) - max(0, min(y0, y1)))
+        )
+        return rect.width >= 1 && rect.height >= 1 ? rect : nil
+    }
+
+    nonisolated private static func transformCentering(point: CGPoint, pixelBuffer: CVPixelBuffer, contentRect: CGRect, transform: TransformState) -> TransformState {
+        var result = transform
+        let videoRect = displayedVideoRect(pixelBuffer: pixelBuffer, transform: result, contentRect: contentRect)
+        let sourceWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+        let sourceHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        guard sourceWidth > 0, sourceHeight > 0, videoRect.width > 0, videoRect.height > 0 else { return result }
+        let scaleX = videoRect.width / sourceWidth
+        let scaleY = videoRect.height / sourceHeight
+        let baseX = contentRect.midX - videoRect.width / 2
+        let baseY = contentRect.midY - videoRect.height / 2
+        result.panX = Double((contentRect.midX - (baseX + point.x * scaleX)) * 2 / max(1, contentRect.width))
+        result.panY = Double((contentRect.midY - (baseY + point.y * scaleY)) * 2 / max(1, contentRect.height))
+        return result
+    }
+
+    nonisolated private static func makeFullGrayImage(pixelBuffer: CVPixelBuffer, maxLongSide: Int) -> GrayImage? {
+        let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
+        guard sourceWidth > 0, sourceHeight > 0 else { return nil }
+        let scale = min(1, Double(maxLongSide) / Double(max(sourceWidth, sourceHeight)))
+        let width = max(2, Int((Double(sourceWidth) * scale).rounded()))
+        let height = max(2, Int((Double(sourceHeight) * scale).rounded()))
+        return makeGrayPatch(
+            pixelBuffer: pixelBuffer,
+            sourceRect: CGRect(x: 0, y: 0, width: sourceWidth, height: sourceHeight),
+            outputWidth: width,
+            outputHeight: height
+        )
+    }
+
+    nonisolated private static func makeGrayPatch(pixelBuffer: CVPixelBuffer, sourceRect: CGRect, outputWidth: Int, outputHeight: Int) -> GrayImage? {
+        guard outputWidth > 1, outputHeight > 1 else { return nil }
+        let lockResult = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        guard lockResult == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
+        guard sourceWidth > 0, sourceHeight > 0 else { return nil }
+        var pixels = Array(repeating: Float(0), count: outputWidth * outputHeight)
+        for y in 0..<outputHeight {
+            let fy = sourceRect.minY + (CGFloat(y) + 0.5) / CGFloat(outputHeight) * sourceRect.height
+            for x in 0..<outputWidth {
+                let fx = sourceRect.minX + (CGFloat(x) + 0.5) / CGFloat(outputWidth) * sourceRect.width
+                pixels[y * outputWidth + x] = sampleLumaLocked(pixelBuffer: pixelBuffer, x: fx, y: fy)
+            }
+        }
+        return GrayImage(width: outputWidth, height: outputHeight, pixels: pixels)
+    }
+
+    nonisolated private static func sampleLumaLocked(pixelBuffer: CVPixelBuffer, x: CGFloat, y: CGFloat) -> Float {
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        if CVPixelBufferGetPlaneCount(pixelBuffer) >= 2,
+           let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) {
+            let planeWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+            let planeHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+            let px = min(max(0, Int(x.rounded(.down))), max(0, planeWidth - 1))
+            let py = min(max(0, Int(y.rounded(.down))), max(0, planeHeight - 1))
+            let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+            if pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange {
+                let pointer = base.assumingMemoryBound(to: UInt16.self)
+                let rowStride = max(1, bytesPerRow / MemoryLayout<UInt16>.stride)
+                let raw = pointer[py * rowStride + px]
+                let tenBit = raw > 1023 ? raw >> 6 : raw
+                return Float(normalizedVideoLuma(Double(tenBit), maxValue: 1023, fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange))
+            }
+            let pointer = base.assumingMemoryBound(to: UInt8.self)
+            return Float(normalizedVideoLuma(Double(pointer[py * bytesPerRow + px]), maxValue: 255, fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange))
+        }
+
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return 0 }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let px = min(max(0, Int(x.rounded(.down))), max(0, width - 1))
+        let py = min(max(0, Int(y.rounded(.down))), max(0, height - 1))
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let pointer = base.assumingMemoryBound(to: UInt8.self)
+        let offset = py * bytesPerRow + px * 4
+        let b = Double(pointer[offset]) / 255.0
+        let g = Double(pointer[offset + 1]) / 255.0
+        let r = Double(pointer[offset + 2]) / 255.0
+        return Float(r * 0.2126 + g * 0.7152 + b * 0.0722)
+    }
+
+    nonisolated private static func matchTemplate(template: GrayImage, target: GrayImage, targetScale: CGFloat, scale: Double) -> TemplateMatchResult? {
+        guard template.width >= 8, template.height >= 8,
+              template.width < target.width, template.height < target.height else { return nil }
+        let samplesX = min(28, max(8, template.width / 4))
+        let samplesY = min(28, max(8, template.height / 4))
+        var offsets: [(x: Int, y: Int)] = []
+        var templateValues: [Float] = []
+        offsets.reserveCapacity(samplesX * samplesY)
+        templateValues.reserveCapacity(samplesX * samplesY)
+        for sy in 0..<samplesY {
+            let y = samplesY == 1 ? template.height / 2 : min(template.height - 1, Int((Double(sy) / Double(samplesY - 1)) * Double(template.height - 1)))
+            for sx in 0..<samplesX {
+                let x = samplesX == 1 ? template.width / 2 : min(template.width - 1, Int((Double(sx) / Double(samplesX - 1)) * Double(template.width - 1)))
+                offsets.append((x, y))
+                templateValues.append(template[x, y])
+            }
+        }
+        let stats = sampleStats(templateValues)
+        guard stats.std >= 0.035 else {
+            Diagnostics.log("roi.align.fail low-texture std=\(String(format: "%.4f", stats.std))")
+            return nil
+        }
+
+        func score(at originX: Int, _ originY: Int) -> Double {
+            var targetSum = 0.0
+            for offset in offsets {
+                targetSum += Double(target[originX + offset.x, originY + offset.y])
+            }
+            let targetMean = targetSum / Double(offsets.count)
+            var numerator = 0.0
+            var targetVariance = 0.0
+            for index in offsets.indices {
+                let value = Double(target[originX + offsets[index].x, originY + offsets[index].y])
+                let td = Double(templateValues[index]) - stats.mean
+                let vd = value - targetMean
+                numerator += td * vd
+                targetVariance += vd * vd
+            }
+            guard targetVariance > 0.000001 else { return -1 }
+            return numerator / sqrt(stats.variance * targetVariance)
+        }
+
+        let maxX = target.width - template.width
+        let maxY = target.height - template.height
+        let coarseStep = max(4, min(template.width, template.height) / 12)
+        var bestX = 0
+        var bestY = 0
+        var bestScore = -Double.infinity
+        for y in stride(from: 0, through: maxY, by: coarseStep) {
+            for x in stride(from: 0, through: maxX, by: coarseStep) {
+                let current = score(at: x, y)
+                if current > bestScore {
+                    bestScore = current
+                    bestX = x
+                    bestY = y
+                }
+            }
+        }
+
+        let refineStep = max(1, coarseStep / 4)
+        let refineRadius = coarseStep
+        let startY = max(0, bestY - refineRadius)
+        let endY = min(maxY, bestY + refineRadius)
+        let startX = max(0, bestX - refineRadius)
+        let endX = min(maxX, bestX + refineRadius)
+        for y in stride(from: startY, through: endY, by: refineStep) {
+            for x in stride(from: startX, through: endX, by: refineStep) {
+                let current = score(at: x, y)
+                if current > bestScore {
+                    bestScore = current
+                    bestX = x
+                    bestY = y
+                }
+            }
+        }
+
+        guard bestScore.isFinite else { return nil }
+        let inverseScale = 1 / max(0.0001, targetScale)
+        let rect = CGRect(
+            x: CGFloat(bestX) * inverseScale,
+            y: CGFloat(bestY) * inverseScale,
+            width: CGFloat(template.width) * inverseScale,
+            height: CGFloat(template.height) * inverseScale
+        )
+        return TemplateMatchResult(targetRect: rect, score: bestScore, scale: scale)
+    }
+
+    nonisolated private static func sampleStats(_ values: [Float]) -> (mean: Double, variance: Double, std: Double) {
+        guard !values.isEmpty else { return (0, 0, 0) }
+        let mean = values.reduce(0.0) { $0 + Double($1) } / Double(values.count)
+        let variance = max(0, values.reduce(0.0) { partial, value in
+            let d = Double(value) - mean
+            return partial + d * d
+        })
+        return (mean, variance, sqrt(variance / Double(values.count)))
+    }
+
     private func colorAdjustment(for slot: VideoSlot?) -> ColorAdjustmentState {
         switch slot {
         case .a: colorAdjustmentA
@@ -1940,7 +2452,7 @@ final class MainWindowController: NSWindowController {
         )
     }
 
-    private static func normalizedVideoLuma(_ value: Double, maxValue: Double, fullRange: Bool) -> Double {
+    nonisolated private static func normalizedVideoLuma(_ value: Double, maxValue: Double, fullRange: Bool) -> Double {
         if fullRange {
             return min(1, max(0, value / maxValue))
         }
