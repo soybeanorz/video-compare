@@ -9,7 +9,7 @@ final class DropVideoView: NSView {
             placeholderLabel.isHidden = !showsPlaceholder
         }
     }
-    private let placeholderLabel = NSTextField(labelWithString: "拖入视频/照片以加载")
+    private let placeholderLabel = NSTextField(labelWithString: "拖入视频/照片/文件夹")
 
     init(slot: VideoSlot) {
         self.slot = slot
@@ -37,7 +37,7 @@ final class DropVideoView: NSView {
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         let urls = urls(from: sender)
-        Diagnostics.log("drop slot=\(slot.rawValue) supportedFiles=\(urls.count) paths=\(urls.map(\.path).joined(separator: " | "))")
+        Diagnostics.log("drop slot=\(slot.rawValue) validItems=\(urls.count) paths=\(urls.map(\.path).joined(separator: " | "))")
         guard !urls.isEmpty else { return false }
         if urls.count == 1, let url = urls.first {
             onFileDropped?(slot, url)
@@ -84,7 +84,10 @@ final class DropVideoView: NSView {
         var seen = Set<String>()
         return urls.compactMap { url in
             let standardized = url.standardizedFileURL
-            guard MediaFileSupport.isSupported(standardized), seen.insert(standardized.path).inserted else { return nil }
+            var isDirectory: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: standardized.path, isDirectory: &isDirectory)
+            let isValid = exists && (isDirectory.boolValue || MediaFileSupport.isSupported(standardized))
+            guard isValid, seen.insert(standardized.path).inserted else { return nil }
             return standardized
         }
     }

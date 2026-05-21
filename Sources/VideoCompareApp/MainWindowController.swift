@@ -408,6 +408,10 @@ final class MainWindowController: NSWindowController {
     private var colorHistogramB = ColorHistogram.empty
     private var lastPixelBufferA: CVPixelBuffer?
     private var lastPixelBufferB: CVPixelBuffer?
+    private var filePanelRootA: URL?
+    private var filePanelRootB: URL?
+    private var filePanelDisplayA: URL?
+    private var filePanelDisplayB: URL?
     private var colorAdjustmentPanel: ColorAdjustmentPanelController?
     private var originalBypassSlot: VideoSlot?
     private var lastHistogramUpdate: TimeInterval = 0
@@ -447,6 +451,11 @@ final class MainWindowController: NSWindowController {
         var transformB: TransformState
         var colorAdjustmentA: ColorAdjustmentState
         var colorAdjustmentB: ColorAdjustmentState
+    }
+
+    private enum DroppedItem {
+        case media(URL)
+        case directory(URL)
     }
 
     convenience init() {
@@ -598,10 +607,10 @@ final class MainWindowController: NSWindowController {
         playerB.onSeekCompleted = { [weak self] _, exact, elapsed in self?.recordSeekCompleted(exact: exact, elapsed: elapsed) }
         configureScrubCoordinators()
 
-        canvas.containerA.onFileDropped = { [weak self] _, url in self?.load(url: url, slot: .a) }
-        canvas.containerB.onFileDropped = { [weak self] _, url in self?.load(url: url, slot: .b) }
-        canvas.containerA.onFilesDropped = { [weak self] _, urls in self?.loadDroppedFiles(urls) }
-        canvas.containerB.onFilesDropped = { [weak self] _, urls in self?.loadDroppedFiles(urls) }
+        canvas.containerA.onFileDropped = { [weak self] slot, url in self?.handleDroppedItems([url], targetSlot: slot) }
+        canvas.containerB.onFileDropped = { [weak self] slot, url in self?.handleDroppedItems([url], targetSlot: slot) }
+        canvas.containerA.onFilesDropped = { [weak self] slot, urls in self?.handleDroppedItems(urls, targetSlot: slot) }
+        canvas.containerB.onFilesDropped = { [weak self] slot, urls in self?.handleDroppedItems(urls, targetSlot: slot) }
         canvas.onPanDragged = { [weak self] slot, dx, dy in
             self?.beginPreviewUndoGroup()
             if self?.selectedSlot != slot {
@@ -1128,12 +1137,39 @@ final class MainWindowController: NSWindowController {
     }
 
     private func mediaRoot(for slot: VideoSlot) -> URL {
-        let url = slot == .a ? playerA?.fileURL : playerB?.fileURL
-        return url?.deletingLastPathComponent() ?? FileManager.default.homeDirectoryForCurrentUser
+        switch slot {
+        case .a: filePanelRootA ?? playerA?.fileURL?.deletingLastPathComponent() ?? FileManager.default.homeDirectoryForCurrentUser
+        case .b: filePanelRootB ?? playerB?.fileURL?.deletingLastPathComponent() ?? FileManager.default.homeDirectoryForCurrentUser
+        }
     }
 
     private func mediaDisplayURL(for slot: VideoSlot) -> URL? {
-        slot == .a ? playerA?.fileURL : playerB?.fileURL
+        switch slot {
+        case .a: filePanelDisplayA ?? playerA?.fileURL
+        case .b: filePanelDisplayB ?? playerB?.fileURL
+        }
+    }
+
+    private func setFilePanelLocation(root: URL, display: URL?, slot: VideoSlot) {
+        switch slot {
+        case .a:
+            filePanelRootA = root.standardizedFileURL
+            filePanelDisplayA = display?.standardizedFileURL
+        case .b:
+            filePanelRootB = root.standardizedFileURL
+            filePanelDisplayB = display?.standardizedFileURL
+        }
+    }
+
+    private func expandMediaFileTreesIfNeeded() {
+        guard !fileTreesExpanded else { return }
+        fileTreesExpanded = true
+        updateFileTreeToggleButton()
+        mediaFileTrees.setBrowserContentSuppressed(true)
+        mediaFileTrees.setExpanded(true, animated: true)
+        animateFileTreeTransition(to: true) { [weak self] in
+            self?.mediaFileTrees.setBrowserContentSuppressed(false)
+        }
     }
 
     private func layoutVideoTimeline(_ timeline: TimelineControl, over canvasRect: NSRect, hidden: Bool, in content: NSView) {
@@ -1173,19 +1209,65 @@ final class MainWindowController: NSWindowController {
         }
     }
 
-    private func loadDroppedFiles(_ urls: [URL]) {
-        guard urls.count >= 2 else {
-            if let url = urls.first {
-                load(url: url, slot: .a)
+    private func handleDroppedItems(_ urls: [URL], targetSlot: VideoSlot) {
+        let items = urls.compactMap(droppedItem(for:))
+        guard !items.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        if items.count == 1, let item = items.first {
+            switch item {
+            case .media:
+                applyDroppedItem(item, slot: targetSlot)
+            case .directory(let url):
+                applyDroppedDirectoryToBothPanels(url)
             }
             return
         }
-        loadInitial(a: urls[0], b: urls[1])
+        for (slot, item) in zip([VideoSlot.a, .b], items.prefix(2)) {
+            applyDroppedItem(item, slot: slot)
+        }
+    }
+
+    private func droppedItem(for url: URL) -> DroppedItem? {
+        let standardized = url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: standardized.path, isDirectory: &isDirectory) else {
+            return nil
+        }
+        if isDirectory.boolValue {
+            return .directory(standardized)
+        }
+        guard MediaFileSupport.isSupported(standardized) else {
+            return nil
+        }
+        return .media(standardized)
+    }
+
+    private func applyDroppedItem(_ item: DroppedItem, slot: VideoSlot) {
+        switch item {
+        case .media(let url):
+            load(url: url, slot: slot)
+        case .directory(let url):
+            Diagnostics.log("drop.directory slot=\(slot.rawValue): \(url.path)")
+            setFilePanelLocation(root: url, display: nil, slot: slot)
+            reloadMediaFileTrees()
+            expandMediaFileTreesIfNeeded()
+        }
+    }
+
+    private func applyDroppedDirectoryToBothPanels(_ url: URL) {
+        Diagnostics.log("drop.directory.both: \(url.path)")
+        setFilePanelLocation(root: url, display: nil, slot: .a)
+        setFilePanelLocation(root: url, display: nil, slot: .b)
+        reloadMediaFileTrees()
+        expandMediaFileTreesIfNeeded()
     }
 
     private func load(url: URL, slot: VideoSlot) {
         Diagnostics.log("load \(slot.rawValue): \(url.path)")
         clearPreviewUndoHistory()
+        setFilePanelLocation(root: url.deletingLastPathComponent(), display: url, slot: slot)
         syncBaseTime = 0
         normalizedOffsetPair = nil
         clearSyncLoopRange()
