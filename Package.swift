@@ -8,11 +8,6 @@ let package = Package(
         .executable(name: "VideoCompare", targets: ["VideoCompareApp"])
     ],
     targets: [
-        .systemLibrary(
-            name: "CMpv",
-            path: "Sources/CMpv",
-            pkgConfig: "mpv"
-        ),
         .target(
             name: "CFFmpeg",
             path: "Sources/CFFmpeg",
@@ -23,12 +18,11 @@ let package = Package(
         ),
         .executableTarget(
             name: "VideoCompareApp",
-            dependencies: ["CMpv", "CFFmpeg"],
+            dependencies: ["CFFmpeg"],
             path: "Sources/VideoCompareApp",
             linkerSettings: [
                 .unsafeFlags([
                     "-L/opt/homebrew/lib",
-                    "-lmpv",
                     "-lavformat",
                     "-lavcodec",
                     "-lavutil",
@@ -43,6 +37,11 @@ let package = Package(
                     "-Xlinker", "/opt/homebrew/lib"
                 ])
             ]
+        ),
+        .testTarget(
+            name: "VideoCompareAppTests",
+            dependencies: ["VideoCompareApp"],
+            path: "Tests/VideoCompareAppTests"
         )
     ]
 )

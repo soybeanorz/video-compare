@@ -361,18 +361,7 @@ final class MainWindowController: NSWindowController {
     private var playerB: NativeVideoPlayer!
 
     private let layoutControl = NSSegmentedControl(labels: CompareLayout.allCases.map(\.title), trackingMode: .selectOne, target: nil, action: nil)
-    private let syncPlayButton = NSButton(title: "同步播放", target: nil, action: nil)
-    private let syncPauseButton = NSButton(title: "同步暂停", target: nil, action: nil)
-    private let prevFrameButton = NSButton(title: "-1 帧", target: nil, action: nil)
-    private let nextFrameButton = NSButton(title: "+1 帧", target: nil, action: nil)
-    private let playAButton = NSButton(title: "A 播放/暂停", target: nil, action: nil)
-    private let playBButton = NSButton(title: "B 播放/暂停", target: nil, action: nil)
-    private let offsetAMinus = NSButton(title: "A 偏移 -1f", target: nil, action: nil)
-    private let offsetAPlus = NSButton(title: "A 偏移 +1f", target: nil, action: nil)
-    private let offsetBMinus = NSButton(title: "B 偏移 -1f", target: nil, action: nil)
-    private let offsetBPlus = NSButton(title: "B 偏移 +1f", target: nil, action: nil)
     private let targetControl = NSSegmentedControl(labels: ["调 A", "调 B"], trackingMode: .selectOne, target: nil, action: nil)
-    private let clearStateButton = NSButton(title: "清理本组", target: nil, action: nil)
     private let syncTimeline = TimelineControl()
     private let videoATimeline = TimelineControl()
     private let videoBTimeline = TimelineControl()
@@ -402,6 +391,10 @@ final class MainWindowController: NSWindowController {
     private var pendingSyncScrubPresentation: SyncScrubPresentation?
     private var syncBaseTime: Double = 0
     private var syncLoopRange: ClosedRange<Double>?
+    private var loopSeekInProgress = false
+    private var loopPreviewGeneration = 0
+    private var loopStartFrameA: NativeVideoFrame?
+    private var loopStartFrameB: NativeVideoFrame?
     private var isSynchronizedPlaying = false
     private var fileTreesExpanded = false
     private var fileTreeAnimationTimer: Timer?
@@ -422,6 +415,8 @@ final class MainWindowController: NSWindowController {
     private var colorAdjustmentPanel: ColorAdjustmentPanelController?
     private var originalBypassSlot: VideoSlot?
     private var lastHistogramUpdate: TimeInterval = 0
+    private var colorHistogramGeneration = 0
+    private let colorHistogramWorker = ColorHistogramWorker()
     private var showsFrameNumbers = false
     private var undoStack: [PreviewEditState] = []
     private var redoStack: [PreviewEditState] = []
@@ -500,6 +495,49 @@ final class MainWindowController: NSWindowController {
         let scale: Double
     }
 
+    private struct ColorHistogramResult {
+        let slot: VideoSlot
+        let generation: Int
+        let histogram: ColorHistogram
+    }
+
+    private final class ColorHistogramWorker {
+        private final class PixelBufferBox: @unchecked Sendable {
+            let pixelBuffer: CVPixelBuffer
+
+            init(_ pixelBuffer: CVPixelBuffer) {
+                self.pixelBuffer = pixelBuffer
+            }
+        }
+
+        private final class CompletionBox: @unchecked Sendable {
+            let completion: (ColorHistogramResult) -> Void
+
+            init(_ completion: @escaping (ColorHistogramResult) -> Void) {
+                self.completion = completion
+            }
+        }
+
+        private let queue = DispatchQueue(label: "VideoCompare.colorHistogram", qos: .utility)
+
+        func sample(
+            slot: VideoSlot,
+            generation: Int,
+            pixelBuffer: CVPixelBuffer,
+            adjustment: ColorAdjustmentState,
+            completion: @escaping (ColorHistogramResult) -> Void
+        ) {
+            let box = PixelBufferBox(pixelBuffer)
+            let completionBox = CompletionBox(completion)
+            queue.async {
+                let histogram = MainWindowController.sampleColorHistogram(pixelBuffer: box.pixelBuffer, adjustment: adjustment)
+                DispatchQueue.main.async {
+                    completionBox.completion(ColorHistogramResult(slot: slot, generation: generation, histogram: histogram))
+                }
+            }
+        }
+    }
+
     private enum DroppedItem {
         case media(URL)
         case directory(URL)
@@ -537,6 +575,7 @@ final class MainWindowController: NSWindowController {
         window.onRedo = { [weak self] in
             self?.redoPreviewEdit()
         }
+        window.center()
         setup()
     }
 
@@ -701,6 +740,9 @@ final class MainWindowController: NSWindowController {
         mediaFileTrees.setExpanded(fileTreesExpanded)
         mediaFileTrees.treeA.onFileOpened = { [weak self] slot, url in self?.load(url: url, slot: slot) }
         mediaFileTrees.treeB.onFileOpened = { [weak self] slot, url in self?.load(url: url, slot: slot) }
+        mediaFileTrees.onHeightChanged = { [weak self] _ in
+            self?.layoutContent(animated: false)
+        }
 
         let controls = [
             layoutControl,
@@ -745,69 +787,7 @@ final class MainWindowController: NSWindowController {
         syncPlay()
     }
 
-    func runSeekStress() {
-        let duration = max(playerA.duration, playerB.duration)
-        guard duration > 0 else { return }
-        syncPause()
-        for index in 0..<60 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.05) {
-                let fraction = Double(index % 30) / 29.0
-                self.seekToBaseTime(fraction * duration, exact: false)
-                if index == 59 {
-                    self.seekToBaseTime(fraction * duration, exact: true)
-                }
-            }
-        }
-    }
-
-    func runScrubBenchmark() {
-        let duration = max(playerA.duration, playerB.duration)
-        guard duration > 0 else { return }
-        Diagnostics.log("scrub.benchmark.start duration=\(debugTime(duration))")
-        syncPause()
-        syncScrub.beginTracking()
-
-        var samples: [(delay: TimeInterval, fraction: Double)] = []
-        for index in 0..<50 {
-            samples.append((Double(index) * 0.025, Double(index) / 49.0))
-        }
-        let slowStart = samples.last?.delay ?? 0
-        for index in 0..<45 {
-            let phase = Double(index) / 44.0
-            samples.append((slowStart + 0.4 + Double(index) * 0.075, 0.45 + sin(phase * Double.pi * 2.0) * 0.035))
-        }
-
-        for (index, sample) in samples.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + sample.delay) {
-                self.timeSlider.doubleValue = sample.fraction
-                self.syncScrub.updateTarget(seconds: self.currentSliderBaseTime(), fps: self.syncScrubFPS())
-                if index == samples.count - 1 {
-                    self.syncScrub.endTracking(seconds: self.currentSliderBaseTime(), fps: self.syncScrubFPS())
-                    Diagnostics.log("scrub.benchmark.end samples=\(samples.count)")
-                }
-            }
-        }
-    }
-
     private func configureControls() {
-        for button in [syncPlayButton, syncPauseButton, prevFrameButton, nextFrameButton,
-                       playAButton, playBButton, offsetAMinus, offsetAPlus, offsetBMinus, offsetBPlus,
-                       clearStateButton] {
-            button.bezelStyle = .rounded
-            button.target = self
-        }
-
-        syncPlayButton.action = #selector(syncPlay)
-        syncPauseButton.action = #selector(syncPause)
-        prevFrameButton.action = #selector(prevFrame)
-        nextFrameButton.action = #selector(nextFrame)
-        playAButton.action = #selector(toggleA)
-        playBButton.action = #selector(toggleB)
-        offsetAMinus.action = #selector(offsetAMinusFrame)
-        offsetAPlus.action = #selector(offsetAPlusFrame)
-        offsetBMinus.action = #selector(offsetBMinusFrame)
-        offsetBPlus.action = #selector(offsetBPlusFrame)
-        clearStateButton.action = #selector(clearCurrentState)
         syncTimeline.playButton.target = self
         syncTimeline.playButton.action = #selector(toggleSyncTimelinePlayback)
         syncTimeline.previousButton.target = self
@@ -1055,10 +1035,16 @@ final class MainWindowController: NSWindowController {
         let pad: CGFloat = 12
         let rowH: CGFloat = 28
         let gap: CGFloat = 8
-        let fileTreeHeight: CGFloat = expanded ? MediaFileTreesView.expandedHeight : MediaFileTreesView.collapsedHeight
-
         let toolbarY = max(pad, h - pad - rowH)
         let fileTreeTop = toolbarY - gap
+        let syncTimelineFrame = NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78)
+        let canvasY = syncTimelineFrame.maxY + gap
+        let maxExpandedHeight = max(
+            MediaFileTreesView.collapsedHeight,
+            min(520, fileTreeTop - gap - canvasY - 100)
+        )
+        mediaFileTrees.setExpandedHeightRange(MediaFileTreesView.collapsedHeight...maxExpandedHeight)
+        let fileTreeHeight: CGFloat = expanded ? mediaFileTrees.currentExpandedHeight : MediaFileTreesView.collapsedHeight
         let fileTreeFrame = NSRect(
             x: pad,
             y: fileTreeTop - fileTreeHeight,
@@ -1068,8 +1054,6 @@ final class MainWindowController: NSWindowController {
 
         let layoutWidth = min(max(300, w * 0.2), 420)
         let layoutX = floor(content.bounds.midX - layoutWidth / 2)
-        let syncTimelineFrame = NSRect(x: pad, y: pad, width: max(100, w - pad * 2), height: 78)
-        let canvasY = syncTimelineFrame.maxY + gap
         let canvasTop = fileTreeFrame.minY - gap
         let helpW: CGFloat = 540
         let helpH: CGFloat = 340
@@ -1488,11 +1472,6 @@ final class MainWindowController: NSWindowController {
     @objc private func prevFrame() { stepBySelection(-1) }
     @objc private func nextFrame() { stepBySelection(1) }
 
-    @objc private func offsetAMinusFrame() { adjustOffset(slot: .a, delta: -1) }
-    @objc private func offsetAPlusFrame() { adjustOffset(slot: .a, delta: 1) }
-    @objc private func offsetBMinusFrame() { adjustOffset(slot: .b, delta: -1) }
-    @objc private func offsetBPlusFrame() { adjustOffset(slot: .b, delta: 1) }
-
     private func adjustOffset(slot: VideoSlot, delta: Int) {
         pauseBothIfNeeded()
         let base = baseTimeAnchoredOpposite(of: slot)
@@ -1501,6 +1480,7 @@ final class MainWindowController: NSWindowController {
         case .b: syncState.offsetFramesB += delta
         }
         let baseShift = normalizeSyncOffsets(adjustBaseTime: false)
+        refreshSyncLoopPreviewIfNeeded()
         seekToBaseTime(base + baseShift)
         saveState()
         refreshStatus()
@@ -1545,14 +1525,23 @@ final class MainWindowController: NSWindowController {
         seekToBaseTime(currentBaseTime())
     }
 
-    private func seekToBaseTime(_ base: Double, exact: Bool = true) {
+    private func seekToBaseTime(_ base: Double, exact: Bool = true, allowCachedFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
         let alignedBase = frameAlignedBaseTime(base)
         syncBaseTime = alignedBase
         let aTime = alignedBase + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
         let bTime = alignedBase + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
         Diagnostics.log("sync.seekToBase requested=\(debugTime(base)) aligned=\(debugTime(alignedBase)) exact=\(exact) aTarget=\(debugTime(aTime)) bTarget=\(debugTime(bTime))")
-        display(playerA, at: aTime, exact: exact)
-        display(playerB, at: bTime, exact: exact)
+        var callbacks = 0
+        var succeeded = false
+        func finish(_ ok: Bool) {
+            callbacks += 1
+            succeeded = succeeded || ok
+            guard callbacks == 2 else { return }
+            completion?(succeeded)
+        }
+        let seekCompletion: ((Bool) -> Void)? = completion == nil ? nil : { ok in finish(ok) }
+        display(playerA, at: aTime, exact: exact, allowCachedFrame: allowCachedFrame, completion: seekCompletion)
+        display(playerB, at: bTime, exact: exact, allowCachedFrame: allowCachedFrame, completion: seekCompletion)
         debugTimelineState("sync.seekToBase.issued")
     }
 
@@ -1597,12 +1586,14 @@ final class MainWindowController: NSWindowController {
         return frameAlignedTime(slider.doubleValue * player.duration, fps: player.fps)
     }
 
-    private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true) {
+    private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true, allowCachedFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
         let hasContent = seconds >= 0 && (player.duration <= 0 || seconds <= player.duration)
         Diagnostics.log("display slot=\(player.slot.rawValue) target=\(debugTime(seconds)) exact=\(exact) hasContent=\(hasContent) duration=\(debugTime(player.duration))")
         player.setVideoVisible(hasContent)
         if hasContent {
-            player.seekAbsolute(seconds, exact: exact)
+            player.seekAbsolute(seconds, exact: exact, allowCachedFrame: allowCachedFrame, completion: completion)
+        } else {
+            completion?(false)
         }
     }
 
@@ -1658,15 +1649,82 @@ final class MainWindowController: NSWindowController {
         }
         syncLoopRange = lower...upper
         timeSlider.loopRange = (lower / duration)...(upper / duration)
+        preheatSyncLoopStart(range: lower...upper)
         Diagnostics.log("loop.set fractions=(\(range.lowerBound),\(range.upperBound)) seconds=\(debugRange(syncLoopRange))")
         debugTimelineState("loop.set")
     }
 
     private func clearSyncLoopRange() {
         Diagnostics.log("loop.clear previous=\(debugRange(syncLoopRange))")
+        loopPreviewGeneration += 1
+        loopStartFrameA = nil
+        loopStartFrameB = nil
         syncLoopRange = nil
         timeSlider.loopRange = nil
         debugTimelineState("loop.clear")
+    }
+
+    private func preheatSyncLoopStart(range: ClosedRange<Double>) {
+        loopPreviewGeneration += 1
+        loopStartFrameA = nil
+        loopStartFrameB = nil
+        let generation = loopPreviewGeneration
+        preheatLoopStartFrame(slot: .a, base: range.lowerBound, range: range, generation: generation)
+        preheatLoopStartFrame(slot: .b, base: range.lowerBound, range: range, generation: generation)
+    }
+
+    private func refreshSyncLoopPreviewIfNeeded() {
+        guard let syncLoopRange else { return }
+        preheatSyncLoopStart(range: syncLoopRange)
+    }
+
+    private func preheatLoopStartFrame(slot: VideoSlot, base: Double, range: ClosedRange<Double>, generation: Int) {
+        let player = slot == .a ? playerA! : playerB!
+        guard player.fileURL != nil else { return }
+        let offsetFrames = slot == .a ? syncState.offsetFramesA : syncState.offsetFramesB
+        let targetTime = base + seconds(forFrames: offsetFrames, fps: player.fps)
+        guard canDisplay(player, at: targetTime) else { return }
+        player.decodeFrameForLoopPreview(seconds: targetTime, exact: true) { [weak self] frame in
+            guard let self,
+                  generation == self.loopPreviewGeneration,
+                  let currentRange = self.syncLoopRange,
+                  abs(currentRange.lowerBound - range.lowerBound) < 0.0001,
+                  abs(currentRange.upperBound - range.upperBound) < 0.0001 else {
+                return
+            }
+            switch slot {
+            case .a:
+                self.loopStartFrameA = frame
+            case .b:
+                self.loopStartFrameB = frame
+            }
+            Diagnostics.log("sync.loop.preview.ready slot=\(slot.rawValue) generation=\(generation) target=\(self.debugTime(targetTime)) pts=\(self.debugTime(frame?.pts))")
+        }
+    }
+
+    @discardableResult
+    private func presentLoopStartPreview(loopRange: ClosedRange<Double>) -> Bool {
+        syncBaseTime = loopRange.lowerBound
+        var didPresent = false
+        if let frame = loopStartFrameA {
+            playerA.setVideoVisible(true)
+            playerA.presentSynchronizedFrame(frame)
+            didPresent = true
+        }
+        if let frame = loopStartFrameB {
+            playerB.setVideoVisible(true)
+            playerB.presentSynchronizedFrame(frame)
+            didPresent = true
+        }
+        if didPresent {
+            Diagnostics.log("sync.loop.preview.present base=\(debugTime(loopRange.lowerBound)) frameA=\(debugTime(loopStartFrameA?.pts)) frameB=\(debugTime(loopStartFrameB?.pts))")
+            refreshStatus()
+        }
+        return didPresent
+    }
+
+    private func canDisplay(_ player: NativeVideoPlayer, at seconds: Double) -> Bool {
+        seconds >= 0 && (player.duration <= 0 || seconds <= player.duration)
     }
 
     private func seekIndividualVideo(slot: VideoSlot, exact: Bool) {
@@ -1701,6 +1759,7 @@ final class MainWindowController: NSWindowController {
             syncState.offsetFramesB = Int(round((targetTime - base) * max(1, playerB.fps)))
             syncBaseTime = base + normalizeSyncOffsets(adjustBaseTime: false)
         }
+        refreshSyncLoopPreviewIfNeeded()
     }
 
     private func normalizeLoadedOffsetsIfReady() {
@@ -2069,6 +2128,12 @@ final class MainWindowController: NSWindowController {
             return nil
         }
 
+        let expectedTargetRect = pixelRect(
+            fromCanvasRect: snapshot.sourceCanvasRect,
+            pixelBuffer: snapshot.targetPixelBuffer,
+            transform: snapshot.targetTransform,
+            contentRect: snapshot.contentRect
+        )
         let targetScale = CGFloat(target.width) / max(1, CGFloat(CVPixelBufferGetWidth(snapshot.targetPixelBuffer)))
         let scaleCandidates = [0.80, 0.86, 0.92, 0.98, 1.04, 1.10, 1.17, 1.25]
         var best: TemplateMatchResult?
@@ -2084,7 +2149,10 @@ final class MainWindowController: NSWindowController {
                     outputWidth: templateWidth,
                     outputHeight: templateHeight
                   ) else { continue }
-            guard let match = matchTemplate(template: template, target: target, targetScale: targetScale, scale: candidateScale) else {
+            let searchRect = expectedTargetRect.map {
+                scaledSearchRect(expectedRect: $0, targetScale: targetScale, target: target, templateWidth: templateWidth, templateHeight: templateHeight)
+            }
+            guard let match = matchTemplate(template: template, target: target, targetScale: targetScale, scale: candidateScale, searchRect: searchRect) else {
                 continue
             }
             if best == nil || match.score > best!.score {
@@ -2097,6 +2165,18 @@ final class MainWindowController: NSWindowController {
             return nil
         }
         return ROIAlignmentResult(sourceRect: sourceRect, targetRect: best.targetRect, score: best.score, scale: best.scale)
+    }
+
+    nonisolated private static func scaledSearchRect(expectedRect: CGRect, targetScale: CGFloat, target: GrayImage, templateWidth: Int, templateHeight: Int) -> CGRect {
+        let scaled = CGRect(
+            x: expectedRect.minX * targetScale,
+            y: expectedRect.minY * targetScale,
+            width: expectedRect.width * targetScale,
+            height: expectedRect.height * targetScale
+        )
+        let marginX = max(CGFloat(templateWidth) * 4.0, CGFloat(target.width) * 0.14)
+        let marginY = max(CGFloat(templateHeight) * 4.0, CGFloat(target.height) * 0.14)
+        return scaled.insetBy(dx: -marginX, dy: -marginY)
     }
 
     nonisolated private static func pixelBufferSize(_ pixelBuffer: CVPixelBuffer) -> CGSize {
@@ -2230,11 +2310,11 @@ final class MainWindowController: NSWindowController {
         return Float(r * 0.2126 + g * 0.7152 + b * 0.0722)
     }
 
-    nonisolated private static func matchTemplate(template: GrayImage, target: GrayImage, targetScale: CGFloat, scale: Double) -> TemplateMatchResult? {
+    nonisolated private static func matchTemplate(template: GrayImage, target: GrayImage, targetScale: CGFloat, scale: Double, searchRect: CGRect?) -> TemplateMatchResult? {
         guard template.width >= 8, template.height >= 8,
               template.width < target.width, template.height < target.height else { return nil }
-        let samplesX = min(28, max(8, template.width / 4))
-        let samplesY = min(28, max(8, template.height / 4))
+        let samplesX = min(56, max(12, template.width / 2))
+        let samplesY = min(56, max(12, template.height / 2))
         var offsets: [(x: Int, y: Int)] = []
         var templateValues: [Float] = []
         offsets.reserveCapacity(samplesX * samplesY)
@@ -2274,12 +2354,13 @@ final class MainWindowController: NSWindowController {
 
         let maxX = target.width - template.width
         let maxY = target.height - template.height
+        let searchBounds = searchBounds(searchRect: searchRect, maxX: maxX, maxY: maxY)
         let coarseStep = max(4, min(template.width, template.height) / 12)
-        var bestX = 0
-        var bestY = 0
+        var bestX = searchBounds.minX
+        var bestY = searchBounds.minY
         var bestScore = -Double.infinity
-        for y in stride(from: 0, through: maxY, by: coarseStep) {
-            for x in stride(from: 0, through: maxX, by: coarseStep) {
+        for y in strideValues(from: searchBounds.minY, through: searchBounds.maxY, by: coarseStep) {
+            for x in strideValues(from: searchBounds.minX, through: searchBounds.maxX, by: coarseStep) {
                 let current = score(at: x, y)
                 if current > bestScore {
                     bestScore = current
@@ -2291,12 +2372,12 @@ final class MainWindowController: NSWindowController {
 
         let refineStep = max(1, coarseStep / 4)
         let refineRadius = coarseStep
-        let startY = max(0, bestY - refineRadius)
-        let endY = min(maxY, bestY + refineRadius)
-        let startX = max(0, bestX - refineRadius)
-        let endX = min(maxX, bestX + refineRadius)
-        for y in stride(from: startY, through: endY, by: refineStep) {
-            for x in stride(from: startX, through: endX, by: refineStep) {
+        let startY = max(searchBounds.minY, bestY - refineRadius)
+        let endY = min(searchBounds.maxY, bestY + refineRadius)
+        let startX = max(searchBounds.minX, bestX - refineRadius)
+        let endX = min(searchBounds.maxX, bestX + refineRadius)
+        for y in strideValues(from: startY, through: endY, by: refineStep) {
+            for x in strideValues(from: startX, through: endX, by: refineStep) {
                 let current = score(at: x, y)
                 if current > bestScore {
                     bestScore = current
@@ -2315,6 +2396,30 @@ final class MainWindowController: NSWindowController {
             height: CGFloat(template.height) * inverseScale
         )
         return TemplateMatchResult(targetRect: rect, score: bestScore, scale: scale)
+    }
+
+    nonisolated private static func searchBounds(searchRect: CGRect?, maxX: Int, maxY: Int) -> (minX: Int, maxX: Int, minY: Int, maxY: Int) {
+        guard let searchRect, !searchRect.isNull, searchRect.width > 1, searchRect.height > 1 else {
+            return (0, maxX, 0, maxY)
+        }
+        let minX = min(maxX, max(0, Int(searchRect.minX.rounded(.down))))
+        let maxSearchX = min(maxX, max(0, Int(searchRect.maxX.rounded(.up))))
+        let minY = min(maxY, max(0, Int(searchRect.minY.rounded(.down))))
+        let maxSearchY = min(maxY, max(0, Int(searchRect.maxY.rounded(.up))))
+        guard minX <= maxSearchX, minY <= maxSearchY else {
+            return (0, maxX, 0, maxY)
+        }
+        return (minX, maxSearchX, minY, maxSearchY)
+    }
+
+    nonisolated private static func strideValues(from start: Int, through end: Int, by step: Int) -> [Int] {
+        guard start <= end else { return [] }
+        let step = max(1, step)
+        var values = Array(stride(from: start, through: end, by: step))
+        if values.last != end {
+            values.append(end)
+        }
+        return values
     }
 
     nonisolated private static func sampleStats(_ values: [Float]) -> (mean: Double, variance: Double, std: Double) {
@@ -2362,26 +2467,43 @@ final class MainWindowController: NSWindowController {
         let now = CACurrentMediaTime()
         guard now - lastHistogramUpdate >= 0.18 else { return }
         lastHistogramUpdate = now
-        let histogram = Self.sampleColorHistogram(pixelBuffer: pixelBuffer, adjustment: colorAdjustment(for: slot))
-        switch slot {
-        case .a: colorHistogramA = histogram
-        case .b: colorHistogramB = histogram
-        }
-        colorAdjustmentPanel.updateHistogram(histogram)
+        scheduleHistogramSample(slot: slot, pixelBuffer: pixelBuffer, updatePanelState: false)
     }
 
     private func refreshHistogramForCurrentFrame(slot: VideoSlot) {
-        guard colorAdjustmentPanel?.window?.isVisible == true else { return }
+        guard selectedSlot == slot,
+              colorAdjustmentPanel?.window?.isVisible == true else { return }
         let pixelBuffer = slot == .a ? lastPixelBufferA : lastPixelBufferB
         guard let pixelBuffer else { return }
-        let histogram = Self.sampleColorHistogram(pixelBuffer: pixelBuffer, adjustment: colorAdjustment(for: slot))
-        switch slot {
-        case .a: colorHistogramA = histogram
-        case .b: colorHistogramB = histogram
+        scheduleHistogramSample(slot: slot, pixelBuffer: pixelBuffer, updatePanelState: true)
+    }
+
+    private func scheduleHistogramSample(slot: VideoSlot, pixelBuffer: CVPixelBuffer, updatePanelState: Bool) {
+        colorHistogramGeneration += 1
+        let generation = colorHistogramGeneration
+        let adjustment = colorAdjustment(for: slot)
+        colorHistogramWorker.sample(slot: slot, generation: generation, pixelBuffer: pixelBuffer, adjustment: adjustment) { [weak self] result in
+            guard let self,
+                  result.generation == self.colorHistogramGeneration,
+                  self.selectedSlot == result.slot,
+                  self.colorAdjustmentPanel?.window?.isVisible == true else { return }
+            switch result.slot {
+            case .a: self.colorHistogramA = result.histogram
+            case .b: self.colorHistogramB = result.histogram
+            }
+            if updatePanelState {
+                self.colorAdjustmentPanel?.update(
+                    slot: self.selectedSlot,
+                    state: self.colorAdjustment(for: self.selectedSlot),
+                    histogram: self.histogram(for: self.selectedSlot)
+                )
+            } else {
+                self.colorAdjustmentPanel?.updateHistogram(result.histogram)
+            }
         }
     }
 
-    private static func sampleColorHistogram(pixelBuffer: CVPixelBuffer, adjustment: ColorAdjustmentState) -> ColorHistogram {
+    nonisolated private static func sampleColorHistogram(pixelBuffer: CVPixelBuffer, adjustment: ColorAdjustmentState) -> ColorHistogram {
         let binCount = ColorAdjustmentState.histogramBinCount
         var red = Array(repeating: 0.0, count: binCount)
         var green = Array(repeating: 0.0, count: binCount)
@@ -2471,7 +2593,7 @@ final class MainWindowController: NSWindowController {
         return min(1, max(0, (value - 16) / 219))
     }
 
-    private static func sampleUV(pixelBuffer: CVPixelBuffer, sourceX: Int, sourceY: Int, is10Bit: Bool, fullRange: Bool) -> (cb: Double, cr: Double) {
+    nonisolated private static func sampleUV(pixelBuffer: CVPixelBuffer, sourceX: Int, sourceY: Int, is10Bit: Bool, fullRange: Bool) -> (cb: Double, cr: Double) {
         guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2,
               let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
             return (0, 0)
@@ -2505,7 +2627,7 @@ final class MainWindowController: NSWindowController {
         return ((rawCb - 128) / 224, (rawCr - 128) / 224)
     }
 
-    private static func yuvToRGB(y: Double, cb: Double, cr: Double) -> (r: Double, g: Double, b: Double) {
+    nonisolated private static func yuvToRGB(y: Double, cb: Double, cr: Double) -> (r: Double, g: Double, b: Double) {
         (
             clamp01(y + 1.5748 * cr),
             clamp01(y - 0.1873 * cb - 0.4681 * cr),
@@ -2513,7 +2635,7 @@ final class MainWindowController: NSWindowController {
         )
     }
 
-    private static func adjustedRGB(r: Double, g: Double, b: Double, adjustment: ColorAdjustmentState) -> (r: Double, g: Double, b: Double) {
+    nonisolated private static func adjustedRGB(r: Double, g: Double, b: Double, adjustment: ColorAdjustmentState) -> (r: Double, g: Double, b: Double) {
         guard adjustment.isEnabled else {
             return (clamp01(r), clamp01(g), clamp01(b))
         }
@@ -2553,7 +2675,7 @@ final class MainWindowController: NSWindowController {
         return (clamp01(r), clamp01(g), clamp01(b))
     }
 
-    private static func clamp01(_ value: Double) -> Double {
+    nonisolated private static func clamp01(_ value: Double) -> Double {
         min(1, max(0, value))
     }
 
@@ -2782,6 +2904,7 @@ final class MainWindowController: NSWindowController {
         if !playerA.isPaused { playerA.setPause(true) }
         if !playerB.isPaused { playerB.setPause(true) }
         isSynchronizedPlaying = true
+        loopSeekInProgress = false
         synchronizedPlaybackToken += 1
         synchronizedDebugFrameCount = 0
         let token = synchronizedPlaybackToken
@@ -2793,7 +2916,8 @@ final class MainWindowController: NSWindowController {
             let base = currentBaseTime()
             if base < loopRange.lowerBound || base > loopRange.upperBound {
                 Diagnostics.log("sync.play.loopClamp token=\(token) base=\(debugTime(base)) loop=\(debugRange(syncLoopRange))")
-                seekToBaseTime(loopRange.lowerBound, exact: true)
+                seekLoopStartAndResume(token: token, loopRange: loopRange, reason: "clamp")
+                return
             }
         }
         scheduleSynchronizedFrame(token: token)
@@ -2802,6 +2926,7 @@ final class MainWindowController: NSWindowController {
     private func stopSynchronizedBarrierPlayback() {
         guard isSynchronizedPlaying else { return }
         isSynchronizedPlaying = false
+        loopSeekInProgress = false
         synchronizedPlaybackToken += 1
         Diagnostics.log("sync.play.stop token=\(synchronizedPlaybackToken)")
         debugTimelineState("sync.play.stop")
@@ -2810,7 +2935,7 @@ final class MainWindowController: NSWindowController {
     }
 
     private func scheduleSynchronizedFrame(token: Int) {
-        guard isSynchronizedPlaying, token == synchronizedPlaybackToken else { return }
+        guard isSynchronizedPlaying, token == synchronizedPlaybackToken, !loopSeekInProgress else { return }
         let started = CACurrentMediaTime()
         var frameA: NativeVideoFrame?
         var frameB: NativeVideoFrame?
@@ -2825,10 +2950,7 @@ final class MainWindowController: NSWindowController {
                let nextBase = self.baseTime(frameA: frameA, frameB: frameB),
                nextBase > loopRange.upperBound + (0.5 / max(1, max(self.playerA.fps, self.playerB.fps))) {
                 Diagnostics.log("sync.loop.wrap token=\(token) nextBase=\(self.debugTime(nextBase)) loop=\(self.debugRange(self.syncLoopRange)) frameA=\(self.debugTime(frameA?.pts)) frameB=\(self.debugTime(frameB?.pts))")
-                self.seekToBaseTime(loopRange.lowerBound, exact: true)
-                DispatchQueue.main.async {
-                    self.scheduleSynchronizedFrame(token: token)
-                }
+                self.seekLoopStartAndResume(token: token, loopRange: loopRange, reason: "upper")
                 return
             }
 
@@ -2847,6 +2969,11 @@ final class MainWindowController: NSWindowController {
             }
 
             if frameA == nil && frameB == nil {
+                if let loopRange = self.syncLoopRange {
+                    Diagnostics.log("sync.loop.wrap token=\(token) reason=eof loop=\(self.debugRange(self.syncLoopRange))")
+                    self.seekLoopStartAndResume(token: token, loopRange: loopRange, reason: "eof")
+                    return
+                }
                 self.stopSynchronizedBarrierPlayback()
                 return
             }
@@ -2873,6 +3000,29 @@ final class MainWindowController: NSWindowController {
         playerB.decodeNextFrameForSynchronization { frame in
             frameB = frame
             finishIfReady()
+        }
+    }
+
+    private func seekLoopStartAndResume(token: Int, loopRange: ClosedRange<Double>, reason: String) {
+        guard isSynchronizedPlaying, token == synchronizedPlaybackToken, !loopSeekInProgress else { return }
+        loopSeekInProgress = true
+        let previewed = presentLoopStartPreview(loopRange: loopRange)
+        Diagnostics.log("sync.loop.seekStart token=\(token) reason=\(reason) target=\(debugTime(loopRange.lowerBound)) previewed=\(previewed) loop=\(debugRange(syncLoopRange))")
+        seekToBaseTime(loopRange.lowerBound, exact: true, allowCachedFrame: false) { [weak self] ok in
+            guard let self else { return }
+            self.loopSeekInProgress = false
+            guard self.isSynchronizedPlaying,
+                  token == self.synchronizedPlaybackToken,
+                  self.syncLoopRange != nil else {
+                return
+            }
+            Diagnostics.log("sync.loop.seekComplete token=\(token) ok=\(ok) base=\(self.debugTime(self.syncBaseTime)) loop=\(self.debugRange(self.syncLoopRange))")
+            self.refreshStatus()
+            guard ok else {
+                self.stopSynchronizedBarrierPlayback()
+                return
+            }
+            self.scheduleSynchronizedFrame(token: token)
         }
     }
 

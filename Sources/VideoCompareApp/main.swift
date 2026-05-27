@@ -20,16 +20,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         controller.startSynchronizedPlayback()
                     }
                 }
-                if LaunchArguments.seekStress {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                        controller.runSeekStress()
-                    }
-                }
-                if LaunchArguments.scrubBenchmark {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                        controller.runScrubBenchmark()
-                    }
-                }
             }
         }
     }
@@ -58,13 +48,6 @@ private enum LaunchArguments {
         CommandLine.arguments.contains("--autoplay")
     }
 
-    static var seekStress: Bool {
-        CommandLine.arguments.contains("--seek-stress")
-    }
-
-    static var scrubBenchmark: Bool {
-        CommandLine.arguments.contains("--scrub-benchmark")
-    }
 }
 
 let app = NSApplication.shared

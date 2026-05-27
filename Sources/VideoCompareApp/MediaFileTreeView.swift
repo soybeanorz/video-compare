@@ -1,4 +1,6 @@
 import AppKit
+import AVFoundation
+import ImageIO
 import UniformTypeIdentifiers
 
 private enum MediaFileSortMode: Int, CaseIterable {
@@ -19,7 +21,7 @@ private enum MediaFileSortMode: Int, CaseIterable {
     }
 }
 
-private final class MediaEntry {
+private final class MediaEntry: @unchecked Sendable {
     let url: URL
     let isDirectory: Bool
     let modifiedDate: Date
@@ -44,6 +46,159 @@ private final class MediaEntry {
     }
 }
 
+private final class MediaDirectoryLoader {
+    private final class CompletionBox: @unchecked Sendable {
+        let completion: (Int, URL, [MediaEntry]) -> Void
+
+        init(_ completion: @escaping (Int, URL, [MediaEntry]) -> Void) {
+            self.completion = completion
+        }
+    }
+
+    private let queue = DispatchQueue(label: "VideoCompare.mediaDirectoryLoader", qos: .userInitiated)
+
+    func load(url: URL, sortMode: MediaFileSortMode, requestID: Int, completion: @escaping (Int, URL, [MediaEntry]) -> Void) {
+        let standardized = url.standardizedFileURL
+        let completionBox = CompletionBox(completion)
+        queue.async {
+            let entries = MediaDirectoryTreeView.loadEntries(in: standardized, sortMode: sortMode)
+            DispatchQueue.main.async {
+                completionBox.completion(requestID, standardized, entries)
+            }
+        }
+    }
+}
+
+private final class MediaThumbnailLoader: @unchecked Sendable {
+    private final class CompletionBox: @unchecked Sendable {
+        let completion: (Int, String, NSImage?) -> Void
+
+        init(_ completion: @escaping (Int, String, NSImage?) -> Void) {
+            self.completion = completion
+        }
+    }
+
+    private final class ImageBox: @unchecked Sendable {
+        let image: NSImage?
+
+        init(_ image: NSImage?) {
+            self.image = image
+        }
+    }
+
+    private let queue = DispatchQueue(label: "VideoCompare.mediaThumbnailLoader", qos: .userInitiated)
+    private let lock = NSLock()
+    private var cache: [String: NSImage] = [:]
+    private var latestByFile: [String: NSImage] = [:]
+    private var inFlight: Set<String> = []
+
+    func cachedImage(for entry: MediaEntry, thumbnailSize: CGFloat, scale: CGFloat) -> NSImage? {
+        let key = cacheKey(for: entry, thumbnailSize: thumbnailSize, scale: scale)
+        let fileKey = fileCacheKey(for: entry)
+        lock.lock()
+        defer { lock.unlock() }
+        return cache[key] ?? latestByFile[fileKey]
+    }
+
+    func load(entry: MediaEntry, thumbnailSize: CGFloat, scale: CGFloat, requestID: Int, completion: @escaping (Int, String, NSImage?) -> Void) {
+        guard canGenerateThumbnail(for: entry) else {
+            completion(requestID, entry.url.path, nil)
+            return
+        }
+
+        let key = cacheKey(for: entry, thumbnailSize: thumbnailSize, scale: scale)
+        lock.lock()
+        if let cached = cache[key] {
+            lock.unlock()
+            completion(requestID, entry.url.path, cached)
+            return
+        }
+        if inFlight.contains(key) {
+            lock.unlock()
+            return
+        }
+        inFlight.insert(key)
+        lock.unlock()
+
+        let url = entry.url
+        let fileKey = fileCacheKey(for: entry)
+        let pixelSize = max(48, Int((thumbnailSize * max(scale, 1)).rounded(.up)))
+        let completionBox = CompletionBox(completion)
+        queue.async { [weak self] in
+            let image: NSImage?
+            if MediaFileSupport.isImage(url) {
+                image = Self.imageThumbnail(url: url, pixelSize: pixelSize)
+            } else {
+                image = Self.videoThumbnail(url: url, pixelSize: pixelSize)
+            }
+            self?.lock.lock()
+            if let image {
+                self?.cache[key] = image
+                self?.latestByFile[fileKey] = image
+            }
+            self?.inFlight.remove(key)
+            self?.lock.unlock()
+            let imageBox = ImageBox(image)
+            DispatchQueue.main.async {
+                completionBox.completion(requestID, url.path, imageBox.image)
+            }
+        }
+    }
+
+    private func cacheKey(for entry: MediaEntry, thumbnailSize: CGFloat, scale: CGFloat) -> String {
+        let pixelSize = Int((thumbnailSize * max(scale, 1)).rounded(.up))
+        return "\(fileCacheKey(for: entry))|p=\(pixelSize)"
+    }
+
+    private func fileCacheKey(for entry: MediaEntry) -> String {
+        let modified = Int(entry.modifiedDate.timeIntervalSinceReferenceDate)
+        return "\(entry.url.path)|m=\(modified)|s=\(entry.fileSize)"
+    }
+
+    private func canGenerateThumbnail(for entry: MediaEntry) -> Bool {
+        !entry.isDirectory && (MediaFileSupport.isImage(entry.url) || MediaFileSupport.videoExtensions.contains(entry.url.pathExtension.lowercased()))
+    }
+
+    private static func imageThumbnail(url: URL, pixelSize: Int) -> NSImage? {
+        let sourceOptions: [CFString: Any] = [
+            kCGImageSourceShouldCache: false
+        ]
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions as CFDictionary) else {
+            return NSImage(contentsOf: url)
+        }
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: pixelSize
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
+            return NSImage(contentsOf: url)
+        }
+        return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+    }
+
+    private static func videoThumbnail(url: URL, pixelSize: Int) -> NSImage? {
+        let asset = AVAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: pixelSize, height: pixelSize)
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .positiveInfinity
+
+        let times = [
+            CMTime(seconds: 0.5, preferredTimescale: 600),
+            CMTime(seconds: 0, preferredTimescale: 600)
+        ]
+        for time in times {
+            if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
+                return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+            }
+        }
+        return nil
+    }
+}
+
 private final class MediaNameCellView: NSTableCellView {
     override func layout() {
         super.layout()
@@ -59,16 +214,62 @@ private final class MediaTextCellView: NSTableCellView {
     }
 }
 
+private final class MediaOutlineView: NSOutlineView {
+    var onContextMenu: ((NSPoint) -> NSMenu?)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        onContextMenu?(convert(event.locationInWindow, from: nil)) ?? super.menu(for: event)
+    }
+}
+
+private final class MediaIconItemView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class IconSizeCapsuleBackgroundView: NSView {
+    var featherWidth: CGFloat = 5
+
+    override var isOpaque: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let outerRect = bounds.insetBy(dx: 1, dy: 1)
+        let feather = min(featherWidth, min(outerRect.width, outerRect.height) / 2.05)
+        guard outerRect.width > feather * 2, outerRect.height > feather * 2 else { return }
+
+        let steps = 36
+        for layer in 0..<steps {
+            let progress = CGFloat(layer) / CGFloat(steps - 1)
+            let inset = feather * progress
+            let rect = outerRect.insetBy(dx: inset, dy: inset)
+            let alpha = 0.03 + 0.12 * pow(progress, 1.45)
+            NSColor.white.withAlphaComponent(alpha).setFill()
+            NSBezierPath(
+                roundedRect: rect,
+                xRadius: rect.height / 2,
+                yRadius: rect.height / 2
+            ).fill()
+        }
+    }
+}
+
 private final class MediaIconItem: NSCollectionViewItem {
+    private static let horizontalPadding: CGFloat = 8
+    private static let topPadding: CGFloat = 8
+    private static let labelGap: CGFloat = 6
+    static let labelHeight: CGFloat = 34
+
+    private var iconSize: CGFloat = MediaFileTreesView.defaultIconSize
+
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 104, height: 88))
+        view = MediaIconItemView(frame: NSRect(x: 0, y: 0, width: 140, height: 160))
         view.wantsLayer = true
         view.layer?.cornerRadius = 8
 
-        let imageView = NSImageView(frame: NSRect(x: 32, y: 8, width: 40, height: 40))
-        imageView.imageScaling = .scaleProportionallyDown
+        let imageView = NSImageView()
+        imageView.imageAlignment = .alignCenter
+        imageView.imageScaling = .scaleProportionallyUpOrDown
         let textField = NSTextField(labelWithString: "")
-        textField.frame = NSRect(x: 6, y: 52, width: 92, height: 31)
         textField.alignment = .center
         textField.maximumNumberOfLines = 2
         textField.lineBreakMode = .byTruncatingMiddle
@@ -80,6 +281,31 @@ private final class MediaIconItem: NSCollectionViewItem {
         self.textField = textField
     }
 
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        let imageSide = min(iconSize, max(24, view.bounds.width - Self.horizontalPadding * 2))
+        let imageX = floor((view.bounds.width - imageSide) / 2)
+        imageView?.frame = NSRect(
+            x: imageX,
+            y: Self.topPadding,
+            width: imageSide,
+            height: imageSide
+        )
+        textField?.frame = NSRect(
+            x: Self.horizontalPadding,
+            y: Self.topPadding + imageSide + Self.labelGap,
+            width: max(0, view.bounds.width - Self.horizontalPadding * 2),
+            height: Self.labelHeight
+        )
+    }
+
+    func configure(entry: MediaEntry, image: NSImage, iconSize: CGFloat) {
+        self.iconSize = iconSize
+        imageView?.image = image
+        textField?.stringValue = entry.name
+        view.needsLayout = true
+    }
+
     override var isSelected: Bool {
         didSet {
             view.layer?.backgroundColor = isSelected ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.22).cgColor : NSColor.clear.cgColor
@@ -89,6 +315,7 @@ private final class MediaIconItem: NSCollectionViewItem {
 
 private final class MediaCollectionView: NSCollectionView {
     var onDoubleClickItem: ((Int) -> Void)?
+    var onContextMenu: ((NSPoint) -> NSMenu?)?
 
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
@@ -96,6 +323,24 @@ private final class MediaCollectionView: NSCollectionView {
         let point = convert(event.locationInWindow, from: nil)
         guard let indexPath = indexPathForItem(at: point) else { return }
         onDoubleClickItem?(indexPath.item)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        onContextMenu?(convert(event.locationInWindow, from: nil)) ?? super.menu(for: event)
+    }
+}
+
+private final class MediaFileTreeResizeHandleView: NSView {
+    var onDragStarted: ((NSEvent) -> Void)?
+
+    override var isFlipped: Bool { true }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .resizeUpDown)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onDragStarted?(event)
     }
 }
 
@@ -128,6 +373,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
 
     let slot: VideoSlot
     var onFileOpened: ((VideoSlot, URL) -> Void)?
+    var onIconSizeChanged: ((CGFloat) -> Void)?
     var isExpanded = false {
         didSet {
             guard oldValue != isExpanded else { return }
@@ -143,9 +389,18 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     private let sortButton = NSButton()
 
     private let listScrollView = NSScrollView()
-    private let outlineView = NSOutlineView()
+    private let outlineView = MediaOutlineView()
     private let iconScrollView = NSScrollView()
     private let collectionView = MediaCollectionView()
+    private let iconSizeControlView = IconSizeCapsuleBackgroundView()
+    private let iconSizeLabel = NSTextField(labelWithString: "图标大小")
+    private let iconSizeSlider = NSSlider(
+        value: Double(MediaFileTreesView.defaultIconSize),
+        minValue: Double(MediaFileTreesView.minIconSize),
+        maxValue: Double(MediaFileTreesView.maxIconSize),
+        target: nil,
+        action: nil
+    )
 
     private var rootURL: URL
     private var rootEntry: MediaEntry
@@ -157,6 +412,12 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     private var suppressesBrowserContent = false
     private var lastColumnLayoutWidth: CGFloat = -1
     private var iconCache: [String: NSImage] = [:]
+    private var iconSize: CGFloat = MediaFileTreesView.defaultIconSize
+    private let directoryLoader = MediaDirectoryLoader()
+    private let thumbnailLoader = MediaThumbnailLoader()
+    private var directoryRequestID = 0
+    private var pendingDirectoryLoads: [String: Int] = [:]
+    private var thumbnailRequestID = 0
 
     private func rectDebug(_ rect: NSRect) -> String {
         "x=\(String(format: "%.1f", rect.origin.x)) y=\(String(format: "%.1f", rect.origin.y)) w=\(String(format: "%.1f", rect.width)) h=\(String(format: "%.1f", rect.height))"
@@ -200,6 +461,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         let contentFrame = NSRect(x: 0, y: toolbarHeight, width: bounds.width, height: isExpanded ? max(0, bounds.height - toolbarHeight) : 0)
         listScrollView.frame = contentFrame
         iconScrollView.frame = contentFrame
+        layoutIconSizeControl(in: contentFrame)
 
         if abs(contentFrame.width - lastColumnLayoutWidth) > 0.5 {
             lastColumnLayoutWidth = contentFrame.width
@@ -221,6 +483,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         self.rootURL = newRootURL
         self.displayURL = newDisplayURL
         rootEntry = Self.directoryEntry(for: self.rootURL)
+        pendingDirectoryLoads.removeAll()
         refreshPathField()
         reloadBrowsers()
     }
@@ -229,6 +492,19 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         guard suppressesBrowserContent != suppressed else { return }
         suppressesBrowserContent = suppressed
         updateExpandedState()
+    }
+
+    var isShowingIconView: Bool {
+        showsIconView
+    }
+
+    func setIconSize(_ size: CGFloat) {
+        let clamped = min(MediaFileTreesView.maxIconSize, max(MediaFileTreesView.minIconSize, size))
+        iconSizeSlider.doubleValue = Double(clamped)
+        guard abs(iconSize - clamped) > 0.5 else { return }
+        iconSize = clamped
+        updateIconLayout()
+        collectionView.reloadData()
     }
 
     func setExpanded(_ expanded: Bool, animated: Bool) {
@@ -426,7 +702,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     }
 
     func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
-        guard let entry = item as? MediaEntry, !entry.isDirectory else { return nil }
+        guard let entry = item as? MediaEntry else { return nil }
         return entry.url as NSURL
     }
 
@@ -438,13 +714,20 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         let item = collectionView.makeItem(withIdentifier: NSUserInterfaceItemIdentifier("iconItem"), for: indexPath)
         guard let iconItem = item as? MediaIconItem, iconEntries.indices.contains(indexPath.item) else { return item }
         let entry = iconEntries[indexPath.item]
-        iconItem.imageView?.image = icon(for: entry)
-        iconItem.textField?.stringValue = entry.name
+        let fallback = icon(for: entry)
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        if let thumbnail = thumbnailLoader.cachedImage(for: entry, thumbnailSize: iconSize, scale: scale) {
+            iconItem.configure(entry: entry, image: thumbnail, iconSize: iconSize)
+            requestThumbnail(for: entry, at: indexPath)
+        } else {
+            iconItem.configure(entry: entry, image: fallback, iconSize: iconSize)
+            requestThumbnail(for: entry, at: indexPath)
+        }
         return iconItem
     }
 
     func collectionView(_ collectionView: NSCollectionView, pasteboardWriterForItemAt indexPath: IndexPath) -> NSPasteboardWriting? {
-        guard iconEntries.indices.contains(indexPath.item), !iconEntries[indexPath.item].isDirectory else { return nil }
+        guard iconEntries.indices.contains(indexPath.item) else { return nil }
         return iconEntries[indexPath.item].url as NSURL
     }
 
@@ -502,6 +785,9 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         outlineView.delegate = self
         outlineView.doubleAction = #selector(openSelectedListItem)
         outlineView.target = self
+        outlineView.onContextMenu = { [weak self] point in
+            self?.contextMenuForList(at: point)
+        }
         outlineView.registerForDraggedTypes([.fileURL])
         outlineView.setDraggingSourceOperationMask(.copy, forLocal: true)
         outlineView.setDraggingSourceOperationMask(.copy, forLocal: false)
@@ -521,7 +807,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
 
     private func setupIconView() {
         let flow = NSCollectionViewFlowLayout()
-        flow.itemSize = NSSize(width: 104, height: 88)
+        flow.itemSize = iconItemSize(for: iconSize)
         flow.minimumInteritemSpacing = 10
         flow.minimumLineSpacing = 10
         flow.sectionInset = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
@@ -535,6 +821,9 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         collectionView.onDoubleClickItem = { [weak self] index in
             self?.openIconEntry(at: index)
         }
+        collectionView.onContextMenu = { [weak self] point in
+            self?.contextMenuForIconView(at: point)
+        }
         collectionView.registerForDraggedTypes([.fileURL])
         collectionView.setDraggingSourceOperationMask(.copy, forLocal: true)
         collectionView.setDraggingSourceOperationMask(.copy, forLocal: false)
@@ -545,6 +834,22 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         iconScrollView.borderType = .noBorder
         iconScrollView.isHidden = true
         addSubview(iconScrollView)
+
+        iconSizeControlView.isHidden = true
+
+        iconSizeLabel.font = NSFont.systemFont(ofSize: 11)
+        iconSizeLabel.textColor = .labelColor
+        iconSizeLabel.alignment = .right
+        iconSizeControlView.addSubview(iconSizeLabel)
+
+        iconSizeSlider.target = self
+        iconSizeSlider.action = #selector(iconSizeSliderChanged)
+        iconSizeSlider.isContinuous = true
+        iconSizeSlider.controlSize = .small
+        iconSizeSlider.toolTip = "图标大小"
+        iconSizeControlView.addSubview(iconSizeSlider)
+
+        addSubview(iconSizeControlView, positioned: .above, relativeTo: iconScrollView)
     }
 
     private func addColumn(id: NSUserInterfaceItemIdentifier, title: String, width: CGFloat) {
@@ -598,6 +903,12 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         updateExpandedState()
     }
 
+    @objc private func iconSizeSliderChanged() {
+        let size = CGFloat(iconSizeSlider.doubleValue)
+        setIconSize(size)
+        onIconSizeChanged?(size)
+    }
+
     @objc private func showSortMenu() {
         let menu = NSMenu()
         for mode in MediaFileSortMode.allCases {
@@ -617,7 +928,96 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         let raw = sender.representedObject as? Int ?? MediaFileSortMode.none.rawValue
         sortMode = MediaFileSortMode(rawValue: raw) ?? .none
         rootEntry.children = nil
+        pendingDirectoryLoads.removeAll()
         reloadBrowsers()
+    }
+
+    private func contextMenuForList(at point: NSPoint) -> NSMenu? {
+        let row = outlineView.row(at: point)
+        let entry = row >= 0 ? outlineView.item(atRow: row) as? MediaEntry : nil
+        if row >= 0 {
+            outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        return contextMenu(for: entry)
+    }
+
+    private func contextMenuForIconView(at point: NSPoint) -> NSMenu? {
+        let indexPath = collectionView.indexPathForItem(at: point)
+        let entry = indexPath.flatMap { iconEntries.indices.contains($0.item) ? iconEntries[$0.item] : nil }
+        if let indexPath {
+            collectionView.selectionIndexPaths = [indexPath]
+        }
+        return contextMenu(for: entry)
+    }
+
+    private func contextMenu(for entry: MediaEntry?) -> NSMenu {
+        let menu = NSMenu()
+        if let entry {
+            menu.addItem(menuItem(title: "打开", action: #selector(contextOpen(_:)), representedObject: entry))
+            menu.addItem(menuItem(title: "在 Finder 中显示", action: #selector(contextRevealInFinder(_:)), representedObject: entry))
+            menu.addItem(.separator())
+            menu.addItem(menuItem(title: "重命名...", action: #selector(contextRename(_:)), representedObject: entry))
+            menu.addItem(menuItem(title: "移到废纸篓", action: #selector(contextTrash(_:)), representedObject: entry))
+        } else {
+            menu.addItem(menuItem(title: "新建文件夹...", action: #selector(contextNewFolder(_:)), representedObject: rootEntry))
+            menu.addItem(menuItem(title: "在 Finder 中显示", action: #selector(contextRevealInFinder(_:)), representedObject: rootEntry))
+        }
+        return menu
+    }
+
+    private func menuItem(title: String, action: Selector, representedObject: MediaEntry) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = representedObject
+        return item
+    }
+
+    @objc private func contextOpen(_ sender: NSMenuItem) {
+        guard let entry = sender.representedObject as? MediaEntry else { return }
+        open(entry: entry)
+    }
+
+    @objc private func contextRevealInFinder(_ sender: NSMenuItem) {
+        guard let entry = sender.representedObject as? MediaEntry else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([entry.url])
+    }
+
+    @objc private func contextNewFolder(_ sender: NSMenuItem) {
+        let parent = existingDirectory(for: rootURL) ?? FileManager.default.homeDirectoryForCurrentUser
+        guard let name = promptForFileName(title: "新建文件夹", message: "输入新文件夹名称：", defaultValue: "未命名文件夹") else {
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(at: parent.appendingPathComponent(name), withIntermediateDirectories: false)
+            refreshAfterFileOperation(preferredRoot: parent)
+        } catch {
+            showFileOperationError(title: "无法新建文件夹", error: error)
+        }
+    }
+
+    @objc private func contextRename(_ sender: NSMenuItem) {
+        guard let entry = sender.representedObject as? MediaEntry,
+              let name = promptForFileName(title: "重命名", message: "输入新名称：", defaultValue: entry.name) else {
+            return
+        }
+        let destination = entry.url.deletingLastPathComponent().appendingPathComponent(name)
+        do {
+            try FileManager.default.moveItem(at: entry.url, to: destination)
+            refreshAfterFileOperation(preferredRoot: rootURL)
+        } catch {
+            showFileOperationError(title: "无法重命名", error: error)
+        }
+    }
+
+    @objc private func contextTrash(_ sender: NSMenuItem) {
+        guard let entry = sender.representedObject as? MediaEntry else { return }
+        do {
+            var resultingURL: NSURL?
+            try FileManager.default.trashItem(at: entry.url, resultingItemURL: &resultingURL)
+            refreshAfterFileOperation(preferredRoot: rootURL)
+        } catch {
+            showFileOperationError(title: "无法移到废纸篓", error: error)
+        }
     }
 
     @objc private func openSelectedListItem() {
@@ -641,10 +1041,60 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
 
     private func reloadBrowsers() {
         iconEntries = children(of: rootEntry)
+        thumbnailRequestID += 1
         outlineView.reloadData()
         collectionView.reloadData()
         updateExpandedState()
         needsLayout = true
+    }
+
+    private func refreshAfterFileOperation(preferredRoot: URL) {
+        let nextRoot = existingDirectory(for: preferredRoot) ?? existingDirectory(for: preferredRoot.deletingLastPathComponent()) ?? FileManager.default.homeDirectoryForCurrentUser
+        rootEntry = Self.directoryEntry(for: nextRoot)
+        rootURL = nextRoot
+        displayURL = nil
+        pendingDirectoryLoads.removeAll()
+        refreshPathField()
+        reloadBrowsers()
+    }
+
+    private func existingDirectory(for url: URL) -> URL? {
+        var current = url.standardizedFileURL
+        while current.path != "/" {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: current.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                return current
+            }
+            current.deleteLastPathComponent()
+        }
+        return URL(fileURLWithPath: "/")
+    }
+
+    private func promptForFileName(title: String, message: String, defaultValue: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        input.stringValue = defaultValue
+        input.lineBreakMode = .byTruncatingMiddle
+        alert.accessoryView = input
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let trimmed = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "." && trimmed != ".." else {
+            NSSound.beep()
+            return nil
+        }
+        return trimmed
+    }
+
+    private func showFileOperationError(title: String, error: Error) {
+        let alert = NSAlert(error: error)
+        alert.messageText = title
+        alert.runModal()
     }
 
     private func updateExpandedState() {
@@ -654,6 +1104,79 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         let showsBrowser = isExpanded && !suppressesBrowserContent
         listScrollView.isHidden = !showsBrowser || showsIconView
         iconScrollView.isHidden = !showsBrowser || !showsIconView
+        iconSizeControlView.isHidden = iconScrollView.isHidden
+    }
+
+    private func layoutIconSizeControl(in contentFrame: NSRect) {
+        let feather: CGFloat = 5
+        let contentWidth = min(150, max(136, contentFrame.width - 24))
+        let contentHeight: CGFloat = 20
+        let controlWidth = contentWidth + feather * 2
+        let controlHeight = contentHeight + feather * 2
+        iconSizeControlView.frame = NSRect(
+            x: max(contentFrame.minX + 12, contentFrame.maxX - controlWidth - 12),
+            y: max(contentFrame.minY + 8, contentFrame.maxY - controlHeight - 10),
+            width: controlWidth,
+            height: controlHeight
+        )
+        iconSizeControlView.featherWidth = feather
+        iconSizeControlView.needsDisplay = true
+
+        let labelWidth: CGFloat = 50
+        let contentRect = NSRect(x: feather, y: feather, width: contentWidth, height: contentHeight)
+        let labelHeight: CGFloat = 18
+        let sliderHeight: CGFloat = 22
+        iconSizeLabel.frame = NSRect(
+            x: contentRect.minX + 2,
+            y: contentRect.midY - labelHeight / 2 - 2,
+            width: labelWidth,
+            height: labelHeight
+        )
+        iconSizeSlider.frame = NSRect(
+            x: contentRect.minX + labelWidth + 8,
+            y: contentRect.midY - sliderHeight / 2,
+            width: max(58, contentWidth - labelWidth - 10),
+            height: sliderHeight
+        )
+    }
+
+    private func updateIconLayout() {
+        thumbnailRequestID += 1
+        if let flow = collectionView.collectionViewLayout as? NSCollectionViewFlowLayout {
+            flow.itemSize = iconItemSize(for: iconSize)
+            flow.invalidateLayout()
+        }
+        collectionView.collectionViewLayout?.invalidateLayout()
+        collectionView.needsLayout = true
+        iconScrollView.needsLayout = true
+    }
+
+    private func iconItemSize(for iconSize: CGFloat) -> NSSize {
+        let width = max(96, iconSize + 28)
+        let height = MediaIconItem.labelHeight + iconSize + 22
+        return NSSize(width: width, height: height)
+    }
+
+    private func requestThumbnail(for entry: MediaEntry, at indexPath: IndexPath) {
+        guard !entry.isDirectory,
+              (MediaFileSupport.isImage(entry.url) || MediaFileSupport.videoExtensions.contains(entry.url.pathExtension.lowercased())) else {
+            return
+        }
+        let requestID = thumbnailRequestID
+        let targetPath = entry.url.path
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        thumbnailLoader.load(entry: entry, thumbnailSize: iconSize, scale: scale, requestID: requestID) { [weak self] completedID, path, image in
+            guard let self,
+                  completedID == self.thumbnailRequestID,
+                  path == targetPath,
+                  let image,
+                  self.iconEntries.indices.contains(indexPath.item),
+                  self.iconEntries[indexPath.item].url.path == path,
+                  let item = self.collectionView.item(at: indexPath) as? MediaIconItem else {
+                return
+            }
+            item.configure(entry: self.iconEntries[indexPath.item], image: image, iconSize: self.iconSize)
+        }
     }
 
     private func refreshPathField() {
@@ -683,9 +1206,47 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
             entry.children = []
             return []
         }
-        let loaded = loadEntries(in: entry.url)
-        entry.children = loaded
-        return loaded
+        requestChildren(for: entry)
+        return []
+    }
+
+    private func requestChildren(for entry: MediaEntry) {
+        let key = entry.url.standardizedFileURL.path
+        guard pendingDirectoryLoads[key] == nil else { return }
+        directoryRequestID += 1
+        let requestID = directoryRequestID
+        pendingDirectoryLoads[key] = requestID
+        directoryLoader.load(url: entry.url, sortMode: sortMode, requestID: requestID) { [weak self] completedID, url, entries in
+            guard let self else { return }
+            let key = url.standardizedFileURL.path
+            guard self.pendingDirectoryLoads[key] == completedID else { return }
+            self.pendingDirectoryLoads.removeValue(forKey: key)
+            guard let target = self.entry(matching: url, in: self.rootEntry), target.children == nil else { return }
+            target.children = entries
+            if target === self.rootEntry {
+                self.iconEntries = entries
+                self.outlineView.reloadData()
+                self.collectionView.reloadData()
+            } else {
+                self.outlineView.reloadItem(target, reloadChildren: true)
+            }
+            self.updateExpandedState()
+            self.needsLayout = true
+        }
+    }
+
+    private func entry(matching url: URL, in entry: MediaEntry) -> MediaEntry? {
+        let standardized = url.standardizedFileURL
+        if entry.url.standardizedFileURL == standardized {
+            return entry
+        }
+        guard let children = entry.children else { return nil }
+        for child in children {
+            if let match = self.entry(matching: standardized, in: child) {
+                return match
+            }
+        }
+        return nil
     }
 
     private func icon(for entry: MediaEntry) -> NSImage {
@@ -704,7 +1265,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         return image
     }
 
-    private func loadEntries(in url: URL) -> [MediaEntry] {
+    nonisolated fileprivate static func loadEntries(in url: URL, sortMode: MediaFileSortMode) -> [MediaEntry] {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: url,
@@ -724,10 +1285,10 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
                 fileSize: UInt64(values?.fileSize ?? 0)
             )
         }
-        return sort(entries: loaded)
+        return sort(entries: loaded, sortMode: sortMode)
     }
 
-    private func sort(entries: [MediaEntry]) -> [MediaEntry] {
+    nonisolated private static func sort(entries: [MediaEntry], sortMode: MediaFileSortMode) -> [MediaEntry] {
         entries.sorted { lhs, rhs in
             if lhs.isDirectory != rhs.isDirectory {
                 return lhs.isDirectory && !rhs.isDirectory
@@ -748,7 +1309,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         }
     }
 
-    private func compareName(_ lhs: MediaEntry, _ rhs: MediaEntry) -> ComparisonResult {
+    nonisolated private static func compareName(_ lhs: MediaEntry, _ rhs: MediaEntry) -> ComparisonResult {
         lhs.name.localizedStandardCompare(rhs.name)
     }
 
@@ -781,10 +1342,25 @@ final class MediaFileTreesView: NSView {
     static let panelGap: CGFloat = 10
     static let collapsedHeight = MediaDirectoryTreeView.collapsedHeight
     static let expandedHeight = MediaDirectoryTreeView.expandedHeight
+    static let minIconSize: CGFloat = 72
+    static let maxIconSize: CGFloat = 180
+    static let defaultIconSize: CGFloat = 112
+    private static let iconSizeDefaultsKey = "mediaFileTree.iconSize.v1"
+    private static let expandedHeightDefaultsKey = "mediaFileTree.expandedHeight.v1"
+    private static let resizeHandleHeight: CGFloat = 8
 
     let treeA: MediaDirectoryTreeView
     let treeB: MediaDirectoryTreeView
+    var onHeightChanged: ((CGFloat) -> Void)?
     private(set) var isExpanded = false
+    private var iconSize = MediaFileTreesView.loadIconSize()
+    private let resizeHandleView = MediaFileTreeResizeHandleView()
+    private var expandedHeightRange: ClosedRange<CGFloat> = collapsedHeight...expandedHeight
+    private var userExpandedHeight = MediaFileTreesView.loadExpandedHeight()
+
+    var currentExpandedHeight: CGFloat {
+        userExpandedHeight
+    }
 
     init(defaultRoot: URL) {
         treeA = MediaDirectoryTreeView(slot: .a, rootURL: defaultRoot)
@@ -792,8 +1368,17 @@ final class MediaFileTreesView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
+        treeA.setIconSize(iconSize)
+        treeB.setIconSize(iconSize)
+        treeA.onIconSizeChanged = { [weak self] size in self?.setSharedIconSize(size) }
+        treeB.onIconSizeChanged = { [weak self] size in self?.setSharedIconSize(size) }
         addSubview(treeA)
         addSubview(treeB)
+        resizeHandleView.onDragStarted = { [weak self] event in
+            self?.trackHeightResize(from: event)
+        }
+        addSubview(resizeHandleView, positioned: .above, relativeTo: nil)
+        updateResizeHandleVisibility()
     }
 
     required init?(coder: NSCoder) {
@@ -808,6 +1393,22 @@ final class MediaFileTreesView: NSView {
         let leftWidth = floor((bounds.width - gap) / 2)
         treeA.frame = NSRect(x: 0, y: 0, width: leftWidth, height: bounds.height)
         treeB.frame = NSRect(x: leftWidth + gap, y: 0, width: max(0, bounds.width - leftWidth - gap), height: bounds.height)
+        resizeHandleView.frame = NSRect(
+            x: 0,
+            y: max(0, bounds.height - Self.resizeHandleHeight),
+            width: bounds.width,
+            height: Self.resizeHandleHeight
+        )
+    }
+
+    func setExpandedHeightRange(_ range: ClosedRange<CGFloat>) {
+        let lower = max(Self.collapsedHeight, range.lowerBound)
+        let upper = max(lower, range.upperBound)
+        expandedHeightRange = lower...upper
+        let clamped = min(upper, max(lower, userExpandedHeight))
+        guard abs(clamped - userExpandedHeight) > 0.5 else { return }
+        userExpandedHeight = clamped
+        UserDefaults.standard.set(Double(userExpandedHeight), forKey: Self.expandedHeightDefaultsKey)
     }
 
     func reload(rootA: URL, rootB: URL) {
@@ -823,6 +1424,7 @@ final class MediaFileTreesView: NSView {
         isExpanded = expanded
         treeA.setExpanded(expanded, animated: animated)
         treeB.setExpanded(expanded, animated: animated)
+        updateResizeHandleVisibility()
         needsLayout = true
     }
 
@@ -837,5 +1439,44 @@ final class MediaFileTreesView: NSView {
 
     var isPathEditing: Bool {
         treeA.isPathEditing || treeB.isPathEditing
+    }
+
+    private func setSharedIconSize(_ size: CGFloat) {
+        iconSize = min(Self.maxIconSize, max(Self.minIconSize, size))
+        UserDefaults.standard.set(Double(iconSize), forKey: Self.iconSizeDefaultsKey)
+        treeA.setIconSize(iconSize)
+        treeB.setIconSize(iconSize)
+    }
+
+    private func updateResizeHandleVisibility() {
+        resizeHandleView.isHidden = !isExpanded
+    }
+
+    private func trackHeightResize(from event: NSEvent) {
+        guard isExpanded, let window else { return }
+        let startY = event.locationInWindow.y
+        let startHeight = userExpandedHeight
+        while true {
+            guard let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else { break }
+            if next.type == .leftMouseUp { break }
+            let proposed = startHeight + (startY - next.locationInWindow.y)
+            let clamped = min(expandedHeightRange.upperBound, max(expandedHeightRange.lowerBound, proposed))
+            guard abs(clamped - userExpandedHeight) > 0.5 else { continue }
+            userExpandedHeight = clamped
+            UserDefaults.standard.set(Double(userExpandedHeight), forKey: Self.expandedHeightDefaultsKey)
+            onHeightChanged?(userExpandedHeight)
+        }
+    }
+
+    private static func loadIconSize() -> CGFloat {
+        let stored = UserDefaults.standard.double(forKey: iconSizeDefaultsKey)
+        guard stored > 0 else { return defaultIconSize }
+        return min(maxIconSize, max(minIconSize, CGFloat(stored)))
+    }
+
+    private static func loadExpandedHeight() -> CGFloat {
+        let stored = UserDefaults.standard.double(forKey: expandedHeightDefaultsKey)
+        guard stored > 0 else { return expandedHeight }
+        return min(520, max(collapsedHeight, CGFloat(stored)))
     }
 }
