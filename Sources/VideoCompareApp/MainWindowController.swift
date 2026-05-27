@@ -389,6 +389,7 @@ final class MainWindowController: NSWindowController {
     private var isTrackingVideoBSlider = false
     private var syncScrubPresentationID = 0
     private var pendingSyncScrubPresentation: SyncScrubPresentation?
+    private var lastTimelineStaticState = (a: false, b: false)
     private var syncBaseTime: Double = 0
     private var syncLoopRange: ClosedRange<Double>?
     private var loopSeekInProgress = false
@@ -626,8 +627,8 @@ final class MainWindowController: NSWindowController {
         let id = syncScrubPresentationID
         let aTime = base + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
         let bTime = base + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
-        let expectA = playerA.fileURL != nil && aTime >= 0 && (playerA.duration <= 0 || aTime <= playerA.duration)
-        let expectB = playerB.fileURL != nil && bTime >= 0 && (playerB.duration <= 0 || bTime <= playerB.duration)
+        let expectA = visualDisplayTime(for: playerA, at: aTime) != nil
+        let expectB = visualDisplayTime(for: playerB, at: bTime) != nil
         pendingSyncScrubPresentation = SyncScrubPresentation(id: id, expectA: expectA, expectB: expectB)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             self?.flushSyncScrubPresentation(id: id, allowPartial: true)
@@ -1119,8 +1120,8 @@ final class MainWindowController: NSWindowController {
         )
         content.addSubview(transientMessageLabel, positioned: .above, relativeTo: nil)
         let hideIndependentTimelines = canvas.layoutMode != .sideBySideHorizontal
-        layoutVideoTimeline(videoATimeline, over: canvas.containerA.frame, hidden: hideIndependentTimelines || canvas.containerA.isHidden, in: content)
-        layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: hideIndependentTimelines || canvas.containerB.isHidden, in: content)
+        layoutVideoTimeline(videoATimeline, over: canvas.containerA.frame, hidden: hideIndependentTimelines || canvas.containerA.isHidden || playerA.isStaticImage, in: content)
+        layoutVideoTimeline(videoBTimeline, over: canvas.containerB.frame, hidden: hideIndependentTimelines || canvas.containerB.isHidden || playerB.isStaticImage, in: content)
     }
 
     private func animateFileTreeTransition(to expanded: Bool, completion: (@MainActor @Sendable () -> Void)? = nil) {
@@ -1360,6 +1361,7 @@ final class MainWindowController: NSWindowController {
         }
         applyColorAdjustmentsToRenderer()
         refreshColorAdjustmentPanel()
+        layoutContent()
         reloadMediaFileTrees()
         loadPairStateIfReady()
     }
@@ -1591,14 +1593,28 @@ final class MainWindowController: NSWindowController {
     }
 
     private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true, allowCachedFrame: Bool = true, publishFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
-        let hasContent = seconds >= 0 && (player.duration <= 0 || seconds <= player.duration)
-        Diagnostics.log("display slot=\(player.slot.rawValue) target=\(debugTime(seconds)) exact=\(exact) hasContent=\(hasContent) duration=\(debugTime(player.duration))")
+        let visualTarget = visualDisplayTime(for: player, at: seconds)
+        let hasContent = visualTarget != nil
+        Diagnostics.log("display slot=\(player.slot.rawValue) target=\(debugTime(seconds)) visual=\(debugTime(visualTarget)) exact=\(exact) hasContent=\(hasContent) duration=\(debugTime(player.duration))")
         player.setVideoVisible(hasContent)
-        if hasContent {
-            player.seekAbsolute(seconds, exact: exact, allowCachedFrame: allowCachedFrame, publishFrame: publishFrame, completion: completion)
+        if let visualTarget {
+            player.seekAbsolute(visualTarget, exact: exact, allowCachedFrame: allowCachedFrame, publishFrame: publishFrame, completion: completion)
         } else {
             completion?(false)
         }
+    }
+
+    private func visualDisplayTime(for player: NativeVideoPlayer, at seconds: Double) -> Double? {
+        guard player.fileURL != nil else { return nil }
+        if player.isStaticImage {
+            return 0
+        }
+        guard player.duration > 0 else {
+            return seconds >= 0 ? seconds : nil
+        }
+        let fps = max(1, player.fps)
+        let lastFrameTime = max(0, player.duration - 0.5 / fps)
+        return min(max(0, seconds), lastFrameTime)
     }
 
     private func seconds(forFrames frames: Int, fps: Double) -> Double {
@@ -1831,6 +1847,24 @@ final class MainWindowController: NSWindowController {
 
     private func canDisplay(_ player: NativeVideoPlayer, at seconds: Double) -> Bool {
         seconds >= 0 && (player.duration <= 0 || seconds <= player.duration)
+    }
+
+    private func synchronizedTargetTime(for slot: VideoSlot, base: Double) -> Double {
+        switch slot {
+        case .a:
+            return base + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
+        case .b:
+            return base + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
+        }
+    }
+
+    private func shouldDecodeSynchronizedFrame(slot: VideoSlot, base: Double) -> Bool {
+        let player = slot == .a ? playerA! : playerB!
+        guard player.fileURL != nil, !player.isStaticImage else { return false }
+        let target = synchronizedTargetTime(for: slot, base: base)
+        guard player.duration > 0 else { return target >= 0 }
+        let halfFrame = 0.5 / max(1, player.fps)
+        return target >= -halfFrame && target <= player.duration + halfFrame
     }
 
     private func seekIndividualVideo(slot: VideoSlot, exact: Bool) {
@@ -2931,6 +2965,11 @@ final class MainWindowController: NSWindowController {
         syncTimeline.setPlaying(synchronizedPlaying)
         videoATimeline.setPlaying(canvas.allowsAlignmentAdjustment ? synchronizedPlaying : !playerA.isPaused)
         videoBTimeline.setPlaying(canvas.allowsAlignmentAdjustment ? synchronizedPlaying : !playerB.isPaused)
+        let staticState = (a: playerA.isStaticImage, b: playerB.isStaticImage)
+        if staticState != lastTimelineStaticState {
+            lastTimelineStaticState = staticState
+            layoutContent(animated: false)
+        }
         updateEndVisibility()
     }
 
@@ -3064,14 +3103,14 @@ final class MainWindowController: NSWindowController {
                 self.playerA.setVideoVisible(true)
                 self.playerA.presentSynchronizedFrame(frameA)
             } else {
-                self.playerA.setVideoVisible(false)
+                self.playerA.setVideoVisible(self.playerA.fileURL != nil)
             }
 
             if let frameB {
                 self.playerB.setVideoVisible(true)
                 self.playerB.presentSynchronizedFrame(frameB)
             } else {
-                self.playerB.setVideoVisible(false)
+                self.playerB.setVideoVisible(self.playerB.fileURL != nil)
             }
 
             if frameA == nil && frameB == nil {
@@ -3099,12 +3138,21 @@ final class MainWindowController: NSWindowController {
             }
         }
 
-        playerA.decodeNextFrameForSynchronization { frame in
-            frameA = frame
+        let base = currentBaseTime()
+        if shouldDecodeSynchronizedFrame(slot: .a, base: base) {
+            playerA.decodeNextFrameForSynchronization { frame in
+                frameA = frame
+                finishIfReady()
+            }
+        } else {
             finishIfReady()
         }
-        playerB.decodeNextFrameForSynchronization { frame in
-            frameB = frame
+        if shouldDecodeSynchronizedFrame(slot: .b, base: base) {
+            playerB.decodeNextFrameForSynchronization { frame in
+                frameB = frame
+                finishIfReady()
+            }
+        } else {
             finishIfReady()
         }
     }
@@ -3173,8 +3221,8 @@ final class MainWindowController: NSWindowController {
         let base = currentBaseTime()
         let aTime = base + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
         let bTime = base + seconds(forFrames: syncState.offsetFramesB, fps: playerB.fps)
-        playerA.setVideoVisible(aTime >= 0 && (playerA.duration <= 0 || aTime <= playerA.duration))
-        playerB.setVideoVisible(bTime >= 0 && (playerB.duration <= 0 || bTime <= playerB.duration))
+        playerA.setVideoVisible(visualDisplayTime(for: playerA, at: aTime) != nil)
+        playerB.setVideoVisible(visualDisplayTime(for: playerB, at: bTime) != nil)
     }
 
     private func saveState() {

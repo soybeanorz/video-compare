@@ -743,7 +743,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         toolbarView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         addSubview(toolbarView)
 
-        configureToolbarButton(upButton, symbolName: "chevron.left")
+        configureToolbarButton(upButton, symbolName: "arrow.up")
         upButton.target = self
         upButton.action = #selector(goUp)
         toolbarView.addSubview(upButton)

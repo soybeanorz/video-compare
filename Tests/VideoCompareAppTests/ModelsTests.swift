@@ -28,5 +28,6 @@ struct ModelsTests {
         #expect(snapshot.fps == 60)
         #expect(snapshot.isPaused)
         #expect(snapshot.isSeekIdle)
+        #expect(!snapshot.isStaticImage)
     }
 }

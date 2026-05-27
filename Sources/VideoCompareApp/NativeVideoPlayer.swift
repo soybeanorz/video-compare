@@ -23,6 +23,7 @@ struct PlayerStatusSnapshot: Sendable, Equatable {
     var fps: Double = 60
     var isPaused = true
     var isSeekIdle = true
+    var isStaticImage = false
 }
 
 private final class SeekCancelToken: @unchecked Sendable {
@@ -109,6 +110,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     var duration: Double { statusSnapshot.duration }
     var fps: Double { statusSnapshot.fps }
     var isPaused: Bool { statusSnapshot.isPaused }
+    var isStaticImage: Bool { statusSnapshot.isStaticImage }
 
     var onStatusChanged: (() -> Void)?
     var onFrameDecoded: ((VideoSlot, CVPixelBuffer, Double) -> Void)?
@@ -149,6 +151,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
             $0.duration = 0
             $0.timePosition = 0
             $0.fps = 60
+            $0.isStaticImage = MediaFileSupport.isImage(url)
         }
         _ = nextPlaybackGeneration()
         frameHistory.removeAll(keepingCapacity: true)
@@ -703,6 +706,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
                         $0.fps = 1
                         $0.timePosition = 0
                         $0.isPaused = true
+                        $0.isStaticImage = true
                     }
                     self.presentStaticImageFrame(frame)
                 }
