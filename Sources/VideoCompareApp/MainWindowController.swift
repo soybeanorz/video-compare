@@ -392,9 +392,11 @@ final class MainWindowController: NSWindowController {
     private var syncBaseTime: Double = 0
     private var syncLoopRange: ClosedRange<Double>?
     private var loopSeekInProgress = false
+    private var loopSeekGeneration = 0
     private var loopPreviewGeneration = 0
-    private var loopStartFrameA: NativeVideoFrame?
-    private var loopStartFrameB: NativeVideoFrame?
+    private var loopPreviewPlaybackGeneration = 0
+    private var loopPreviewFramesA: [NativeVideoFrame] = []
+    private var loopPreviewFramesB: [NativeVideoFrame] = []
     private var isSynchronizedPlaying = false
     private var fileTreesExpanded = false
     private var fileTreeAnimationTimer: Timer?
@@ -427,6 +429,8 @@ final class MainWindowController: NSWindowController {
     private var roiAlignmentGeneration = 0
     private var isROIAlignmentRunning = false
     private var transientMessageGeneration = 0
+    private static let loopPreviewFrameCount = 8
+    private static let loopSeekTimeout: TimeInterval = 1.5
     private var selectedSlot: VideoSlot? {
         didSet {
             canvas.selectedSlot = selectedSlot
@@ -1525,7 +1529,7 @@ final class MainWindowController: NSWindowController {
         seekToBaseTime(currentBaseTime())
     }
 
-    private func seekToBaseTime(_ base: Double, exact: Bool = true, allowCachedFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
+    private func seekToBaseTime(_ base: Double, exact: Bool = true, allowCachedFrame: Bool = true, publishFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
         let alignedBase = frameAlignedBaseTime(base)
         syncBaseTime = alignedBase
         let aTime = alignedBase + seconds(forFrames: syncState.offsetFramesA, fps: playerA.fps)
@@ -1540,8 +1544,8 @@ final class MainWindowController: NSWindowController {
             completion?(succeeded)
         }
         let seekCompletion: ((Bool) -> Void)? = completion == nil ? nil : { ok in finish(ok) }
-        display(playerA, at: aTime, exact: exact, allowCachedFrame: allowCachedFrame, completion: seekCompletion)
-        display(playerB, at: bTime, exact: exact, allowCachedFrame: allowCachedFrame, completion: seekCompletion)
+        display(playerA, at: aTime, exact: exact, allowCachedFrame: allowCachedFrame, publishFrame: publishFrame, completion: seekCompletion)
+        display(playerB, at: bTime, exact: exact, allowCachedFrame: allowCachedFrame, publishFrame: publishFrame, completion: seekCompletion)
         debugTimelineState("sync.seekToBase.issued")
     }
 
@@ -1586,12 +1590,12 @@ final class MainWindowController: NSWindowController {
         return frameAlignedTime(slider.doubleValue * player.duration, fps: player.fps)
     }
 
-    private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true, allowCachedFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
+    private func display(_ player: NativeVideoPlayer, at seconds: Double, exact: Bool = true, allowCachedFrame: Bool = true, publishFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
         let hasContent = seconds >= 0 && (player.duration <= 0 || seconds <= player.duration)
         Diagnostics.log("display slot=\(player.slot.rawValue) target=\(debugTime(seconds)) exact=\(exact) hasContent=\(hasContent) duration=\(debugTime(player.duration))")
         player.setVideoVisible(hasContent)
         if hasContent {
-            player.seekAbsolute(seconds, exact: exact, allowCachedFrame: allowCachedFrame, completion: completion)
+            player.seekAbsolute(seconds, exact: exact, allowCachedFrame: allowCachedFrame, publishFrame: publishFrame, completion: completion)
         } else {
             completion?(false)
         }
@@ -1656,9 +1660,10 @@ final class MainWindowController: NSWindowController {
 
     private func clearSyncLoopRange() {
         Diagnostics.log("loop.clear previous=\(debugRange(syncLoopRange))")
+        cancelLoopSeekState(reason: "clear")
         loopPreviewGeneration += 1
-        loopStartFrameA = nil
-        loopStartFrameB = nil
+        loopPreviewFramesA = []
+        loopPreviewFramesB = []
         syncLoopRange = nil
         timeSlider.loopRange = nil
         debugTimelineState("loop.clear")
@@ -1666,11 +1671,11 @@ final class MainWindowController: NSWindowController {
 
     private func preheatSyncLoopStart(range: ClosedRange<Double>) {
         loopPreviewGeneration += 1
-        loopStartFrameA = nil
-        loopStartFrameB = nil
+        loopPreviewFramesA = []
+        loopPreviewFramesB = []
         let generation = loopPreviewGeneration
-        preheatLoopStartFrame(slot: .a, base: range.lowerBound, range: range, generation: generation)
-        preheatLoopStartFrame(slot: .b, base: range.lowerBound, range: range, generation: generation)
+        preheatLoopPreviewFrames(slot: .a, base: range.lowerBound, range: range, generation: generation)
+        preheatLoopPreviewFrames(slot: .b, base: range.lowerBound, range: range, generation: generation)
     }
 
     private func refreshSyncLoopPreviewIfNeeded() {
@@ -1678,13 +1683,14 @@ final class MainWindowController: NSWindowController {
         preheatSyncLoopStart(range: syncLoopRange)
     }
 
-    private func preheatLoopStartFrame(slot: VideoSlot, base: Double, range: ClosedRange<Double>, generation: Int) {
+    private func preheatLoopPreviewFrames(slot: VideoSlot, base: Double, range: ClosedRange<Double>, generation: Int) {
         let player = slot == .a ? playerA! : playerB!
         guard player.fileURL != nil else { return }
         let offsetFrames = slot == .a ? syncState.offsetFramesA : syncState.offsetFramesB
-        let targetTime = base + seconds(forFrames: offsetFrames, fps: player.fps)
+        let offsetSeconds = seconds(forFrames: offsetFrames, fps: player.fps)
+        let targetTime = base + offsetSeconds
         guard canDisplay(player, at: targetTime) else { return }
-        player.decodeFrameForLoopPreview(seconds: targetTime, exact: true) { [weak self] frame in
+        player.decodeFramesForLoopPreview(seconds: targetTime, exact: true, maxFrames: Self.loopPreviewFrameCount) { [weak self] frames in
             guard let self,
                   generation == self.loopPreviewGeneration,
                   let currentRange = self.syncLoopRange,
@@ -1692,13 +1698,18 @@ final class MainWindowController: NSWindowController {
                   abs(currentRange.upperBound - range.upperBound) < 0.0001 else {
                 return
             }
+            let frameInterval = 1.0 / max(1, max(self.playerA.fps, self.playerB.fps))
+            let validFrames = frames.filter { frame in
+                let baseTime = max(0, frame.pts - offsetSeconds)
+                return baseTime <= range.upperBound + frameInterval * 0.5
+            }
             switch slot {
             case .a:
-                self.loopStartFrameA = frame
+                self.loopPreviewFramesA = validFrames
             case .b:
-                self.loopStartFrameB = frame
+                self.loopPreviewFramesB = validFrames
             }
-            Diagnostics.log("sync.loop.preview.ready slot=\(slot.rawValue) generation=\(generation) target=\(self.debugTime(targetTime)) pts=\(self.debugTime(frame?.pts))")
+            Diagnostics.log("sync.loop.preview.ready slot=\(slot.rawValue) generation=\(generation) target=\(self.debugTime(targetTime)) frames=\(validFrames.count) first=\(self.debugTime(validFrames.first?.pts)) last=\(self.debugTime(validFrames.last?.pts))")
         }
     }
 
@@ -1706,21 +1717,116 @@ final class MainWindowController: NSWindowController {
     private func presentLoopStartPreview(loopRange: ClosedRange<Double>) -> Bool {
         syncBaseTime = loopRange.lowerBound
         var didPresent = false
-        if let frame = loopStartFrameA {
+        if let frame = loopPreviewFramesA.first {
             playerA.setVideoVisible(true)
             playerA.presentSynchronizedFrame(frame)
             didPresent = true
         }
-        if let frame = loopStartFrameB {
+        if let frame = loopPreviewFramesB.first {
             playerB.setVideoVisible(true)
             playerB.presentSynchronizedFrame(frame)
             didPresent = true
         }
         if didPresent {
-            Diagnostics.log("sync.loop.preview.present base=\(debugTime(loopRange.lowerBound)) frameA=\(debugTime(loopStartFrameA?.pts)) frameB=\(debugTime(loopStartFrameB?.pts))")
+            Diagnostics.log("sync.loop.preview.present base=\(debugTime(loopRange.lowerBound)) frameA=\(debugTime(loopPreviewFramesA.first?.pts)) frameB=\(debugTime(loopPreviewFramesB.first?.pts))")
             refreshStatus()
         }
         return didPresent
+    }
+
+    private func hasCompleteLoopPreview(loopRange: ClosedRange<Double>) -> Bool {
+        hasLoopPreview(slot: .a, loopRange: loopRange) && hasLoopPreview(slot: .b, loopRange: loopRange)
+    }
+
+    private func hasLoopPreview(slot: VideoSlot, loopRange: ClosedRange<Double>) -> Bool {
+        let player = slot == .a ? playerA! : playerB!
+        guard player.fileURL != nil else { return true }
+        let offsetFrames = slot == .a ? syncState.offsetFramesA : syncState.offsetFramesB
+        let targetTime = loopRange.lowerBound + seconds(forFrames: offsetFrames, fps: player.fps)
+        guard canDisplay(player, at: targetTime) else { return true }
+        switch slot {
+        case .a:
+            return !loopPreviewFramesA.isEmpty
+        case .b:
+            return !loopPreviewFramesB.isEmpty
+        }
+    }
+
+    private func cancelLoopPreviewPlayback() {
+        loopPreviewPlaybackGeneration += 1
+    }
+
+    private func cancelLoopSeekState(reason: String) {
+        cancelLoopPreviewPlayback()
+        loopSeekGeneration += 1
+        if loopSeekInProgress {
+            Diagnostics.log("sync.loop.seekCancel reason=\(reason) generation=\(loopSeekGeneration)")
+        }
+        loopSeekInProgress = false
+    }
+
+    private func playLoopPreviewFramesWhileSeeking(token: Int, loopRange: ClosedRange<Double>) {
+        let maxCount = max(loopPreviewFramesA.count, loopPreviewFramesB.count)
+        guard maxCount > 1 else { return }
+        loopPreviewPlaybackGeneration += 1
+        let generation = loopPreviewPlaybackGeneration
+        let frameInterval = 1.0 / max(1, max(playerA.fps, playerB.fps))
+        Diagnostics.log("sync.loop.preview.play token=\(token) generation=\(generation) framesA=\(loopPreviewFramesA.count) framesB=\(loopPreviewFramesB.count)")
+        scheduleLoopPreviewFrame(
+            index: 1,
+            maxCount: maxCount,
+            token: token,
+            generation: generation,
+            loopRange: loopRange,
+            frameInterval: frameInterval
+        )
+    }
+
+    private func scheduleLoopPreviewFrame(
+        index: Int,
+        maxCount: Int,
+        token: Int,
+        generation: Int,
+        loopRange: ClosedRange<Double>,
+        frameInterval: Double
+    ) {
+        guard index < maxCount else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + frameInterval) { [weak self] in
+            guard let self,
+                  self.loopPreviewPlaybackGeneration == generation,
+                  self.isSynchronizedPlaying,
+                  token == self.synchronizedPlaybackToken,
+                  self.loopSeekInProgress,
+                  self.syncLoopRange != nil else {
+                return
+            }
+            var frameA: NativeVideoFrame?
+            var frameB: NativeVideoFrame?
+            if self.loopPreviewFramesA.indices.contains(index) {
+                frameA = self.loopPreviewFramesA[index]
+                self.playerA.setVideoVisible(true)
+                self.playerA.presentSynchronizedFrame(frameA!)
+            }
+            if self.loopPreviewFramesB.indices.contains(index) {
+                frameB = self.loopPreviewFramesB[index]
+                self.playerB.setVideoVisible(true)
+                self.playerB.presentSynchronizedFrame(frameB!)
+            }
+            if let nextBase = self.baseTime(frameA: frameA, frameB: frameB),
+               nextBase <= loopRange.upperBound + frameInterval * 0.5 {
+                self.syncBaseTime = nextBase
+                self.refreshStatus()
+                Diagnostics.log("sync.loop.preview.frame token=\(token) generation=\(generation) index=\(index) base=\(self.debugTime(nextBase)) frameA=\(self.debugTime(frameA?.pts)) frameB=\(self.debugTime(frameB?.pts))")
+                self.scheduleLoopPreviewFrame(
+                    index: index + 1,
+                    maxCount: maxCount,
+                    token: token,
+                    generation: generation,
+                    loopRange: loopRange,
+                    frameInterval: frameInterval
+                )
+            }
+        }
     }
 
     private func canDisplay(_ player: NativeVideoPlayer, at seconds: Double) -> Bool {
@@ -2904,7 +3010,7 @@ final class MainWindowController: NSWindowController {
         if !playerA.isPaused { playerA.setPause(true) }
         if !playerB.isPaused { playerB.setPause(true) }
         isSynchronizedPlaying = true
-        loopSeekInProgress = false
+        cancelLoopSeekState(reason: "start")
         synchronizedPlaybackToken += 1
         synchronizedDebugFrameCount = 0
         let token = synchronizedPlaybackToken
@@ -2924,9 +3030,9 @@ final class MainWindowController: NSWindowController {
     }
 
     private func stopSynchronizedBarrierPlayback() {
+        cancelLoopSeekState(reason: "stop")
         guard isSynchronizedPlaying else { return }
         isSynchronizedPlaying = false
-        loopSeekInProgress = false
         synchronizedPlaybackToken += 1
         Diagnostics.log("sync.play.stop token=\(synchronizedPlaybackToken)")
         debugTimelineState("sync.play.stop")
@@ -3006,10 +3112,37 @@ final class MainWindowController: NSWindowController {
     private func seekLoopStartAndResume(token: Int, loopRange: ClosedRange<Double>, reason: String) {
         guard isSynchronizedPlaying, token == synchronizedPlaybackToken, !loopSeekInProgress else { return }
         loopSeekInProgress = true
-        let previewed = presentLoopStartPreview(loopRange: loopRange)
-        Diagnostics.log("sync.loop.seekStart token=\(token) reason=\(reason) target=\(debugTime(loopRange.lowerBound)) previewed=\(previewed) loop=\(debugRange(syncLoopRange))")
-        seekToBaseTime(loopRange.lowerBound, exact: true, allowCachedFrame: false) { [weak self] ok in
+        loopSeekGeneration += 1
+        let seekGeneration = loopSeekGeneration
+        let canUsePreviewPlayback = hasCompleteLoopPreview(loopRange: loopRange)
+        let previewed = canUsePreviewPlayback && presentLoopStartPreview(loopRange: loopRange)
+        if previewed {
+            playLoopPreviewFramesWhileSeeking(token: token, loopRange: loopRange)
+        }
+        Diagnostics.log("sync.loop.seekStart token=\(token) generation=\(seekGeneration) reason=\(reason) target=\(debugTime(loopRange.lowerBound)) previewed=\(previewed) loop=\(debugRange(syncLoopRange))")
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.loopSeekTimeout) { [weak self] in
+            guard let self,
+                  self.loopSeekInProgress,
+                  self.loopSeekGeneration == seekGeneration,
+                  self.isSynchronizedPlaying,
+                  token == self.synchronizedPlaybackToken,
+                  self.syncLoopRange != nil else {
+                return
+            }
+            Diagnostics.log("sync.loop.seekTimeout token=\(token) generation=\(seekGeneration) target=\(self.debugTime(loopRange.lowerBound))")
+            self.cancelLoopPreviewPlayback()
+            self.loopSeekGeneration += 1
+            self.loopSeekInProgress = false
+            self.refreshStatus()
+            self.scheduleSynchronizedFrame(token: token)
+        }
+        seekToBaseTime(loopRange.lowerBound, exact: true, allowCachedFrame: false, publishFrame: !previewed) { [weak self] ok in
             guard let self else { return }
+            guard self.loopSeekGeneration == seekGeneration else {
+                Diagnostics.log("sync.loop.seekComplete.stale token=\(token) generation=\(seekGeneration) ok=\(ok)")
+                return
+            }
+            self.cancelLoopPreviewPlayback()
             self.loopSeekInProgress = false
             guard self.isSynchronizedPlaying,
                   token == self.synchronizedPlaybackToken,

@@ -59,6 +59,14 @@ private final class FrameCompletionBox: @unchecked Sendable {
     }
 }
 
+private final class FramesCompletionBox: @unchecked Sendable {
+    let completion: ([NativeVideoFrame]) -> Void
+
+    init(_ completion: @escaping ([NativeVideoFrame]) -> Void) {
+        self.completion = completion
+    }
+}
+
 private final class SeekCompletionBox: @unchecked Sendable {
     let completion: (Bool) -> Void
 
@@ -71,11 +79,12 @@ final class NativeVideoPlayer: @unchecked Sendable {
     let slot: VideoSlot
 
     private let queue: DispatchQueue
+    private let loopPreviewQueue: DispatchQueue
     private let seekLock = NSLock()
     private let statusLock = NSLock()
     private let playbackLock = NSLock()
     private var decoder: OpaquePointer?
-    private var pendingSeek: (seconds: Double, exact: Bool, generation: Int, completion: SeekCompletionBox?)?
+    private var pendingSeek: (seconds: Double, exact: Bool, publishFrame: Bool, generation: Int, completion: SeekCompletionBox?)?
     private var isSeeking = false
     private var seekGeneration = 0
     private let seekCancelToken = SeekCancelToken()
@@ -110,6 +119,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
     init(slot: VideoSlot) {
         self.slot = slot
         self.queue = DispatchQueue(label: "VideoCompare.native.decode.\(slot.rawValue)", qos: .userInitiated)
+        self.loopPreviewQueue = DispatchQueue(label: "VideoCompare.native.loopPreview.\(slot.rawValue)", qos: .utility)
     }
 
     deinit {
@@ -209,10 +219,12 @@ final class NativeVideoPlayer: @unchecked Sendable {
         setPause(!isPaused)
     }
 
-    func seekAbsolute(_ seconds: Double, exact: Bool = true, allowCachedFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
+    func seekAbsolute(_ seconds: Double, exact: Bool = true, allowCachedFrame: Bool = true, publishFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
         let completionBox = completion.map(SeekCompletionBox.init)
         if let staticImageFrame {
-            presentStaticImageFrame(staticImageFrame)
+            if publishFrame {
+                presentStaticImageFrame(staticImageFrame)
+            }
             completionBox?.completion(true)
             return
         }
@@ -220,7 +232,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
         seekGeneration += 1
         let generation = seekGeneration
         seekCancelToken.pointer.pointee = Int32(generation)
-        if allowCachedFrame, exact, Thread.isMainThread, let cached = cachedFrame(at: seconds) {
+        if publishFrame, allowCachedFrame, exact, Thread.isMainThread, let cached = cachedFrame(at: seconds) {
             pendingSeek = nil
             seekLock.unlock()
             presentHistoricalFrame(cached)
@@ -231,7 +243,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
             self.frameHistory.removeAll(keepingCapacity: true)
             self.frameHistoryIndex = nil
         }
-        pendingSeek = (max(0, seconds), exact, generation, completionBox)
+        pendingSeek = (max(0, seconds), exact, publishFrame, generation, completionBox)
         Diagnostics.log("player.\(slot.rawValue).seek.request generation=\(generation) seconds=\(String(format: "%.6f", max(0, seconds))) exact=\(exact) isSeeking=\(isSeeking)")
         guard !isSeeking else {
             seekLock.unlock()
@@ -255,6 +267,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
                     seconds: request.seconds,
                     exact: request.exact,
                     publishStale: false,
+                    publishFrame: request.publishFrame,
                     seekGeneration: request.generation,
                     completion: request.completion
                 )
@@ -371,22 +384,39 @@ final class NativeVideoPlayer: @unchecked Sendable {
 
     func decodeFrameForLoopPreview(seconds: Double, exact: Bool = true, completion: @escaping (NativeVideoFrame?) -> Void) {
         let completionBox = FrameCompletionBox(completion)
+        decodeFramesForLoopPreview(seconds: seconds, exact: exact, maxFrames: 1) { frames in
+            completionBox.completion(frames.first)
+        }
+    }
+
+    func decodeFramesForLoopPreview(seconds: Double, exact: Bool = true, maxFrames: Int, completion: @escaping ([NativeVideoFrame]) -> Void) {
+        let completionBox = FramesCompletionBox(completion)
+        guard maxFrames > 0 else {
+            DispatchQueue.main.async {
+                completionBox.completion([])
+            }
+            return
+        }
         if let staticImageFrame {
-            completionBox.completion(staticImageFrame)
+            DispatchQueue.main.async {
+                completionBox.completion([staticImageFrame])
+            }
             return
         }
         guard let url = statusSnapshot.fileURL else {
-            completionBox.completion(nil)
+            DispatchQueue.main.async {
+                completionBox.completion([])
+            }
             return
         }
 
         let path = url.path
         let target = max(0, seconds)
-        queue.async {
+        loopPreviewQueue.async {
             var error = [CChar](repeating: 0, count: 512)
             guard let previewDecoder = path.withCString({ vc_decoder_open($0, &error, Int32(error.count)) }) else {
                 DispatchQueue.main.async {
-                    completionBox.completion(nil)
+                    completionBox.completion([])
                 }
                 return
             }
@@ -397,17 +427,34 @@ final class NativeVideoPlayer: @unchecked Sendable {
             guard result > 0, let unmanagedPixelBuffer = frame.pixelBuffer else {
                 vc_frame_release(&frame)
                 DispatchQueue.main.async {
-                    completionBox.completion(nil)
+                    completionBox.completion([])
                 }
                 return
             }
-            let videoFrame = NativeVideoFrame(
-                pixelBuffer: unmanagedPixelBuffer.takeRetainedValue(),
-                pts: frame.pts,
-                duration: frame.duration
-            )
+            var frames = [
+                NativeVideoFrame(
+                    pixelBuffer: unmanagedPixelBuffer.takeRetainedValue(),
+                    pts: frame.pts,
+                    duration: frame.duration
+                )
+            ]
+            while frames.count < maxFrames {
+                var nextFrame = VCDecodedFrame()
+                let nextResult = vc_decoder_next(previewDecoder, &nextFrame)
+                guard nextResult > 0, let unmanagedNextPixelBuffer = nextFrame.pixelBuffer else {
+                    vc_frame_release(&nextFrame)
+                    break
+                }
+                frames.append(
+                    NativeVideoFrame(
+                        pixelBuffer: unmanagedNextPixelBuffer.takeRetainedValue(),
+                        pts: nextFrame.pts,
+                        duration: nextFrame.duration
+                    )
+                )
+            }
             DispatchQueue.main.async {
-                completionBox.completion(videoFrame)
+                completionBox.completion(frames)
             }
         }
     }
@@ -541,7 +588,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
         }
     }
 
-    private func decodeSeek(seconds: Double, exact: Bool, publishStale: Bool, seekGeneration: Int? = nil, completion: SeekCompletionBox? = nil) {
+    private func decodeSeek(seconds: Double, exact: Bool, publishStale: Bool, publishFrame: Bool = true, seekGeneration: Int? = nil, completion: SeekCompletionBox? = nil) {
         guard let decoder else {
             DispatchQueue.main.async { completion?.completion(false) }
             return
@@ -576,10 +623,10 @@ final class NativeVideoPlayer: @unchecked Sendable {
         }
         let pixelBuffer = unmanagedPixelBuffer.takeRetainedValue()
         Diagnostics.log("player.\(slot.rawValue).seek.decoded generation=\(seekGeneration.map(String.init) ?? "nil") requested=\(String(format: "%.6f", seconds)) pts=\(String(format: "%.6f", frame.pts)) exact=\(exact)")
-        publish(frame: frame, pixelBuffer: pixelBuffer, publishStale: publishStale, seekGeneration: seekGeneration, completion: completion)
+        publish(frame: frame, pixelBuffer: pixelBuffer, publishStale: publishStale, publishFrame: publishFrame, seekGeneration: seekGeneration, completion: completion)
     }
 
-    private func publish(frame: VCDecodedFrame, pixelBuffer: CVPixelBuffer, publishStale: Bool = true, seekGeneration: Int? = nil, completion: SeekCompletionBox? = nil) {
+    private func publish(frame: VCDecodedFrame, pixelBuffer: CVPixelBuffer, publishStale: Bool = true, publishFrame: Bool = true, seekGeneration: Int? = nil, completion: SeekCompletionBox? = nil) {
         let pts = frame.pts
         let videoFrame = NativeVideoFrame(pixelBuffer: pixelBuffer, pts: frame.pts, duration: frame.duration)
         DispatchQueue.main.async {
@@ -591,7 +638,9 @@ final class NativeVideoPlayer: @unchecked Sendable {
             if let seekGeneration {
                 Diagnostics.log("player.\(self.slot.rawValue).seek.publish generation=\(seekGeneration) pts=\(String(format: "%.6f", pts))")
             }
-            self.presentSynchronizedFrame(videoFrame)
+            if publishFrame {
+                self.presentSynchronizedFrame(videoFrame)
+            }
             completion?.completion(true)
         }
     }
