@@ -1,7 +1,9 @@
 import AppKit
 import CFFmpeg
+import CoreImage
 import CoreVideo
 import Foundation
+import ImageIO
 import QuartzCore
 
 final class NativeVideoFrame: @unchecked Sendable {
@@ -76,7 +78,17 @@ private final class SeekCompletionBox: @unchecked Sendable {
     }
 }
 
+private final class BoolCompletionBox: @unchecked Sendable {
+    let completion: (Bool) -> Void
+
+    init(_ completion: @escaping (Bool) -> Void) {
+        self.completion = completion
+    }
+}
+
 final class NativeVideoPlayer: @unchecked Sendable {
+    private static let rawPreviewMaxPixelSize = 1600
+
     let slot: VideoSlot
 
     private let queue: DispatchQueue
@@ -96,7 +108,87 @@ final class NativeVideoPlayer: @unchecked Sendable {
     private var frameCache: [Int: NativeVideoFrame] = [:]
     private var frameCacheOrder: [Int] = []
     private var staticImageFrame: NativeVideoFrame?
+    private var staticImageReloadGeneration = 0
+    private var rawRenderSession: RawRenderSession?
+    private var rawNeutralDefaults: RawNeutralDefaults?
     private var status = PlayerStatusSnapshot()
+
+    private final class RawRenderSession {
+        let url: URL
+        let filter: CIFilter
+        let context: CIContext
+        let colorSpace: CGColorSpace
+        let defaults: RawNeutralDefaults
+        private var previewPixelBuffer: CVPixelBuffer?
+        private var fullPixelBuffer: CVPixelBuffer?
+
+        init(url: URL) throws {
+            guard let filter = CIFilter(imageURL: url) else {
+                throw NSError(domain: "VideoCompare.RawLoad", code: 1, userInfo: [NSLocalizedDescriptionKey: "系统 RAW 解码器无法打开该文件"])
+            }
+            filter.setDefaults()
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            self.url = url
+            self.filter = filter
+            self.colorSpace = colorSpace
+            self.context = CIContext(options: [
+                .workingColorSpace: colorSpace,
+                .outputColorSpace: colorSpace
+            ])
+            self.defaults = NativeVideoPlayer.rawNeutralDefaults(from: filter)
+        }
+
+        func render(adjustment: ColorAdjustmentState, maxPixelSize: Int?) throws -> CVPixelBuffer {
+            let mapped = RawTemperatureTintMapper.mappedNeutral(defaults: defaults, adjustment: adjustment)
+            Diagnostics.log("raw.decode path=\(url.lastPathComponent) defaultTemp=\(String(format: "%.3f", defaults.temperature)) defaultTint=\(String(format: "%.3f", defaults.tint)) mappedTemp=\(String(format: "%.3f", mapped.temperature)) mappedTint=\(String(format: "%.3f", mapped.tint)) previewMax=\(maxPixelSize.map(String.init) ?? "full")")
+            NativeVideoPlayer.setFilterValueIfAvailable(mapped.temperature, key: "inputNeutralTemperature", filter: filter)
+            NativeVideoPlayer.setFilterValueIfAvailable(mapped.tint, key: "inputNeutralTint", filter: filter)
+            NativeVideoPlayer.setFilterValueIfAvailable(1.0, key: "inputBoost", filter: filter)
+
+            guard var image = filter.outputImage else {
+                throw NSError(domain: "VideoCompare.RawLoad", code: 2, userInfo: [NSLocalizedDescriptionKey: "系统 RAW 解码器无法生成图像"])
+            }
+            let extent = image.extent
+            guard extent.width > 1, extent.height > 1 else {
+                throw NSError(domain: "VideoCompare.RawLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "RAW 图像尺寸无效"])
+            }
+            image = image.transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
+
+            var width = max(1, Int(ceil(extent.width)))
+            var height = max(1, Int(ceil(extent.height)))
+            if let maxPixelSize, max(width, height) > maxPixelSize {
+                let scale = CGFloat(maxPixelSize) / CGFloat(max(width, height))
+                image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                width = max(1, Int(ceil(image.extent.width)))
+                height = max(1, Int(ceil(image.extent.height)))
+            }
+
+            let pixelBuffer = try reusablePixelBuffer(width: width, height: height, preview: maxPixelSize != nil)
+            context.render(
+                image,
+                to: pixelBuffer,
+                bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                colorSpace: colorSpace
+            )
+            return pixelBuffer
+        }
+
+        private func reusablePixelBuffer(width: Int, height: Int, preview: Bool) throws -> CVPixelBuffer {
+            let current = preview ? previewPixelBuffer : fullPixelBuffer
+            if let current,
+               CVPixelBufferGetWidth(current) == width,
+               CVPixelBufferGetHeight(current) == height {
+                return current
+            }
+            let pixelBuffer = try NativeVideoPlayer.makePixelBuffer(width: width, height: height)
+            if preview {
+                previewPixelBuffer = pixelBuffer
+            } else {
+                fullPixelBuffer = pixelBuffer
+            }
+            return pixelBuffer
+        }
+    }
 
     var statusSnapshot: PlayerStatusSnapshot {
         statusLock.lock()
@@ -159,6 +251,9 @@ final class NativeVideoPlayer: @unchecked Sendable {
         frameCache.removeAll(keepingCapacity: true)
         frameCacheOrder.removeAll(keepingCapacity: true)
         staticImageFrame = nil
+        rawRenderSession = nil
+        rawNeutralDefaults = nil
+        staticImageReloadGeneration += 1
         if MediaFileSupport.isImage(url) {
             loadStaticImage(url: url)
             return
@@ -220,6 +315,54 @@ final class NativeVideoPlayer: @unchecked Sendable {
 
     func togglePause() {
         setPause(!isPaused)
+    }
+
+    func reloadStaticImage(rawAdjustment adjustment: ColorAdjustmentState, preview: Bool = false, completion: ((Bool) -> Void)? = nil) {
+        guard let url = fileURL,
+              isStaticImage,
+              MediaFileSupport.isRawImage(url) else {
+            completion?(false)
+            return
+        }
+        let completionBox = completion.map(BoolCompletionBox.init)
+        staticImageReloadGeneration += 1
+        let generation = staticImageReloadGeneration
+        queue.async {
+            guard generation == self.staticImageReloadGeneration else {
+                Diagnostics.log("player.\(self.slot.rawValue).raw.reload.skipStaleBeforeDecode generation=\(generation)")
+                return
+            }
+            do {
+                Diagnostics.log("player.\(self.slot.rawValue).raw.reload.start generation=\(generation) temp=\(String(format: "%.4f", adjustment.temperature)) tint=\(String(format: "%.4f", adjustment.tint)) preview=\(preview)")
+                let session = try self.rawRenderSession(for: url)
+                let pixelBuffer = try session.render(
+                    adjustment: adjustment,
+                    maxPixelSize: preview ? Self.rawPreviewMaxPixelSize : nil
+                )
+                let rawDefaults = session.defaults
+                let frame = NativeVideoFrame(pixelBuffer: pixelBuffer, pts: 0, duration: 0)
+                DispatchQueue.main.async {
+                    guard generation == self.staticImageReloadGeneration,
+                          self.fileURL == url,
+                          self.isStaticImage else {
+                        return
+                    }
+                    self.rawNeutralDefaults = rawDefaults
+                    self.staticImageFrame = frame
+                    self.presentStaticImageFrame(frame)
+                    Diagnostics.log("player.\(self.slot.rawValue).raw.reload.apply generation=\(generation) preview=\(preview)")
+                    completionBox?.completion(true)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard generation == self.staticImageReloadGeneration else {
+                        return
+                    }
+                    self.onOpenFailed?(self.slot, error.localizedDescription)
+                    completionBox?.completion(false)
+                }
+            }
+        }
     }
 
     func seekAbsolute(_ seconds: Double, exact: Bool = true, allowCachedFrame: Bool = true, publishFrame: Bool = true, completion: ((Bool) -> Void)? = nil) {
@@ -696,10 +839,21 @@ final class NativeVideoPlayer: @unchecked Sendable {
                 self.decoder = nil
             }
             do {
-                let pixelBuffer = try Self.makePixelBuffer(fromImageAt: url)
+                let decoded: (pixelBuffer: CVPixelBuffer, rawDefaults: RawNeutralDefaults?)
+                if MediaFileSupport.isRawImage(url) {
+                    let session = try self.rawRenderSession(for: url)
+                    decoded = (
+                        try session.render(adjustment: ColorAdjustmentState(), maxPixelSize: nil),
+                        session.defaults
+                    )
+                } else {
+                    decoded = try Self.makePixelBuffer(fromImageAt: url, rawAdjustment: ColorAdjustmentState(), rawDefaults: nil)
+                }
+                let pixelBuffer = decoded.pixelBuffer
                 let frame = NativeVideoFrame(pixelBuffer: pixelBuffer, pts: 0, duration: 0)
                 Diagnostics.log("player.\(self.slot.rawValue).image.opened path=\(path) width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer))")
                 DispatchQueue.main.async {
+                    self.rawNeutralDefaults = decoded.rawDefaults
                     self.staticImageFrame = frame
                     self.updateStatus {
                         $0.duration = 0
@@ -718,33 +872,81 @@ final class NativeVideoPlayer: @unchecked Sendable {
         }
     }
 
-    private static func makePixelBuffer(fromImageAt url: URL) throws -> CVPixelBuffer {
-        guard let image = NSImage(contentsOf: url) else {
-            throw NSError(domain: "VideoCompare.ImageLoad", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法打开照片"])
+    private func rawRenderSession(for url: URL) throws -> RawRenderSession {
+        if let rawRenderSession, rawRenderSession.url == url {
+            return rawRenderSession
         }
-        var proposedRect = NSRect(origin: .zero, size: image.size)
-        guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+        let session = try RawRenderSession(url: url)
+        rawRenderSession = session
+        rawNeutralDefaults = session.defaults
+        return session
+    }
+
+    private static func makePixelBuffer(fromImageAt url: URL, rawAdjustment: ColorAdjustmentState, rawDefaults: RawNeutralDefaults?) throws -> (pixelBuffer: CVPixelBuffer, rawDefaults: RawNeutralDefaults?) {
+        if MediaFileSupport.isRawImage(url),
+           let decoded = try? makeRawPixelBuffer(fromImageAt: url, adjustment: rawAdjustment, defaults: rawDefaults) {
+            return decoded
+        }
+        guard let cgImage = makeCGImage(fromImageAt: url) else {
             throw NSError(domain: "VideoCompare.ImageLoad", code: 2, userInfo: [NSLocalizedDescriptionKey: "无法解码照片"])
         }
+        return (try makePixelBuffer(from: cgImage), nil)
+    }
+
+    private static func makeRawPixelBuffer(fromImageAt url: URL, adjustment: ColorAdjustmentState, defaults: RawNeutralDefaults?) throws -> (pixelBuffer: CVPixelBuffer, rawDefaults: RawNeutralDefaults) {
+        guard let filter = CIFilter(imageURL: url) else {
+            throw NSError(domain: "VideoCompare.RawLoad", code: 1, userInfo: [NSLocalizedDescriptionKey: "系统 RAW 解码器无法打开该文件"])
+        }
+        filter.setDefaults()
+        let detectedDefaults = rawNeutralDefaults(from: filter)
+        let rawDefaults = defaults ?? detectedDefaults
+        let mapped = RawTemperatureTintMapper.mappedNeutral(defaults: rawDefaults, adjustment: adjustment)
+        Diagnostics.log("raw.decode path=\(url.lastPathComponent) defaultTemp=\(String(format: "%.3f", rawDefaults.temperature)) defaultTint=\(String(format: "%.3f", rawDefaults.tint)) mappedTemp=\(String(format: "%.3f", mapped.temperature)) mappedTint=\(String(format: "%.3f", mapped.tint))")
+        setFilterValueIfAvailable(mapped.temperature, key: "inputNeutralTemperature", filter: filter)
+        setFilterValueIfAvailable(mapped.tint, key: "inputNeutralTint", filter: filter)
+        setFilterValueIfAvailable(1.0, key: "inputBoost", filter: filter)
+
+        guard var image = filter.outputImage else {
+            throw NSError(domain: "VideoCompare.RawLoad", code: 2, userInfo: [NSLocalizedDescriptionKey: "系统 RAW 解码器无法生成图像"])
+        }
+        let extent = image.extent
+        guard extent.width > 1, extent.height > 1 else {
+            throw NSError(domain: "VideoCompare.RawLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "RAW 图像尺寸无效"])
+        }
+        image = image.transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
+        let width = max(1, Int(ceil(extent.width)))
+        let height = max(1, Int(ceil(extent.height)))
+        let pixelBuffer = try makePixelBuffer(width: width, height: height)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let context = CIContext(options: [
+            .workingColorSpace: colorSpace,
+            .outputColorSpace: colorSpace
+        ])
+        context.render(
+            image,
+            to: pixelBuffer,
+            bounds: CGRect(x: 0, y: 0, width: width, height: height),
+            colorSpace: colorSpace
+        )
+        return (pixelBuffer, rawDefaults)
+    }
+
+    private static func rawNeutralDefaults(from filter: CIFilter) -> RawNeutralDefaults {
+        RawNeutralDefaults(
+            temperature: (filter.value(forKey: "inputNeutralTemperature") as? NSNumber)?.doubleValue ?? 6500,
+            tint: (filter.value(forKey: "inputNeutralTint") as? NSNumber)?.doubleValue ?? 0
+        )
+    }
+
+    private static func setFilterValueIfAvailable(_ value: Double, key: String, filter: CIFilter) {
+        guard filter.inputKeys.contains(key) else { return }
+        filter.setValue(value, forKey: key)
+    }
+
+    private static func makePixelBuffer(from cgImage: CGImage) throws -> CVPixelBuffer {
         let width = max(1, cgImage.width)
         let height = max(1, cgImage.height)
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferMetalCompatibilityKey: true,
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true
-        ]
-        var pixelBuffer: CVPixelBuffer?
-        let createResult = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            width,
-            height,
-            kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
-            &pixelBuffer
-        )
-        guard createResult == kCVReturnSuccess, let pixelBuffer else {
-            throw NSError(domain: "VideoCompare.ImageLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "无法创建照片缓冲区"])
-        }
+        let pixelBuffer = try makePixelBuffer(width: width, height: height)
 
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
@@ -768,4 +970,56 @@ final class NativeVideoPlayer: @unchecked Sendable {
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         return pixelBuffer
     }
+
+    private static func makePixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+        ]
+        var pixelBuffer: CVPixelBuffer?
+        let createResult = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            attrs as CFDictionary,
+            &pixelBuffer
+        )
+        guard createResult == kCVReturnSuccess, let pixelBuffer else {
+            throw NSError(domain: "VideoCompare.ImageLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "无法创建照片缓冲区"])
+        }
+        return pixelBuffer
+    }
+
+    private static func makeCGImage(fromImageAt url: URL) -> CGImage? {
+        let sourceOptions: [CFString: Any] = [
+            kCGImageSourceShouldCache: false
+        ]
+        if let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions as CFDictionary) {
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+            let width = properties?[kCGImagePropertyPixelWidth] as? Int ?? 0
+            let height = properties?[kCGImagePropertyPixelHeight] as? Int ?? 0
+            let maxPixelSize = max(width, height)
+            if maxPixelSize > 0 {
+                let thumbnailOptions: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+                ]
+                if let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) {
+                    return image
+                }
+            }
+            if let image = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+                return image
+            }
+        }
+
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        var proposedRect = NSRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil)
+    }
+
 }

@@ -194,7 +194,15 @@ final class VideoCanvasView: NSView {
     var onZoomDragged: ((VideoSlot, CGFloat) -> Void)?
     var onAlignmentGestureEnded: (() -> Void)?
     var onROIAlignmentRequested: ((VideoSlot, NSRect) -> Void)?
+    var onWhiteBalanceSampleRequested: ((VideoSlot, NSPoint) -> Void)?
     var onSelectionChanged: ((VideoSlot?) -> Void)?
+    var isWhiteBalanceSampling = false {
+        didSet {
+            guard oldValue != isWhiteBalanceSampling else { return }
+            discardActiveGesture()
+            window?.invalidateCursorRects(for: self)
+        }
+    }
     var selectedSlot: VideoSlot? {
         didSet {
             guard oldValue != selectedSlot else { return }
@@ -258,6 +266,13 @@ final class VideoCanvasView: NSView {
     }
 
     override var isFlipped: Bool { true }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isWhiteBalanceSampling {
+            addCursorRect(bounds, cursor: .crosshair)
+        }
+    }
 
     override func layout() {
         super.layout()
@@ -328,6 +343,15 @@ final class VideoCanvasView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if isWhiteBalanceSampling {
+            guard activeContentBounds().contains(point), let clickedSlot = slot(at: point) else {
+                NSSound.beep()
+                return
+            }
+            selectedSlot = clickedSlot
+            onWhiteBalanceSampleRequested?(clickedSlot, point)
+            return
+        }
         let wantsROISelection = event.modifierFlags.contains(.control)
         if wantsROISelection,
            layoutMode == .overlapWipe,
@@ -525,6 +549,18 @@ final class VideoCanvasView: NSView {
         renderer.wipeFraction = wipeFraction
         needsDisplay = true
         onWipeChanged?(wipeFraction)
+    }
+
+    private func discardActiveGesture() {
+        isDraggingWipe = false
+        isPanning = false
+        isSelectingROI = false
+        didPan = false
+        lastDragPoint = nil
+        panSlot = nil
+        roiStartPoint = nil
+        roiSlot = nil
+        roiOverlay.selectionRect = nil
     }
 
     private func normalizedRect(from start: NSPoint, to end: NSPoint) -> NSRect {

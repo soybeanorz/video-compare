@@ -29,13 +29,24 @@ private enum EndpointIcon {
     }
 }
 
+private final class TrackingSlider: NSSlider {
+    var onTrackingChanged: ((Bool) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onTrackingChanged?(true)
+        super.mouseDown(with: event)
+        onTrackingChanged?(false)
+    }
+}
+
 private final class NativeAdjustmentRowView: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let leftIconView = NSImageView()
     private let rightIconView = NSImageView()
-    private let slider = NSSlider(value: 0, minValue: 1, maxValue: 1, target: nil, action: nil)
+    private let slider = TrackingSlider(value: 0, minValue: 1, maxValue: 1, target: nil, action: nil)
     private var isUpdating = false
     var onValueChanged: ((Double) -> Void)?
+    var onTrackingChanged: ((Bool) -> Void)?
 
     var value: Double {
         get { slider.doubleValue }
@@ -67,6 +78,10 @@ private final class NativeAdjustmentRowView: NSView {
         slider.tickMarkPosition = .below
         slider.target = self
         slider.action = #selector(sliderChanged)
+        slider.onTrackingChanged = { [weak self] tracking in
+            guard self?.rowEnabled == true else { return }
+            self?.onTrackingChanged?(tracking)
+        }
 
         addSubview(titleLabel)
         addSubview(leftIconView)
@@ -115,10 +130,20 @@ private final class NativeAdjustmentRowView: NSView {
         isUpdating = false
     }
 
+    func setRange(_ range: ClosedRange<Double>) {
+        guard slider.minValue != range.lowerBound || slider.maxValue != range.upperBound else { return }
+        isUpdating = true
+        slider.minValue = range.lowerBound
+        slider.maxValue = range.upperBound
+        value = slider.doubleValue
+        isUpdating = false
+    }
+
     @objc private func sliderChanged() {
         guard !isUpdating else { return }
         onValueChanged?(slider.doubleValue)
     }
+
 }
 
 final class CurveHistogramView: NSView {
@@ -303,6 +328,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
     private let rootView = ColorAdjustmentRootView()
     private let enabledButton = NSButton(checkboxWithTitle: "启用", target: nil, action: nil)
     private let autoLevelsButton = NSButton(title: "Auto Levels", target: nil, action: nil)
+    private let whiteBalanceButton = NSButton(title: "WB", target: nil, action: nil)
     private let resetButton = NSButton(title: "Reset All", target: nil, action: nil)
     private let curveView = CurveHistogramView()
     private let separatorTone = NSBox()
@@ -313,9 +339,12 @@ final class ColorAdjustmentPanelController: NSWindowController {
     private var state = ColorAdjustmentState()
     private var currentSlot: VideoSlot?
     private var isSyncing = false
+    private var canWhiteBalance = false
 
     var onStateChanged: ((ColorAdjustmentState) -> Void)?
+    var onStateChangeTracking: ((ColorAdjustmentState, Bool) -> Void)?
     var onReset: (() -> Void)?
+    var onWhiteBalanceRequested: (() -> Void)?
 
     convenience init() {
         let panel = NSPanel(
@@ -340,15 +369,21 @@ final class ColorAdjustmentPanelController: NSWindowController {
         window?.center()
     }
 
-    func update(slot: VideoSlot?, state: ColorAdjustmentState, histogram: ColorHistogram) {
+    func update(slot: VideoSlot?, state: ColorAdjustmentState, histogram: ColorHistogram, isRawImage: Bool = false, canWhiteBalance: Bool = false) {
         currentSlot = slot
         self.state = state
+        self.canWhiteBalance = canWhiteBalance
+        updateTemperatureTintRanges(isRawImage: isRawImage)
         curveView.histogram = histogram
         syncControls()
     }
 
     func updateHistogram(_ histogram: ColorHistogram) {
         curveView.histogram = histogram
+    }
+
+    func setWhiteBalanceSampling(_ sampling: Bool) {
+        whiteBalanceButton.title = sampling ? "取消" : "WB"
     }
 
     private func setup() {
@@ -365,13 +400,15 @@ final class ColorAdjustmentPanelController: NSWindowController {
         enabledButton.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         enabledButton.contentTintColor = .white
 
-        for button in [autoLevelsButton, resetButton] {
+        for button in [autoLevelsButton, whiteBalanceButton, resetButton] {
             button.bezelStyle = .rounded
             button.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
             button.contentTintColor = .white
         }
         autoLevelsButton.target = self
         autoLevelsButton.action = #selector(autoLevelsClicked)
+        whiteBalanceButton.target = self
+        whiteBalanceButton.action = #selector(whiteBalanceClicked)
         resetButton.target = self
         resetButton.action = #selector(resetClicked)
         curveView.onToneCurveChanged = { [weak self] toneCurve in
@@ -386,14 +423,14 @@ final class ColorAdjustmentPanelController: NSWindowController {
             separator.contentViewMargins = .zero
         }
 
-        [curveView, autoLevelsButton, separatorTone, separatorColor, separatorDetail, separatorReset, enabledButton, resetButton].forEach(rootView.addSubview)
+        [curveView, autoLevelsButton, whiteBalanceButton, separatorTone, separatorColor, separatorDetail, separatorReset, enabledButton, resetButton].forEach(rootView.addSubview)
 
         addRow("exposure", title: "Exposure:", value: 0, range: -2...2, left: .symbol("camera.aperture", .white), right: .symbol("camera.aperture", .white))
         addRow("contrast", title: "Contrast:", value: 0, range: -1...1, left: .colorDot(.black), right: .symbol("circle.lefthalf.filled", .white))
         addRow("brightness", title: "Brightness:", value: 0, range: -1...1, left: .symbol("sun.min", .systemYellow), right: .symbol("sun.max.fill", .systemYellow))
         addRow("saturation", title: "Saturation:", value: 0, range: -1...1, left: .grayscale, right: .rgb)
-        addRow("temperature", title: "Temp:", value: 0, range: -1...1, left: .symbol("thermometer.low", NSColor(calibratedRed: 0.68, green: 0.86, blue: 1, alpha: 1)), right: .symbol("thermometer.high", NSColor(calibratedRed: 1, green: 0.45, blue: 0.28, alpha: 1)))
-        addRow("tint", title: "Tint:", value: 0, range: -1...1, left: .colorDot(.systemGreen), right: .colorDot(.systemPink))
+        addRow("temperature", title: "Temp:", value: 0, range: ColorAdjustmentControlRanges.standardTemperatureTint, left: .symbol("thermometer.low", NSColor(calibratedRed: 0.68, green: 0.86, blue: 1, alpha: 1)), right: .symbol("thermometer.high", NSColor(calibratedRed: 1, green: 0.45, blue: 0.28, alpha: 1)))
+        addRow("tint", title: "Tint:", value: 0, range: ColorAdjustmentControlRanges.standardTemperatureTint, left: .colorDot(.systemGreen), right: .colorDot(.systemPink))
         addRow("sharpness", title: "Sharpness:", value: 0, range: 0...1, left: .symbol("square", .white), right: .symbol("square.fill", .white))
     }
 
@@ -401,6 +438,9 @@ final class ColorAdjustmentPanelController: NSWindowController {
         let row = NativeAdjustmentRowView(title: title, value: value, range: range, leftIcon: left, rightIcon: right)
         row.onValueChanged = { [weak self] newValue in
             self?.rowChanged(key: key, value: newValue)
+        }
+        row.onTrackingChanged = { [weak self] tracking in
+            self?.rowTrackingChanged(key: key, tracking: tracking)
         }
         rows[key] = row
         rootView.addSubview(row)
@@ -415,6 +455,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
         enabledButton.state = state.isEnabled ? .on : .off
         enabledButton.isEnabled = hasSlot
         autoLevelsButton.isEnabled = hasSlot && state.isEnabled
+        whiteBalanceButton.isEnabled = hasSlot && canWhiteBalance
         resetButton.isEnabled = hasSlot
         rows["exposure"]?.setValue(state.exposure)
         rows["contrast"]?.setValue(state.contrast)
@@ -429,6 +470,12 @@ final class ColorAdjustmentPanelController: NSWindowController {
         rootView.needsLayout = true
     }
 
+    private func updateTemperatureTintRanges(isRawImage: Bool) {
+        let range = isRawImage ? ColorAdjustmentControlRanges.rawTemperatureTint : ColorAdjustmentControlRanges.standardTemperatureTint
+        rows["temperature"]?.setRange(range)
+        rows["tint"]?.setRange(range)
+    }
+
     private func layoutControls() {
         let bounds = rootView.bounds
         let pad: CGFloat = 24
@@ -440,10 +487,11 @@ final class ColorAdjustmentPanelController: NSWindowController {
         layoutRows(["exposure", "contrast", "brightness"], startY: 232)
 
         separatorColor.frame = NSRect(x: pad - 8, y: 316, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
-        layoutRows(["saturation", "temperature", "tint"], startY: 332)
+        whiteBalanceButton.frame = NSRect(x: bounds.width - pad - 44, y: 322, width: 44, height: 22)
+        layoutRows(["saturation", "temperature", "tint"], startY: 352)
 
-        separatorDetail.frame = NSRect(x: pad - 8, y: 416, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
-        layoutRows(["sharpness"], startY: 432)
+        separatorDetail.frame = NSRect(x: pad - 8, y: 440, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
+        layoutRows(["sharpness"], startY: 456)
 
         let resetY = bounds.height - 32
         separatorReset.frame = NSRect(x: pad - 8, y: resetY - 16, width: max(100, bounds.width - (pad - 8) * 2), height: 1)
@@ -477,6 +525,11 @@ final class ColorAdjustmentPanelController: NSWindowController {
         onStateChanged?(state)
     }
 
+    @objc private func whiteBalanceClicked() {
+        guard currentSlot != nil, canWhiteBalance else { return }
+        onWhiteBalanceRequested?()
+    }
+
     @objc private func resetClicked() {
         guard currentSlot != nil else { return }
         onReset?()
@@ -496,6 +549,11 @@ final class ColorAdjustmentPanelController: NSWindowController {
         }
         curveView.adjustment = state
         onStateChanged?(state)
+    }
+
+    private func rowTrackingChanged(key: String, tracking: Bool) {
+        guard !isSyncing, currentSlot != nil, key == "temperature" || key == "tint" else { return }
+        onStateChangeTracking?(state, tracking)
     }
 }
 

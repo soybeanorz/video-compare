@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        Diagnostics.log("app.launch exe=\(Bundle.main.executableURL?.path ?? "unknown") bundle=\(Bundle.main.bundleURL.path)")
         let controller = MainWindowController()
         controller.showWindow(nil)
         windowController = controller

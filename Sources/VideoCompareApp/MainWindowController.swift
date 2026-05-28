@@ -405,6 +405,7 @@ final class MainWindowController: NSWindowController {
     private var synchronizedDebugFrameCount = 0
     private var colorAdjustmentA = ColorAdjustmentState()
     private var colorAdjustmentB = ColorAdjustmentState()
+    private var rawTemperatureTintTrackingSlots: Set<VideoSlot> = []
     private var colorHistogramA = ColorHistogram.empty
     private var colorHistogramB = ColorHistogram.empty
     private var lastPixelBufferA: CVPixelBuffer?
@@ -430,6 +431,7 @@ final class MainWindowController: NSWindowController {
     private var roiAlignmentGeneration = 0
     private var isROIAlignmentRunning = false
     private var transientMessageGeneration = 0
+    private var isWhiteBalanceSampling = false
     private static let loopPreviewFrameCount = 8
     private static let loopSeekTimeout: TimeInterval = 1.5
     private var selectedSlot: VideoSlot? {
@@ -733,6 +735,9 @@ final class MainWindowController: NSWindowController {
         canvas.onROIAlignmentRequested = { [weak self] slot, rect in
             self?.performROIAlignment(sourceSlot: slot, sourceCanvasRect: rect)
         }
+        canvas.onWhiteBalanceSampleRequested = { [weak self] slot, point in
+            self?.applyWhiteBalanceSample(slot: slot, canvasPoint: point)
+        }
         canvas.onToggleChanged = { [weak self] in
             self?.refreshStatus()
         }
@@ -991,7 +996,7 @@ final class MainWindowController: NSWindowController {
         let imageItem = NSMenuItem()
         mainMenu.addItem(imageItem)
         let imageMenu = NSMenu(title: "画面")
-        let colorItem = NSMenuItem(title: "调整选中视频...", action: #selector(openColorAdjustmentPanel), keyEquivalent: "c")
+        let colorItem = NSMenuItem(title: "调整选中视频...", action: #selector(openColorAdjustmentPanel(_:)), keyEquivalent: "c")
         colorItem.keyEquivalentModifierMask = [.command, .option]
         colorItem.target = self
         imageMenu.addItem(colorItem)
@@ -1342,11 +1347,13 @@ final class MainWindowController: NSWindowController {
         syncBaseTime = 0
         normalizedOffsetPair = nil
         clearSyncLoopRange()
+        cancelWhiteBalanceSampling()
         debugTimelineState("load.reset slot=\(slot.rawValue)")
         switch slot {
         case .a:
             canvas.containerA.showsPlaceholder = false
             colorAdjustmentA = ColorAdjustmentState()
+            rawTemperatureTintTrackingSlots.remove(.a)
             colorHistogramA = ColorHistogram.empty
             lastPixelBufferA = nil
             lastFrameTimeA = nil
@@ -1354,6 +1361,7 @@ final class MainWindowController: NSWindowController {
         case .b:
             canvas.containerB.showsPlaceholder = false
             colorAdjustmentB = ColorAdjustmentState()
+            rawTemperatureTintTrackingSlots.remove(.b)
             colorHistogramB = ColorHistogram.empty
             lastPixelBufferB = nil
             lastFrameTimeB = nil
@@ -1960,51 +1968,220 @@ final class MainWindowController: NSWindowController {
         playerB.setSubtitleLoadingDisabled(value)
     }
 
-    @objc private func openColorAdjustmentPanel() {
+    @objc func openColorAdjustmentPanel(_ sender: Any?) {
+        Diagnostics.log(
+            "colorPanel.open.begin sender=\(String(describing: sender.map { type(of: $0) })) " +
+            "exe=\(Bundle.main.executableURL?.path ?? "unknown") " +
+            "selected=\(selectedSlot?.rawValue ?? "nil") " +
+            "fileA=\(playerA.fileURL?.path ?? "nil") fileB=\(playerB.fileURL?.path ?? "nil") " +
+            "hasPanel=\(colorAdjustmentPanel != nil)"
+        )
+        if selectedSlot == nil {
+            if playerA.fileURL != nil {
+                selectedSlot = .a
+            } else if playerB.fileURL != nil {
+                selectedSlot = .b
+            }
+        }
         let panel = colorAdjustmentPanel ?? makeColorAdjustmentPanel()
         colorAdjustmentPanel = panel
+        refreshColorAdjustmentPanel()
+        NSApp.activate(ignoringOtherApps: true)
         panel.showWindow(nil)
         panel.window?.makeKeyAndOrderFront(nil)
-        refreshColorAdjustmentPanel()
+        panel.window?.orderFrontRegardless()
+        Diagnostics.log(
+            "colorPanel.open.end selected=\(selectedSlot?.rawValue ?? "nil") " +
+            "visible=\(panel.window?.isVisible ?? false) key=\(panel.window?.isKeyWindow ?? false)"
+        )
     }
 
     private func makeColorAdjustmentPanel() -> ColorAdjustmentPanelController {
+        Diagnostics.log("colorPanel.make.begin")
         let panel = ColorAdjustmentPanelController()
         panel.onStateChanged = { [weak self] state in
             guard let self, let slot = self.selectedSlot else { return }
             self.setColorAdjustment(state, slot: slot)
         }
+        panel.onStateChangeTracking = { [weak self] state, tracking in
+            guard let self, let slot = self.selectedSlot else { return }
+            self.setColorAdjustmentTracking(state, slot: slot, tracking: tracking)
+        }
         panel.onReset = { [weak self] in
             guard let self, let slot = self.selectedSlot else { return }
             self.setColorAdjustment(ColorAdjustmentState(), slot: slot)
         }
+        panel.onWhiteBalanceRequested = { [weak self] in
+            self?.toggleWhiteBalanceSampling()
+        }
+        Diagnostics.log("colorPanel.make.end window=\(panel.window != nil)")
         return panel
     }
 
     private func setColorAdjustment(_ adjustment: ColorAdjustmentState, slot: VideoSlot) {
-        guard colorAdjustment(for: slot) != adjustment else { return }
-        if !isApplyingPreviewHistory {
+        let deferRawCommit = isRawImageLoaded(in: slot) && rawTemperatureTintTrackingSlots.contains(slot)
+        setColorAdjustment(adjustment, slot: slot, rawPreview: deferRawCommit, forceRawReload: false)
+    }
+
+    private func setColorAdjustmentTracking(_ adjustment: ColorAdjustmentState, slot: VideoSlot, tracking: Bool) {
+        guard isRawImageLoaded(in: slot) else { return }
+        if tracking {
+            rawTemperatureTintTrackingSlots.insert(slot)
+            return
+        }
+        rawTemperatureTintTrackingSlots.remove(slot)
+        setColorAdjustment(adjustment, slot: slot, rawPreview: false, forceRawReload: true)
+    }
+
+    private func setColorAdjustment(_ adjustment: ColorAdjustmentState, slot: VideoSlot, rawPreview: Bool, forceRawReload: Bool) {
+        let previous = colorAdjustment(for: slot)
+        let changed = previous != adjustment
+        let rawTemperatureTintChanged = previous.temperature != adjustment.temperature || previous.tint != adjustment.tint
+        guard changed || forceRawReload else { return }
+        if changed && !isApplyingPreviewHistory {
             beginPreviewUndoGroup()
         }
-        switch slot {
-        case .a:
-            colorAdjustmentA = adjustment
-            canvas.renderer.colorAdjustmentA = adjustment
-        case .b:
-            colorAdjustmentB = adjustment
-            canvas.renderer.colorAdjustmentB = adjustment
+        if changed {
+            switch slot {
+            case .a:
+                colorAdjustmentA = adjustment
+                canvas.renderer.colorAdjustmentA = rendererColorAdjustment(for: .a)
+            case .b:
+                colorAdjustmentB = adjustment
+                canvas.renderer.colorAdjustmentB = rendererColorAdjustment(for: .b)
+            }
+        }
+        if isRawImageLoaded(in: slot), rawTemperatureTintChanged || forceRawReload {
+            reloadRawStaticImageIfNeeded(slot: slot, adjustment: adjustment, preview: rawPreview)
         }
         refreshHistogramForCurrentFrame(slot: slot)
         refreshColorAdjustmentPanel()
-        if !isApplyingPreviewHistory {
+        if changed && !isApplyingPreviewHistory {
             schedulePreviewUndoCommit()
         }
     }
 
     private func applyColorAdjustmentsToRenderer() {
-        canvas.renderer.colorAdjustmentA = colorAdjustmentA
-        canvas.renderer.colorAdjustmentB = colorAdjustmentB
+        canvas.renderer.colorAdjustmentA = rendererColorAdjustment(for: .a)
+        canvas.renderer.colorAdjustmentB = rendererColorAdjustment(for: .b)
         canvas.renderer.originalBypassSlot = originalBypassSlot
+    }
+
+    private func rendererColorAdjustment(for slot: VideoSlot) -> ColorAdjustmentState {
+        let adjustment = colorAdjustment(for: slot)
+        guard isRawImageLoaded(in: slot) else {
+            return adjustment
+        }
+        var rendererAdjustment = adjustment
+        rendererAdjustment.temperature = 0
+        rendererAdjustment.tint = 0
+        return rendererAdjustment
+    }
+
+    private func reloadRawStaticImageIfNeeded(slot: VideoSlot, adjustment: ColorAdjustmentState, preview: Bool = false) {
+        guard isRawImageLoaded(in: slot) else { return }
+        let player = slot == .a ? playerA! : playerB!
+        player.reloadStaticImage(rawAdjustment: adjustment, preview: preview) { [weak self] ok in
+            guard let self else { return }
+            if ok {
+                self.applyColorAdjustmentsToRenderer()
+                self.refreshHistogramForCurrentFrame(slot: slot)
+            } else if !preview {
+                self.showTransientMessage("该 RAW 文件不支持解码级调色")
+            }
+        }
+    }
+
+    private func toggleWhiteBalanceSampling() {
+        if isWhiteBalanceSampling {
+            cancelWhiteBalanceSampling()
+            return
+        }
+        guard let selectedSlot, pixelBuffer(for: selectedSlot) != nil else {
+            showTransientMessage("请先选择有画面的 A/B")
+            return
+        }
+        isWhiteBalanceSampling = true
+        canvas.isWhiteBalanceSampling = true
+        colorAdjustmentPanel?.setWhiteBalanceSampling(true)
+        showTransientMessage("点击画面中的白色或中性灰区域")
+    }
+
+    private func cancelWhiteBalanceSampling() {
+        guard isWhiteBalanceSampling else { return }
+        isWhiteBalanceSampling = false
+        canvas.isWhiteBalanceSampling = false
+        colorAdjustmentPanel?.setWhiteBalanceSampling(false)
+    }
+
+    private func applyWhiteBalanceSample(slot: VideoSlot, canvasPoint: NSPoint) {
+        guard isWhiteBalanceSampling else { return }
+        selectedSlot = slot
+        guard let pixelBuffer = pixelBuffer(for: slot) else {
+            showTransientMessage("当前画面不可取样")
+            return
+        }
+        guard let pixelPoint = pixelPoint(for: canvasPoint, slot: slot, pixelBuffer: pixelBuffer) else {
+            showTransientMessage("请点击画面内容区域")
+            return
+        }
+        guard let sample = Self.sampleRGB(pixelBuffer: pixelBuffer, center: pixelPoint, radius: 7) else {
+            showTransientMessage("取样失败，请换一个位置")
+            return
+        }
+        let range = isRawImageLoaded(in: slot)
+            ? ColorAdjustmentControlRanges.rawTemperatureTint
+            : ColorAdjustmentControlRanges.standardTemperatureTint
+        var adjustment = colorAdjustment(for: slot)
+        guard let correction = WhiteBalanceSolver.temperatureTintCorrection(
+            sample: sample,
+            baseAdjustment: adjustment,
+            range: range
+        ) else {
+            showTransientMessage("取样区域不适合白平衡")
+            return
+        }
+        adjustment.isEnabled = true
+        adjustment.temperature = correction.temperature
+        adjustment.tint = correction.tint
+        setColorAdjustment(adjustment, slot: slot)
+        cancelWhiteBalanceSampling()
+        showTransientMessage("已应用取色白平衡")
+    }
+
+    private func pixelBuffer(for slot: VideoSlot) -> CVPixelBuffer? {
+        switch slot {
+        case .a: lastPixelBufferA
+        case .b: lastPixelBufferB
+        }
+    }
+
+    private func transform(for slot: VideoSlot) -> TransformState {
+        switch slot {
+        case .a: syncState.transformA
+        case .b: syncState.transformB
+        }
+    }
+
+    private func pixelPoint(for canvasPoint: NSPoint, slot: VideoSlot, pixelBuffer: CVPixelBuffer) -> CGPoint? {
+        let contentRect = canvas.videoRect(for: slot)
+        let videoRect = Self.displayedVideoRect(
+            pixelBuffer: pixelBuffer,
+            transform: transform(for: slot),
+            contentRect: contentRect
+        )
+        guard videoRect.width > 0,
+              videoRect.height > 0,
+              videoRect.contains(CGPoint(x: canvasPoint.x, y: canvasPoint.y)) else {
+            return nil
+        }
+        let width = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+        let height = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        guard width > 0, height > 0 else { return nil }
+        return CGPoint(
+            x: min(width - 1, max(0, (canvasPoint.x - videoRect.minX) / videoRect.width * width)),
+            y: min(height - 1, max(0, (canvasPoint.y - videoRect.minY) / videoRect.height * height))
+        )
     }
 
     private func currentPreviewEditState() -> PreviewEditState {
@@ -2082,6 +2259,8 @@ final class MainWindowController: NSWindowController {
         playerA.applyTransform(syncState.transformA)
         playerB.applyTransform(syncState.transformB)
         applyColorAdjustmentsToRenderer()
+        reloadRawStaticImageIfNeeded(slot: .a, adjustment: colorAdjustmentA)
+        reloadRawStaticImageIfNeeded(slot: .b, adjustment: colorAdjustmentB)
         refreshHistogramForCurrentFrame(slot: .a)
         refreshHistogramForCurrentFrame(slot: .b)
         refreshColorAdjustmentPanel()
@@ -2588,7 +2767,26 @@ final class MainWindowController: NSWindowController {
         }
     }
 
+    private func isRawImageLoaded(in slot: VideoSlot?) -> Bool {
+        switch slot {
+        case .a:
+            guard let url = playerA.fileURL else { return false }
+            return MediaFileSupport.isRawImage(url)
+        case .b:
+            guard let url = playerB.fileURL else { return false }
+            return MediaFileSupport.isRawImage(url)
+        case nil:
+            return false
+        }
+    }
+
+    private func canWhiteBalanceLoaded(in slot: VideoSlot?) -> Bool {
+        guard let slot else { return false }
+        return pixelBuffer(for: slot) != nil
+    }
+
     private func refreshColorAdjustmentPanel() {
+        let isRawImage = isRawImageLoaded(in: selectedSlot)
         if let selectedSlot {
             refreshHistogramForCurrentFrame(slot: selectedSlot)
         }
@@ -2596,7 +2794,9 @@ final class MainWindowController: NSWindowController {
         colorAdjustmentPanel.update(
             slot: selectedSlot,
             state: colorAdjustment(for: selectedSlot),
-            histogram: histogram(for: selectedSlot)
+            histogram: histogram(for: selectedSlot),
+            isRawImage: isRawImage,
+            canWhiteBalance: canWhiteBalanceLoaded(in: selectedSlot)
         )
     }
 
@@ -2621,7 +2821,7 @@ final class MainWindowController: NSWindowController {
     private func scheduleHistogramSample(slot: VideoSlot, pixelBuffer: CVPixelBuffer, updatePanelState: Bool) {
         colorHistogramGeneration += 1
         let generation = colorHistogramGeneration
-        let adjustment = colorAdjustment(for: slot)
+        let adjustment = rendererColorAdjustment(for: slot)
         colorHistogramWorker.sample(slot: slot, generation: generation, pixelBuffer: pixelBuffer, adjustment: adjustment) { [weak self] result in
             guard let self,
                   result.generation == self.colorHistogramGeneration,
@@ -2635,12 +2835,100 @@ final class MainWindowController: NSWindowController {
                 self.colorAdjustmentPanel?.update(
                     slot: self.selectedSlot,
                     state: self.colorAdjustment(for: self.selectedSlot),
-                    histogram: self.histogram(for: self.selectedSlot)
+                    histogram: self.histogram(for: self.selectedSlot),
+                    isRawImage: self.isRawImageLoaded(in: self.selectedSlot),
+                    canWhiteBalance: self.canWhiteBalanceLoaded(in: self.selectedSlot)
                 )
             } else {
                 self.colorAdjustmentPanel?.updateHistogram(result.histogram)
             }
         }
+    }
+
+    nonisolated private static func sampleRGB(pixelBuffer: CVPixelBuffer, center: CGPoint, radius: Int) -> WhiteBalanceSolver.RGBSample? {
+        let lockResult = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        guard lockResult == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0 else { return nil }
+        let centerX = min(width - 1, max(0, Int(center.x.rounded())))
+        let centerY = min(height - 1, max(0, Int(center.y.rounded())))
+        let xRange = max(0, centerX - radius)...min(width - 1, centerX + radius)
+        let yRange = max(0, centerY - radius)...min(height - 1, centerY + radius)
+        var red: [Double] = []
+        var green: [Double] = []
+        var blue: [Double] = []
+        let sampleCapacity = xRange.count * yRange.count
+        red.reserveCapacity(sampleCapacity)
+        green.reserveCapacity(sampleCapacity)
+        blue.reserveCapacity(sampleCapacity)
+
+        func append(r: Double, g: Double, b: Double) {
+            red.append(r)
+            green.append(g)
+            blue.append(b)
+        }
+
+        if CVPixelBufferGetPlaneCount(pixelBuffer) >= 2,
+           let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) {
+            let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+            let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+            if pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange {
+                let pointer = base.assumingMemoryBound(to: UInt16.self)
+                let rowStride = max(1, bytesPerRow / MemoryLayout<UInt16>.stride)
+                for y in yRange {
+                    for x in xRange {
+                        let raw = pointer[y * rowStride + x]
+                        let tenBit = raw > 1023 ? raw >> 6 : raw
+                        let yValue = normalizedVideoLuma(Double(tenBit), maxValue: 1023, fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+                        let uv = sampleUV(pixelBuffer: pixelBuffer, sourceX: x, sourceY: y, is10Bit: true, fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+                        let rgb = yuvToRGB(y: yValue, cb: uv.cb, cr: uv.cr)
+                        append(r: rgb.r, g: rgb.g, b: rgb.b)
+                    }
+                }
+            } else {
+                let pointer = base.assumingMemoryBound(to: UInt8.self)
+                for y in yRange {
+                    for x in xRange {
+                        let yValue = normalizedVideoLuma(Double(pointer[y * bytesPerRow + x]), maxValue: 255, fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+                        let uv = sampleUV(pixelBuffer: pixelBuffer, sourceX: x, sourceY: y, is10Bit: false, fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+                        let rgb = yuvToRGB(y: yValue, cb: uv.cb, cr: uv.cr)
+                        append(r: rgb.r, g: rgb.g, b: rgb.b)
+                    }
+                }
+            }
+        } else if let base = CVPixelBufferGetBaseAddress(pixelBuffer) {
+            let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+            let pointer = base.assumingMemoryBound(to: UInt8.self)
+            for y in yRange {
+                for x in xRange {
+                    let offset = y * bytesPerRow + x * 4
+                    append(
+                        r: Double(pointer[offset + 2]) / 255.0,
+                        g: Double(pointer[offset + 1]) / 255.0,
+                        b: Double(pointer[offset]) / 255.0
+                    )
+                }
+            }
+        }
+
+        guard red.count >= 9 else { return nil }
+        return WhiteBalanceSolver.RGBSample(
+            r: trimmedMean(red),
+            g: trimmedMean(green),
+            b: trimmedMean(blue)
+        )
+    }
+
+    nonisolated private static func trimmedMean(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let trim = min(sorted.count / 5, max(0, (sorted.count - 1) / 2))
+        let kept = sorted[trim..<(sorted.count - trim)]
+        return kept.reduce(0, +) / Double(kept.count)
     }
 
     nonisolated private static func sampleColorHistogram(pixelBuffer: CVPixelBuffer, adjustment: ColorAdjustmentState) -> ColorHistogram {
@@ -3252,13 +3540,17 @@ final class MainWindowController: NSWindowController {
             }
             return false
         }
+        if event.keyCode == 53, isWhiteBalanceSampling {
+            cancelWhiteBalanceSampling()
+            return true
+        }
 
         if let key = event.charactersIgnoringModifiers?.lowercased() {
             let commandOption = event.modifierFlags.contains(.command)
                 && event.modifierFlags.contains(.option)
                 && event.modifierFlags.intersection([.control]).isEmpty
             if commandOption, key == "c" {
-                openColorAdjustmentPanel()
+                openColorAdjustmentPanel(nil)
                 return true
             }
 

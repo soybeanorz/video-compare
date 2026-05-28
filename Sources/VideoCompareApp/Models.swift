@@ -215,6 +215,86 @@ struct ColorAdjustmentState: Equatable {
     }
 }
 
+enum ColorAdjustmentControlRanges {
+    static let standardTemperatureTint: ClosedRange<Double> = -1...1
+    static let rawTemperatureTint: ClosedRange<Double> = -1...1
+}
+
+struct RawNeutralDefaults: Equatable {
+    var temperature: Double
+    var tint: Double
+}
+
+enum RawTemperatureTintMapper {
+    static let temperatureDelta: Double = 8000
+    static let tintDelta: Double = 300
+    static let temperatureBounds: ClosedRange<Double> = 1500...50000
+    static let tintBounds: ClosedRange<Double> = -1000...1000
+
+    static func mappedNeutral(defaults: RawNeutralDefaults, adjustment: ColorAdjustmentState) -> RawNeutralDefaults {
+        RawNeutralDefaults(
+            temperature: clamp(defaults.temperature + adjustment.temperature * temperatureDelta, to: temperatureBounds),
+            tint: clamp(defaults.tint + adjustment.tint * tintDelta, to: tintBounds)
+        )
+    }
+
+    static func uiAdjustment(defaults: RawNeutralDefaults, neutral: RawNeutralDefaults) -> (temperature: Double, tint: Double) {
+        (
+            clamp((neutral.temperature - defaults.temperature) / temperatureDelta, to: ColorAdjustmentControlRanges.rawTemperatureTint),
+            clamp((neutral.tint - defaults.tint) / tintDelta, to: ColorAdjustmentControlRanges.rawTemperatureTint)
+        )
+    }
+
+    private static func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
+        min(range.upperBound, max(range.lowerBound, value))
+    }
+}
+
+enum WhiteBalanceSolver {
+    struct RGBSample: Equatable {
+        var r: Double
+        var g: Double
+        var b: Double
+    }
+
+    static func temperatureTintCorrection(
+        sample: RGBSample,
+        baseAdjustment: ColorAdjustmentState,
+        range: ClosedRange<Double>
+    ) -> (temperature: Double, tint: Double)? {
+        guard sample.r.isFinite, sample.g.isFinite, sample.b.isFinite else { return nil }
+        let preprocessed = preprocess(sample: sample, adjustment: baseAdjustment)
+        let luma = preprocessed.r * 0.2126 + preprocessed.g * 0.7152 + preprocessed.b * 0.0722
+        guard luma >= 0.04, luma <= 0.96 else { return nil }
+        guard !isUnreliablePureColor(preprocessed) else { return nil }
+
+        let temperature = (preprocessed.b - preprocessed.r) / 0.16
+        let tint = (2 * preprocessed.g - preprocessed.r - preprocessed.b) / 0.18
+        return (
+            min(range.upperBound, max(range.lowerBound, temperature)),
+            min(range.upperBound, max(range.lowerBound, tint))
+        )
+    }
+
+    private static func preprocess(sample: RGBSample, adjustment: ColorAdjustmentState) -> RGBSample {
+        var r = sample.r * pow(2, adjustment.exposure) + adjustment.brightness * 0.35
+        var g = sample.g * pow(2, adjustment.exposure) + adjustment.brightness * 0.35
+        var b = sample.b * pow(2, adjustment.exposure) + adjustment.brightness * 0.35
+
+        let contrast = 1 + adjustment.contrast * 1.5
+        r = (r - 0.5) * contrast + 0.5
+        g = (g - 0.5) * contrast + 0.5
+        b = (b - 0.5) * contrast + 0.5
+        return RGBSample(r: r, g: g, b: b)
+    }
+
+    private static func isUnreliablePureColor(_ sample: RGBSample) -> Bool {
+        let channels = [sample.r, sample.g, sample.b]
+        guard let minChannel = channels.min(), let maxChannel = channels.max() else { return true }
+        return minChannel < 0.025 && maxChannel > 0.85
+    }
+}
+
 struct ColorHistogram: Equatable {
     var red: [Double] = ColorAdjustmentState.defaultHistogram()
     var green: [Double] = ColorAdjustmentState.defaultHistogram()
