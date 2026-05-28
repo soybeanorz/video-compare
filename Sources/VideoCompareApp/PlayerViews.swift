@@ -223,7 +223,10 @@ final class VideoCanvasView: NSView {
             if isWhiteBalanceSampling {
                 updateWhiteBalanceCursorFromCurrentMouseLocation()
             } else {
-                NSCursor.arrow.set()
+                restoreDefaultCursorFromCurrentMouseLocation()
+                DispatchQueue.main.async { [weak self] in
+                    self?.restoreDefaultCursorFromCurrentMouseLocation()
+                }
             }
         }
     }
@@ -315,7 +318,7 @@ final class VideoCanvasView: NSView {
         if isWhiteBalanceSampling {
             updateWhiteBalanceCursor(with: event)
         } else {
-            super.cursorUpdate(with: event)
+            restoreDefaultCursor(with: event)
         }
     }
 
@@ -323,6 +326,7 @@ final class VideoCanvasView: NSView {
         if isWhiteBalanceSampling {
             updateWhiteBalanceCursor(with: event)
         } else {
+            restoreDefaultCursor(with: event)
             super.mouseEntered(with: event)
         }
     }
@@ -331,6 +335,7 @@ final class VideoCanvasView: NSView {
         if isWhiteBalanceSampling {
             updateWhiteBalanceCursor(with: event)
         } else {
+            restoreDefaultCursor(with: event)
             super.mouseMoved(with: event)
         }
     }
@@ -339,6 +344,7 @@ final class VideoCanvasView: NSView {
         if isWhiteBalanceSampling {
             NSCursor.arrow.set()
         } else {
+            NSCursor.arrow.set()
             super.mouseExited(with: event)
         }
     }
@@ -352,9 +358,6 @@ final class VideoCanvasView: NSView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        if isWhiteBalanceSampling {
-            addCursorRect(activeContentBounds(), cursor: WhiteBalanceCursorFactory.cursor())
-        }
     }
 
     private func updateWhiteBalanceCursor(with event: NSEvent) {
@@ -367,6 +370,24 @@ final class VideoCanvasView: NSView {
             return
         }
         updateWhiteBalanceCursor(at: convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+
+    private func restoreDefaultCursor(with event: NSEvent) {
+        restoreDefaultCursor(at: convert(event.locationInWindow, from: nil))
+    }
+
+    private func restoreDefaultCursorFromCurrentMouseLocation() {
+        guard let window else {
+            NSCursor.arrow.set()
+            return
+        }
+        restoreDefaultCursor(at: convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+
+    private func restoreDefaultCursor(at point: NSPoint) {
+        if bounds.contains(point), activeContentBounds().contains(point), slot(at: point) != nil {
+            NSCursor.arrow.set()
+        }
     }
 
     private func updateWhiteBalanceCursor(at point: NSPoint) {
@@ -459,6 +480,7 @@ final class VideoCanvasView: NSView {
             updateWhiteBalanceCursor(at: point)
             return
         }
+        restoreDefaultCursor(at: point)
         let wantsROISelection = event.modifierFlags.contains(.control)
         if wantsROISelection,
            layoutMode == .overlapWipe,

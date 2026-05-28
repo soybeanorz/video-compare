@@ -41,10 +41,61 @@ private enum EndpointIcon {
 private final class TrackingSlider: NSSlider {
     var onTrackingChanged: ((Bool) -> Void)?
 
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        cell = ThinSliderCell()
+    }
+
+    convenience init(value: Double, minValue: Double, maxValue: Double, target: AnyObject?, action: Selector?) {
+        self.init(frame: .zero)
+        self.minValue = minValue
+        self.maxValue = maxValue
+        self.doubleValue = value
+        self.target = target
+        self.action = action
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        cell = ThinSliderCell()
+    }
+
     override func mouseDown(with event: NSEvent) {
         onTrackingChanged?(true)
         super.mouseDown(with: event)
         onTrackingChanged?(false)
+    }
+}
+
+private final class ThinSliderCell: NSSliderCell {
+    private let knobSize = NSSize(width: 5, height: 18)
+
+    override func knobRect(flipped: Bool) -> NSRect {
+        let base = super.knobRect(flipped: flipped)
+        return NSRect(
+            x: base.midX - knobSize.width / 2,
+            y: base.midY - knobSize.height / 2,
+            width: knobSize.width,
+            height: knobSize.height
+        )
+    }
+
+    override func drawKnob(_ knobRect: NSRect) {
+        let rect = knobRect.insetBy(dx: 0, dy: 0.5)
+        let fill: NSColor
+        if !isEnabled {
+            fill = NSColor(calibratedWhite: 0.82, alpha: 0.70)
+        } else if isHighlighted {
+            fill = NSColor(calibratedWhite: 0.96, alpha: 1)
+        } else {
+            fill = NSColor.white
+        }
+        fill.setFill()
+        let path = NSBezierPath(roundedRect: rect, xRadius: rect.width / 2, yRadius: rect.width / 2)
+        path.fill()
+        NSColor(calibratedWhite: 0.42, alpha: isEnabled ? 0.35 : 0.18).setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
     }
 }
 
@@ -532,7 +583,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
         let hasSlot = currentSlot != nil
         window?.title = currentSlot.map { "Adjust Color - \($0.rawValue.uppercased())" } ?? "Adjust Color"
         curveView.showsHistogramBars = hasSlot
-        curveView.isInteractive = hasSlot && state.isEnabled
+        curveView.isInteractive = hasSlot
         enabledButton.state = state.isEnabled ? .on : .off
         enabledButton.isEnabled = hasSlot
         whiteBalanceButton.isEnabled = hasSlot && canWhiteBalance
@@ -545,7 +596,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
         rows["tint"]?.setValue(state.tint)
         rows["sharpness"]?.setValue(state.sharpness)
         curveView.adjustment = state
-        rows.values.forEach { $0.rowEnabled = hasSlot && state.isEnabled }
+        rows.values.forEach { $0.rowEnabled = hasSlot }
         isSyncing = false
         rootView.needsLayout = true
     }
@@ -610,8 +661,6 @@ final class ColorAdjustmentPanelController: NSWindowController {
         guard !isSyncing, currentSlot != nil else { return }
         state.isEnabled = enabledButton.state == .on
         curveView.adjustment = state
-        curveView.isInteractive = state.isEnabled
-        rows.values.forEach { $0.rowEnabled = state.isEnabled }
         onStateChanged?(state)
     }
 

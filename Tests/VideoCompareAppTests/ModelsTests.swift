@@ -33,6 +33,11 @@ struct ModelsTests {
         #expect(!snapshot.isStaticImage)
     }
 
+    @Test func colorHistogramUsesExpandedBinCount() {
+        #expect(ColorAdjustmentState.histogramBinCount == 128)
+        #expect(ColorAdjustmentState.defaultHistogram().count == 128)
+    }
+
     @Test func dngIsSupportedAsStaticImage() {
         #expect(MediaFileSupport.isSupportedExtension("dng"))
         #expect(MediaFileSupport.isSupportedExtension("DNG"))
@@ -188,6 +193,10 @@ struct ModelsTests {
             defaults: defaults,
             adjustment: ColorAdjustmentState(temperature: 10, tint: -10)
         )
+        let disabled = RawTemperatureTintMapper.mappedNeutral(
+            defaults: defaults,
+            adjustment: ColorAdjustmentState(isEnabled: false, temperature: 0.5, tint: -0.25)
+        )
 
         #expect(mapped.temperature == 10500)
         #expect(mapped.tint == -65)
@@ -195,6 +204,7 @@ struct ModelsTests {
         #expect(abs(ui.tint + 0.25) <= 0.0001)
         #expect(clamped.temperature == RawTemperatureTintMapper.temperatureBounds.upperBound)
         #expect(clamped.tint == RawTemperatureTintMapper.tintBounds.lowerBound)
+        #expect(disabled == defaults)
     }
 
 }

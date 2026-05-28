@@ -229,7 +229,7 @@ struct ColorAdjustmentState: Equatable {
         self.toneCurveLUT = toneCurve.makeLUT()
     }
 
-    static let histogramBinCount = 64
+    static let histogramBinCount = 128
 
     static func defaultHistogram() -> [Double] {
         Array(repeating: 0, count: histogramBinCount)
@@ -265,7 +265,10 @@ enum RawTemperatureTintMapper {
     static let tintBounds: ClosedRange<Double> = -1000...1000
 
     static func mappedNeutral(defaults: RawNeutralDefaults, adjustment: ColorAdjustmentState) -> RawNeutralDefaults {
-        RawNeutralDefaults(
+        guard adjustment.isEnabled else {
+            return defaults
+        }
+        return RawNeutralDefaults(
             temperature: clamp(defaults.temperature + adjustment.temperature * temperatureDelta, to: temperatureBounds),
             tint: clamp(defaults.tint + adjustment.tint * tintDelta, to: tintBounds)
         )

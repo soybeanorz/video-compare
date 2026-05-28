@@ -2049,6 +2049,7 @@ final class MainWindowController: NSWindowController {
         let previous = colorAdjustment(for: slot)
         let changed = previous != adjustment
         let rawTemperatureTintChanged = previous.temperature != adjustment.temperature || previous.tint != adjustment.tint
+        let rawDecodeAdjustmentChanged = previous.isEnabled != adjustment.isEnabled || (adjustment.isEnabled && rawTemperatureTintChanged)
         guard changed || forceRawReload else { return }
         if changed && !isApplyingPreviewHistory {
             beginPreviewUndoGroup()
@@ -2063,7 +2064,7 @@ final class MainWindowController: NSWindowController {
                 canvas.renderer.colorAdjustmentB = rendererColorAdjustment(for: .b)
             }
         }
-        if isRawImageLoaded(in: slot), rawTemperatureTintChanged || forceRawReload {
+        if isRawImageLoaded(in: slot), rawDecodeAdjustmentChanged || forceRawReload {
             reloadRawStaticImageIfNeeded(slot: slot, adjustment: adjustment, preview: rawPreview)
         }
         refreshHistogramForCurrentFrame(slot: slot)
@@ -2172,15 +2173,18 @@ final class MainWindowController: NSWindowController {
         }
         let player = request.slot == .a ? playerA! : playerB!
         let baseAdjustment = colorAdjustment(for: request.slot)
-        let preferredAdjustment = lastRawWhiteBalancePreview?.slot == request.slot
+        var solvingBaseAdjustment = baseAdjustment
+        solvingBaseAdjustment.isEnabled = true
+        var preferredAdjustment = lastRawWhiteBalancePreview?.slot == request.slot
             ? lastRawWhiteBalancePreview?.adjustment
-            : baseAdjustment
+            : solvingBaseAdjustment
+        preferredAdjustment?.isEnabled = true
         let searchMode: RawWhiteBalanceSearchMode = .finalCommit
         let started = CACurrentMediaTime()
         rawWhiteBalanceIsSolving = true
         player.solveRawWhiteBalance(
             canvasPixelPoint: pixelPoint,
-            baseAdjustment: baseAdjustment,
+            baseAdjustment: solvingBaseAdjustment,
             preferredAdjustment: preferredAdjustment,
             searchMode: searchMode,
             sampleRadius: 7
@@ -2202,7 +2206,6 @@ final class MainWindowController: NSWindowController {
                 return
             }
             var adjustment = self.colorAdjustment(for: request.slot)
-            adjustment.isEnabled = true
             adjustment.temperature = result.adjustmentTemperature
             adjustment.tint = result.adjustmentTint
             self.lastRawWhiteBalancePreview = (request.slot, adjustment)
@@ -2211,7 +2214,7 @@ final class MainWindowController: NSWindowController {
                 slot: request.slot,
                 commitFullResolution: true
             )
-            self.showTransientMessage("已应用 RAW 取色白平衡，可继续点击取样")
+            self.showTransientMessage(adjustment.isEnabled ? "已应用 RAW 取色白平衡，可继续点击取样" : "已记录 RAW 取色白平衡，勾选启用后应用")
             self.lastRawWhiteBalancePreview = nil
         }
     }
@@ -2230,10 +2233,12 @@ final class MainWindowController: NSWindowController {
         if isRawImageLoaded(in: slot) {
             let player = slot == .a ? playerA! : playerB!
             let baseAdjustment = colorAdjustment(for: slot)
+            var solvingBaseAdjustment = baseAdjustment
+            solvingBaseAdjustment.isEnabled = true
             showTransientMessage("正在计算 RAW 白平衡...")
             player.solveRawWhiteBalance(
                 canvasPixelPoint: pixelPoint,
-                baseAdjustment: baseAdjustment,
+                baseAdjustment: solvingBaseAdjustment,
                 sampleRadius: 7
             ) { [weak self] result in
                 guard let self else { return }
@@ -2243,11 +2248,10 @@ final class MainWindowController: NSWindowController {
                     return
                 }
                 var adjustment = self.colorAdjustment(for: slot)
-                adjustment.isEnabled = true
                 adjustment.temperature = result.adjustmentTemperature
                 adjustment.tint = result.adjustmentTint
                 self.applyRawWhiteBalanceAdjustment(adjustment, slot: slot)
-                self.showTransientMessage("已应用 RAW 取色白平衡，可继续点击取样")
+                self.showTransientMessage(adjustment.isEnabled ? "已应用 RAW 取色白平衡，可继续点击取样" : "已记录 RAW 取色白平衡，勾选启用后应用")
             }
             return
         }
@@ -2265,11 +2269,10 @@ final class MainWindowController: NSWindowController {
             showTransientMessage("取样区域不适合白平衡")
             return
         }
-        adjustment.isEnabled = true
         adjustment.temperature = correction.temperature
         adjustment.tint = correction.tint
         setColorAdjustment(adjustment, slot: slot)
-        showTransientMessage("已应用取色白平衡，可继续点击取样")
+        showTransientMessage(adjustment.isEnabled ? "已应用取色白平衡，可继续点击取样" : "已记录取色白平衡，勾选启用后应用")
     }
 
     private func applyRawWhiteBalanceAdjustment(_ adjustment: ColorAdjustmentState, slot: VideoSlot, commitFullResolution: Bool = true) {
@@ -2293,6 +2296,8 @@ final class MainWindowController: NSWindowController {
                 schedulePreviewUndoCommit()
             }
         }
+
+        guard adjustment.isEnabled else { return }
 
         let player = slot == .a ? playerA! : playerB!
         let previewStarted = CACurrentMediaTime()
@@ -3114,8 +3119,8 @@ final class MainWindowController: NSWindowController {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         guard width > 0, height > 0 else { return .empty }
-        let stepX = max(1, width / 128)
-        let stepY = max(1, height / 72)
+        let stepX = max(1, width / 181)
+        let stepY = max(1, height / 102)
         var samples = 0.0
 
         func addRGB(r: Double, g: Double, b: Double) {
