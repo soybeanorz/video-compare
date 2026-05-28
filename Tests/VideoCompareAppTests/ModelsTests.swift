@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import VideoCompareApp
@@ -107,6 +108,73 @@ struct ModelsTests {
 
         #expect(dark == nil)
         #expect(pureColor == nil)
+    }
+
+    @Test func rawWhiteBalanceEvaluatorScoresNeutralCandidateLower() {
+        let greenCast = WhiteBalanceSolver.RGBSample(r: 0.35, g: 0.62, b: 0.36)
+        let neutral = WhiteBalanceSolver.RGBSample(r: 0.45, g: 0.46, b: 0.45)
+
+        #expect(RawWhiteBalanceEvaluator.isValidSample(greenCast))
+        #expect(RawWhiteBalanceEvaluator.isValidSample(neutral))
+        #expect(RawWhiteBalanceEvaluator.neutralError(neutral) < RawWhiteBalanceEvaluator.neutralError(greenCast))
+    }
+
+    @Test func rawWhiteBalanceEvaluatorRejectsInvalidSamples() {
+        #expect(!RawWhiteBalanceEvaluator.isValidSample(.init(r: 0.01, g: 0.01, b: 0.01)))
+        #expect(!RawWhiteBalanceEvaluator.isValidSample(.init(r: 0.99, g: 0.99, b: 0.99)))
+        #expect(!RawWhiteBalanceEvaluator.isValidSample(.init(r: 0.95, g: 0.01, b: 0.01)))
+    }
+
+    @Test func rawWhiteBalancePatchClampsAtImageEdges() throws {
+        let imageSize = CGSize(width: 400, height: 300)
+        let topLeft = try #require(RawWhiteBalanceEvaluator.samplePatch(center: CGPoint(x: 4, y: 5), imageSize: imageSize, patchSize: 64))
+        let bottomRight = try #require(RawWhiteBalanceEvaluator.samplePatch(center: CGPoint(x: 398, y: 299), imageSize: imageSize, patchSize: 64))
+        let center = try #require(RawWhiteBalanceEvaluator.samplePatch(center: CGPoint(x: 200, y: 150), imageSize: imageSize, patchSize: 64))
+
+        #expect(topLeft.rect.origin == .zero)
+        #expect(topLeft.samplePoint == CGPoint(x: 4, y: 5))
+        #expect(bottomRight.rect.maxX == imageSize.width)
+        #expect(bottomRight.rect.maxY == imageSize.height)
+        #expect(bottomRight.samplePoint.x <= bottomRight.rect.width)
+        #expect(bottomRight.samplePoint.y <= bottomRight.rect.height)
+        #expect(center.rect == CGRect(x: 168, y: 118, width: 64, height: 64))
+        #expect(center.samplePoint == CGPoint(x: 32, y: 32))
+    }
+
+    @Test func rawWhiteBalancePreferredSearchValuesClampAroundCenter() {
+        let middle = RawWhiteBalanceEvaluator.preferredSearchValues(center: 0.8, range: -1...1)
+        let upper = RawWhiteBalanceEvaluator.preferredSearchValues(center: 0.95, range: -1...1)
+        let lower = RawWhiteBalanceEvaluator.preferredSearchValues(center: -0.95, range: -1...1)
+
+        #expect(zip(middle, [0.6, 0.7, 0.8, 0.9, 1.0]).allSatisfy { abs($0 - $1) < 0.0001 })
+        #expect(upper.last == 1)
+        #expect(Set(upper).count == upper.count)
+        #expect(lower.first == -1)
+        #expect(Set(lower).count == lower.count)
+    }
+
+    @Test func rawWhiteBalanceDragModeUsesFewerNominalCandidates() {
+        #expect(RawWhiteBalanceSearchMode.dragPreview.nominalCandidateCount < RawWhiteBalanceSearchMode.finalCommit.nominalCandidateCount)
+    }
+
+    @Test func rawWhiteBalancePreviewThresholdSkipsTinyChanges() {
+        let previous = ColorAdjustmentState(temperature: 0.25, tint: -0.4)
+        let tiny = ColorAdjustmentState(temperature: 0.254, tint: -0.406)
+        let visible = ColorAdjustmentState(temperature: 0.25, tint: -0.38)
+
+        #expect(!RawWhiteBalanceEvaluator.shouldApplyPreview(previous: previous, next: tiny, threshold: 0.01))
+        #expect(RawWhiteBalanceEvaluator.shouldApplyPreview(previous: previous, next: visible, threshold: 0.01))
+        #expect(RawWhiteBalanceEvaluator.shouldApplyPreview(previous: nil, next: tiny, threshold: 0.01))
+    }
+
+    @MainActor
+    @Test func whiteBalanceCursorFactoryProvidesCursorImage() {
+        let cursor = WhiteBalanceCursorFactory.cursor()
+        let cached = WhiteBalanceCursorFactory.cursor()
+
+        #expect(cursor.image.size.width > 0)
+        #expect(cursor.image.size.height > 0)
+        #expect(cursor === cached)
     }
 
     @Test func rawTemperatureTintMappingUsesDefaultsAndClamps() {

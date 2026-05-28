@@ -4,6 +4,7 @@ import CoreImage
 import CoreVideo
 import Foundation
 import ImageIO
+import Metal
 import QuartzCore
 
 final class NativeVideoFrame: @unchecked Sendable {
@@ -86,6 +87,14 @@ private final class BoolCompletionBox: @unchecked Sendable {
     }
 }
 
+private final class RawWhiteBalanceCompletionBox: @unchecked Sendable {
+    let completion: (RawWhiteBalanceResult?) -> Void
+
+    init(_ completion: @escaping (RawWhiteBalanceResult?) -> Void) {
+        self.completion = completion
+    }
+}
+
 final class NativeVideoPlayer: @unchecked Sendable {
     private static let rawPreviewMaxPixelSize = 1600
 
@@ -121,6 +130,13 @@ final class NativeVideoPlayer: @unchecked Sendable {
         let defaults: RawNeutralDefaults
         private var previewPixelBuffer: CVPixelBuffer?
         private var fullPixelBuffer: CVPixelBuffer?
+        private var searchPixelBuffer: CVPixelBuffer?
+
+        private enum BufferKind {
+            case preview
+            case full
+            case search
+        }
 
         init(url: URL) throws {
             guard let filter = CIFilter(imageURL: url) else {
@@ -131,16 +147,232 @@ final class NativeVideoPlayer: @unchecked Sendable {
             self.url = url
             self.filter = filter
             self.colorSpace = colorSpace
-            self.context = CIContext(options: [
+            let options: [CIContextOption: Any] = [
                 .workingColorSpace: colorSpace,
                 .outputColorSpace: colorSpace
-            ])
+            ]
+            if let device = MTLCreateSystemDefaultDevice() {
+                self.context = CIContext(mtlDevice: device, options: options)
+            } else {
+                self.context = CIContext(options: options)
+            }
             self.defaults = NativeVideoPlayer.rawNeutralDefaults(from: filter)
         }
 
         func render(adjustment: ColorAdjustmentState, maxPixelSize: Int?) throws -> CVPixelBuffer {
+            try render(
+                adjustment: adjustment,
+                maxPixelSize: maxPixelSize,
+                bufferKind: maxPixelSize == nil ? .full : .preview,
+                logRender: true
+            )
+        }
+
+        func solveWhiteBalance(
+            pixelPoint: CGPoint,
+            sourceSize: CGSize,
+            baseAdjustment: ColorAdjustmentState,
+            preferredAdjustment: ColorAdjustmentState?,
+            searchMode: RawWhiteBalanceSearchMode,
+            sampleRadius: Int,
+            maxPixelSize: Int
+        ) throws -> RawWhiteBalanceResult? {
+            guard sourceSize.width > 0, sourceSize.height > 0 else { return nil }
+            let coarseValues = stride(
+                from: ColorAdjustmentControlRanges.rawTemperatureTint.lowerBound,
+                through: ColorAdjustmentControlRanges.rawTemperatureTint.upperBound + 0.0001,
+                by: 0.25
+            ).map { clampUI($0) }
+            var best: RawWhiteBalanceResult?
+            let earlyExitError = 0.025
+
+            func evaluate(temperature: Double, tint: Double, allowFullPreviewFallback: Bool) throws {
+                var candidate = baseAdjustment
+                candidate.temperature = clampUI(temperature)
+                candidate.tint = clampUI(tint)
+                let sample: WhiteBalanceSolver.RGBSample?
+                if let rendered = try? renderSearchPatch(
+                    adjustment: candidate,
+                    pixelPoint: pixelPoint,
+                    sourceSize: sourceSize,
+                    sampleRadius: sampleRadius
+                ) {
+                    sample = NativeVideoPlayer.sampleBGRAPixelBuffer(
+                        rendered.pixelBuffer,
+                        center: rendered.samplePoint,
+                        radius: rendered.sampleRadius
+                    )
+                } else {
+                    sample = nil
+                }
+                let resolvedSample: WhiteBalanceSolver.RGBSample?
+                if let sample, RawWhiteBalanceEvaluator.isValidSample(sample) {
+                    resolvedSample = sample
+                } else if allowFullPreviewFallback {
+                    resolvedSample = try sampleFullPreview(
+                        adjustment: candidate,
+                        pixelPoint: pixelPoint,
+                        sourceSize: sourceSize,
+                        sampleRadius: sampleRadius,
+                        maxPixelSize: maxPixelSize
+                    )
+                } else {
+                    resolvedSample = nil
+                }
+                guard let sample = resolvedSample,
+                      RawWhiteBalanceEvaluator.isValidSample(sample) else { return }
+                let neutralError = RawWhiteBalanceEvaluator.neutralError(sample)
+                if best == nil || neutralError < best!.neutralError {
+                    best = RawWhiteBalanceResult(
+                        adjustmentTemperature: candidate.temperature,
+                        adjustmentTint: candidate.tint,
+                        sampleRGB: sample,
+                        neutralError: neutralError
+                    )
+                }
+            }
+
+            if let preferredAdjustment {
+                let preferredTemperatures = RawWhiteBalanceEvaluator.preferredSearchValues(
+                    center: preferredAdjustment.temperature,
+                    range: ColorAdjustmentControlRanges.rawTemperatureTint
+                )
+                let preferredTints = RawWhiteBalanceEvaluator.preferredSearchValues(
+                    center: preferredAdjustment.tint,
+                    range: ColorAdjustmentControlRanges.rawTemperatureTint
+                )
+                preferredSearch: for temperature in preferredTemperatures {
+                    for tint in preferredTints {
+                        try evaluate(temperature: temperature, tint: tint, allowFullPreviewFallback: false)
+                        if (best?.neutralError ?? .greatestFiniteMagnitude) <= earlyExitError {
+                            break preferredSearch
+                        }
+                    }
+                }
+            }
+
+            if searchMode == .dragPreview {
+                if best == nil, preferredAdjustment == nil {
+                    let previewTemperatures = RawWhiteBalanceEvaluator.preferredSearchValues(
+                        center: baseAdjustment.temperature,
+                        range: ColorAdjustmentControlRanges.rawTemperatureTint
+                    )
+                    let previewTints = RawWhiteBalanceEvaluator.preferredSearchValues(
+                        center: baseAdjustment.tint,
+                        range: ColorAdjustmentControlRanges.rawTemperatureTint
+                    )
+                    for temperature in previewTemperatures {
+                        for tint in previewTints {
+                            try evaluate(temperature: temperature, tint: tint, allowFullPreviewFallback: false)
+                        }
+                    }
+                }
+                return best
+            }
+
+            coarseSearch: for temperature in coarseValues {
+                if (best?.neutralError ?? .greatestFiniteMagnitude) <= earlyExitError {
+                    break coarseSearch
+                }
+                for tint in coarseValues {
+                    try evaluate(temperature: temperature, tint: tint, allowFullPreviewFallback: false)
+                    if (best?.neutralError ?? .greatestFiniteMagnitude) <= earlyExitError {
+                        break coarseSearch
+                    }
+                }
+            }
+            if best == nil {
+                for temperature in stride(from: -1.0, through: 1.0001, by: 0.5) {
+                    for tint in stride(from: -1.0, through: 1.0001, by: 0.5) {
+                        try evaluate(temperature: temperature, tint: tint, allowFullPreviewFallback: true)
+                    }
+                }
+            }
+            guard let coarseBest = best else { return nil }
+
+            fineSearch: for temperatureOffset in stride(from: -0.15, through: 0.1501, by: 0.05) {
+                for tintOffset in stride(from: -0.15, through: 0.1501, by: 0.05) {
+                    try evaluate(
+                        temperature: coarseBest.adjustmentTemperature + temperatureOffset,
+                        tint: coarseBest.adjustmentTint + tintOffset,
+                        allowFullPreviewFallback: false
+                    )
+                    if (best?.neutralError ?? .greatestFiniteMagnitude) <= earlyExitError {
+                        break fineSearch
+                    }
+                }
+            }
+            return best
+        }
+
+        private func sampleFullPreview(
+            adjustment: ColorAdjustmentState,
+            pixelPoint: CGPoint,
+            sourceSize: CGSize,
+            sampleRadius: Int,
+            maxPixelSize: Int
+        ) throws -> WhiteBalanceSolver.RGBSample? {
+            let pixelBuffer = try render(
+                adjustment: adjustment,
+                maxPixelSize: maxPixelSize,
+                bufferKind: .search,
+                logRender: false
+            )
+            let width = CVPixelBufferGetWidth(pixelBuffer)
+            let height = CVPixelBufferGetHeight(pixelBuffer)
+            guard width > 0, height > 0 else { return nil }
+            let samplePoint = CGPoint(
+                x: pixelPoint.x * CGFloat(width) / sourceSize.width,
+                y: pixelPoint.y * CGFloat(height) / sourceSize.height
+            )
+            let scaledRadius = max(5, Int((CGFloat(sampleRadius) * CGFloat(width) / sourceSize.width).rounded()))
+            return NativeVideoPlayer.sampleBGRAPixelBuffer(pixelBuffer, center: samplePoint, radius: scaledRadius)
+        }
+
+        private func renderSearchPatch(
+            adjustment: ColorAdjustmentState,
+            pixelPoint: CGPoint,
+            sourceSize: CGSize,
+            sampleRadius: Int
+        ) throws -> (pixelBuffer: CVPixelBuffer, samplePoint: CGPoint, sampleRadius: Int) {
+            let image = try configuredImage(adjustment: adjustment, logRender: false)
+            let imageSize = CGSize(width: image.extent.width, height: image.extent.height)
+            guard imageSize.width > 0, imageSize.height > 0 else {
+                throw NSError(domain: "VideoCompare.RawLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "RAW 图像尺寸无效"])
+            }
+            let fullResolutionPoint = CGPoint(
+                x: pixelPoint.x * imageSize.width / sourceSize.width,
+                y: pixelPoint.y * imageSize.height / sourceSize.height
+            )
+            let scaledRadius = max(3, Int((CGFloat(sampleRadius) * imageSize.width / sourceSize.width).rounded()))
+            let patchSize = max(CGFloat(scaledRadius * 4), 64)
+            guard let patch = RawWhiteBalanceEvaluator.samplePatch(
+                center: fullResolutionPoint,
+                imageSize: imageSize,
+                patchSize: patchSize
+            ) else {
+                throw NSError(domain: "VideoCompare.RawLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "RAW 取样区域无效"])
+            }
+            let width = max(1, Int(patch.rect.width.rounded()))
+            let height = max(1, Int(patch.rect.height.rounded()))
+            let pixelBuffer = try reusablePixelBuffer(width: width, height: height, kind: .search)
+            let patchImage = image
+                .cropped(to: patch.rect)
+                .transformed(by: CGAffineTransform(translationX: -patch.rect.minX, y: -patch.rect.minY))
+            context.render(
+                patchImage,
+                to: pixelBuffer,
+                bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                colorSpace: colorSpace
+            )
+            return (pixelBuffer, patch.samplePoint, min(scaledRadius, max(1, min(width, height) / 2)))
+        }
+
+        private func configuredImage(adjustment: ColorAdjustmentState, logRender: Bool) throws -> CIImage {
             let mapped = RawTemperatureTintMapper.mappedNeutral(defaults: defaults, adjustment: adjustment)
-            Diagnostics.log("raw.decode path=\(url.lastPathComponent) defaultTemp=\(String(format: "%.3f", defaults.temperature)) defaultTint=\(String(format: "%.3f", defaults.tint)) mappedTemp=\(String(format: "%.3f", mapped.temperature)) mappedTint=\(String(format: "%.3f", mapped.tint)) previewMax=\(maxPixelSize.map(String.init) ?? "full")")
+            if logRender {
+                Diagnostics.log("raw.decode path=\(url.lastPathComponent) defaultTemp=\(String(format: "%.3f", defaults.temperature)) defaultTint=\(String(format: "%.3f", defaults.tint)) mappedTemp=\(String(format: "%.3f", mapped.temperature)) mappedTint=\(String(format: "%.3f", mapped.tint))")
+            }
             NativeVideoPlayer.setFilterValueIfAvailable(mapped.temperature, key: "inputNeutralTemperature", filter: filter)
             NativeVideoPlayer.setFilterValueIfAvailable(mapped.tint, key: "inputNeutralTint", filter: filter)
             NativeVideoPlayer.setFilterValueIfAvailable(1.0, key: "inputBoost", filter: filter)
@@ -153,7 +385,15 @@ final class NativeVideoPlayer: @unchecked Sendable {
                 throw NSError(domain: "VideoCompare.RawLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "RAW 图像尺寸无效"])
             }
             image = image.transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
+            return image
+        }
 
+        private func render(adjustment: ColorAdjustmentState, maxPixelSize: Int?, bufferKind: BufferKind, logRender: Bool) throws -> CVPixelBuffer {
+            var image = try configuredImage(adjustment: adjustment, logRender: logRender)
+            if logRender {
+                Diagnostics.log("raw.decode.previewMax=\(maxPixelSize.map(String.init) ?? "full")")
+            }
+            let extent = image.extent
             var width = max(1, Int(ceil(extent.width)))
             var height = max(1, Int(ceil(extent.height)))
             if let maxPixelSize, max(width, height) > maxPixelSize {
@@ -163,7 +403,7 @@ final class NativeVideoPlayer: @unchecked Sendable {
                 height = max(1, Int(ceil(image.extent.height)))
             }
 
-            let pixelBuffer = try reusablePixelBuffer(width: width, height: height, preview: maxPixelSize != nil)
+            let pixelBuffer = try reusablePixelBuffer(width: width, height: height, kind: bufferKind)
             context.render(
                 image,
                 to: pixelBuffer,
@@ -173,20 +413,34 @@ final class NativeVideoPlayer: @unchecked Sendable {
             return pixelBuffer
         }
 
-        private func reusablePixelBuffer(width: Int, height: Int, preview: Bool) throws -> CVPixelBuffer {
-            let current = preview ? previewPixelBuffer : fullPixelBuffer
+        private func reusablePixelBuffer(width: Int, height: Int, kind: BufferKind) throws -> CVPixelBuffer {
+            let current: CVPixelBuffer? = switch kind {
+            case .preview: previewPixelBuffer
+            case .full: fullPixelBuffer
+            case .search: searchPixelBuffer
+            }
             if let current,
                CVPixelBufferGetWidth(current) == width,
                CVPixelBufferGetHeight(current) == height {
                 return current
             }
             let pixelBuffer = try NativeVideoPlayer.makePixelBuffer(width: width, height: height)
-            if preview {
+            switch kind {
+            case .preview:
                 previewPixelBuffer = pixelBuffer
-            } else {
+            case .full:
                 fullPixelBuffer = pixelBuffer
+            case .search:
+                searchPixelBuffer = pixelBuffer
             }
             return pixelBuffer
+        }
+
+        private func clampUI(_ value: Double) -> Double {
+            min(
+                ColorAdjustmentControlRanges.rawTemperatureTint.upperBound,
+                max(ColorAdjustmentControlRanges.rawTemperatureTint.lowerBound, value)
+            )
         }
     }
 
@@ -360,6 +614,55 @@ final class NativeVideoPlayer: @unchecked Sendable {
                     }
                     self.onOpenFailed?(self.slot, error.localizedDescription)
                     completionBox?.completion(false)
+                }
+            }
+        }
+    }
+
+    func solveRawWhiteBalance(
+        canvasPixelPoint: CGPoint,
+        baseAdjustment: ColorAdjustmentState,
+        preferredAdjustment: ColorAdjustmentState? = nil,
+        searchMode: RawWhiteBalanceSearchMode = .finalCommit,
+        sampleRadius: Int,
+        completion: @escaping (RawWhiteBalanceResult?) -> Void
+    ) {
+        guard let url = fileURL,
+              isStaticImage,
+              MediaFileSupport.isRawImage(url),
+              let staticImageFrame else {
+            completion(nil)
+            return
+        }
+        let completionBox = RawWhiteBalanceCompletionBox(completion)
+        let sourceSize = CGSize(
+            width: CVPixelBufferGetWidth(staticImageFrame.pixelBuffer),
+            height: CVPixelBufferGetHeight(staticImageFrame.pixelBuffer)
+        )
+        queue.async {
+            do {
+                let session = try self.rawRenderSession(for: url)
+                let result = try session.solveWhiteBalance(
+                    pixelPoint: canvasPixelPoint,
+                    sourceSize: sourceSize,
+                    baseAdjustment: baseAdjustment,
+                    preferredAdjustment: preferredAdjustment,
+                    searchMode: searchMode,
+                    sampleRadius: sampleRadius,
+                    maxPixelSize: Self.rawPreviewMaxPixelSize
+                )
+                DispatchQueue.main.async {
+                    guard self.fileURL == url,
+                          self.isStaticImage,
+                          MediaFileSupport.isRawImage(url) else {
+                        return
+                    }
+                    completionBox.completion(result)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard self.fileURL == url else { return }
+                    completionBox.completion(nil)
                 }
             }
         }
@@ -990,6 +1293,52 @@ final class NativeVideoPlayer: @unchecked Sendable {
             throw NSError(domain: "VideoCompare.ImageLoad", code: 3, userInfo: [NSLocalizedDescriptionKey: "无法创建照片缓冲区"])
         }
         return pixelBuffer
+    }
+
+    private static func sampleBGRAPixelBuffer(_ pixelBuffer: CVPixelBuffer, center: CGPoint, radius: Int) -> WhiteBalanceSolver.RGBSample? {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else { return nil }
+        let lockResult = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        guard lockResult == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0, let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let centerX = min(width - 1, max(0, Int(center.x.rounded())))
+        let centerY = min(height - 1, max(0, Int(center.y.rounded())))
+        let xRange = max(0, centerX - radius)...min(width - 1, centerX + radius)
+        let yRange = max(0, centerY - radius)...min(height - 1, centerY + radius)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let pointer = base.assumingMemoryBound(to: UInt8.self)
+        var red: [Double] = []
+        var green: [Double] = []
+        var blue: [Double] = []
+        red.reserveCapacity(xRange.count * yRange.count)
+        green.reserveCapacity(xRange.count * yRange.count)
+        blue.reserveCapacity(xRange.count * yRange.count)
+
+        for y in yRange {
+            for x in xRange {
+                let offset = y * bytesPerRow + x * 4
+                blue.append(Double(pointer[offset]) / 255.0)
+                green.append(Double(pointer[offset + 1]) / 255.0)
+                red.append(Double(pointer[offset + 2]) / 255.0)
+            }
+        }
+        guard red.count >= 9 else { return nil }
+        return WhiteBalanceSolver.RGBSample(
+            r: trimmedMean(red),
+            g: trimmedMean(green),
+            b: trimmedMean(blue)
+        )
+    }
+
+    private static func trimmedMean(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let trim = min(sorted.count / 5, max(0, (sorted.count - 1) / 2))
+        let kept = sorted[trim..<(sorted.count - trim)]
+        return kept.reduce(0, +) / Double(kept.count)
     }
 
     private static func makeCGImage(fromImageAt url: URL) -> CGImage? {

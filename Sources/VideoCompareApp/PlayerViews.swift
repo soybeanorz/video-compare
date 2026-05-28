@@ -170,6 +170,25 @@ final class ROISelectionOverlayView: NSView {
     }
 }
 
+@MainActor
+enum WhiteBalanceCursorFactory {
+    private static let cachedCursor: NSCursor = makeCursor()
+
+    static func cursor() -> NSCursor {
+        cachedCursor
+    }
+
+    private static func makeCursor() -> NSCursor {
+        guard let symbol = NSImage(systemSymbolName: "eyedropper", accessibilityDescription: "White Balance Picker")
+            ?? NSImage(systemSymbolName: "eyedropper.full", accessibilityDescription: "White Balance Picker") else {
+            return .crosshair
+        }
+        let image = symbol.copy() as? NSImage ?? symbol
+        image.size = NSSize(width: 24, height: 24)
+        return NSCursor(image: image, hotSpot: NSPoint(x: 4, y: 20))
+    }
+}
+
 final class VideoCanvasView: NSView {
     let containerA = DropVideoView(slot: .a)
     let containerB = DropVideoView(slot: .b)
@@ -194,13 +213,18 @@ final class VideoCanvasView: NSView {
     var onZoomDragged: ((VideoSlot, CGFloat) -> Void)?
     var onAlignmentGestureEnded: (() -> Void)?
     var onROIAlignmentRequested: ((VideoSlot, NSRect) -> Void)?
-    var onWhiteBalanceSampleRequested: ((VideoSlot, NSPoint) -> Void)?
+    var onWhiteBalanceSampleRequested: ((VideoSlot, NSPoint, WhiteBalancePickPhase) -> Void)?
     var onSelectionChanged: ((VideoSlot?) -> Void)?
     var isWhiteBalanceSampling = false {
         didSet {
             guard oldValue != isWhiteBalanceSampling else { return }
             discardActiveGesture()
             window?.invalidateCursorRects(for: self)
+            if isWhiteBalanceSampling {
+                updateWhiteBalanceCursorFromCurrentMouseLocation()
+            } else {
+                NSCursor.arrow.set()
+            }
         }
     }
     var selectedSlot: VideoSlot? {
@@ -218,6 +242,7 @@ final class VideoCanvasView: NSView {
     private var panSlot: VideoSlot?
     private var roiStartPoint: NSPoint?
     private var roiSlot: VideoSlot?
+    private var whiteBalanceCursorTrackingArea: NSTrackingArea?
 
     var allowsAlignmentAdjustment: Bool {
         layoutMode == .overlapWipe
@@ -267,10 +292,90 @@ final class VideoCanvasView: NSView {
 
     override var isFlipped: Bool { true }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        isWhiteBalanceSampling || super.acceptsFirstMouse(for: event)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let whiteBalanceCursorTrackingArea {
+            removeTrackingArea(whiteBalanceCursorTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeInActiveApp, .cursorUpdate, .mouseEnteredAndExited, .mouseMoved, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        whiteBalanceCursorTrackingArea = area
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        if isWhiteBalanceSampling {
+            updateWhiteBalanceCursor(with: event)
+        } else {
+            super.cursorUpdate(with: event)
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if isWhiteBalanceSampling {
+            updateWhiteBalanceCursor(with: event)
+        } else {
+            super.mouseEntered(with: event)
+        }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        if isWhiteBalanceSampling {
+            updateWhiteBalanceCursor(with: event)
+        } else {
+            super.mouseMoved(with: event)
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if isWhiteBalanceSampling {
+            NSCursor.arrow.set()
+        } else {
+            super.mouseExited(with: event)
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if isWhiteBalanceSampling {
+            return bounds.contains(point) ? self : nil
+        }
+        return super.hitTest(point)
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
         if isWhiteBalanceSampling {
-            addCursorRect(bounds, cursor: .crosshair)
+            addCursorRect(activeContentBounds(), cursor: WhiteBalanceCursorFactory.cursor())
+        }
+    }
+
+    private func updateWhiteBalanceCursor(with event: NSEvent) {
+        updateWhiteBalanceCursor(at: convert(event.locationInWindow, from: nil))
+    }
+
+    private func updateWhiteBalanceCursorFromCurrentMouseLocation() {
+        guard let window else {
+            NSCursor.arrow.set()
+            return
+        }
+        updateWhiteBalanceCursor(at: convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+
+    private func updateWhiteBalanceCursor(at point: NSPoint) {
+        if isWhiteBalanceSampling,
+           activeContentBounds().contains(point),
+           slot(at: point) != nil {
+            WhiteBalanceCursorFactory.cursor().set()
+        } else {
+            NSCursor.arrow.set()
         }
     }
 
@@ -346,10 +451,12 @@ final class VideoCanvasView: NSView {
         if isWhiteBalanceSampling {
             guard activeContentBounds().contains(point), let clickedSlot = slot(at: point) else {
                 NSSound.beep()
+                updateWhiteBalanceCursor(at: point)
                 return
             }
             selectedSlot = clickedSlot
-            onWhiteBalanceSampleRequested?(clickedSlot, point)
+            onWhiteBalanceSampleRequested?(clickedSlot, point, .begin)
+            updateWhiteBalanceCursor(at: point)
             return
         }
         let wantsROISelection = event.modifierFlags.contains(.control)

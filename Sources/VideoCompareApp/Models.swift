@@ -5,6 +5,27 @@ enum VideoSlot: String, Codable {
     case b
 }
 
+enum WhiteBalancePickPhase: Equatable {
+    case begin
+    case update
+    case end
+    case cancel
+}
+
+enum RawWhiteBalanceSearchMode: Equatable {
+    case dragPreview
+    case finalCommit
+
+    var nominalCandidateCount: Int {
+        switch self {
+        case .dragPreview:
+            return 25
+        case .finalCommit:
+            return 25 + 81 + 49
+        }
+    }
+}
+
 enum CompareLayout: Int, CaseIterable {
     case sideBySideHorizontal = 0
     case overlapWipe = 1
@@ -225,6 +246,18 @@ struct RawNeutralDefaults: Equatable {
     var tint: Double
 }
 
+struct RawWhiteBalanceResult: Equatable {
+    var adjustmentTemperature: Double
+    var adjustmentTint: Double
+    var sampleRGB: WhiteBalanceSolver.RGBSample
+    var neutralError: Double
+}
+
+struct RawSamplePatch: Equatable {
+    var rect: CGRect
+    var samplePoint: CGPoint
+}
+
 enum RawTemperatureTintMapper {
     static let temperatureDelta: Double = 8000
     static let tintDelta: Double = 300
@@ -247,6 +280,56 @@ enum RawTemperatureTintMapper {
 
     private static func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
         min(range.upperBound, max(range.lowerBound, value))
+    }
+}
+
+enum RawWhiteBalanceEvaluator {
+    static func shouldApplyPreview(previous: ColorAdjustmentState?, next: ColorAdjustmentState, threshold: Double = 0.01) -> Bool {
+        guard let previous else { return true }
+        return abs(previous.temperature - next.temperature) >= threshold
+            || abs(previous.tint - next.tint) >= threshold
+    }
+
+    static func preferredSearchValues(center: Double, range: ClosedRange<Double>) -> [Double] {
+        let offsets = [-0.20, -0.10, 0, 0.10, 0.20]
+        var values: [Double] = []
+        for offset in offsets {
+            let value = min(range.upperBound, max(range.lowerBound, center + offset))
+            if !values.contains(where: { abs($0 - value) < 0.0001 }) {
+                values.append(value)
+            }
+        }
+        return values
+    }
+
+    static func samplePatch(center: CGPoint, imageSize: CGSize, patchSize: CGFloat = 64) -> RawSamplePatch? {
+        guard center.x.isFinite, center.y.isFinite,
+              imageSize.width > 0, imageSize.height > 0 else { return nil }
+        let width = min(max(1, patchSize.rounded()), imageSize.width)
+        let height = min(max(1, patchSize.rounded()), imageSize.height)
+        let maxX = max(0, imageSize.width - width)
+        let maxY = max(0, imageSize.height - height)
+        let originX = min(maxX, max(0, (center.x - width / 2).rounded(.down)))
+        let originY = min(maxY, max(0, (center.y - height / 2).rounded(.down)))
+        let rect = CGRect(x: originX, y: originY, width: width, height: height)
+        return RawSamplePatch(
+            rect: rect,
+            samplePoint: CGPoint(x: center.x - originX, y: center.y - originY)
+        )
+    }
+
+    static func isValidSample(_ sample: WhiteBalanceSolver.RGBSample) -> Bool {
+        guard sample.r.isFinite, sample.g.isFinite, sample.b.isFinite else { return false }
+        let luma = sample.r * 0.2126 + sample.g * 0.7152 + sample.b * 0.0722
+        guard luma >= 0.04, luma <= 0.96 else { return false }
+        let channels = [sample.r, sample.g, sample.b]
+        guard let minChannel = channels.min(), let maxChannel = channels.max() else { return false }
+        return !(minChannel < 0.025 && maxChannel > 0.85)
+    }
+
+    static func neutralError(_ sample: WhiteBalanceSolver.RGBSample) -> Double {
+        let luma = max(0.05, sample.r * 0.2126 + sample.g * 0.7152 + sample.b * 0.0722)
+        return (abs(sample.r - sample.g) + abs(sample.b - sample.g)) / luma
     }
 }
 

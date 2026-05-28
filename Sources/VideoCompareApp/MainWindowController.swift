@@ -432,8 +432,20 @@ final class MainWindowController: NSWindowController {
     private var isROIAlignmentRunning = false
     private var transientMessageGeneration = 0
     private var isWhiteBalanceSampling = false
+    private var rawWhiteBalanceGeneration = 0
+    private var rawWhiteBalanceIsSolving = false
+    private var pendingRawWhiteBalanceRequest: RawWhiteBalancePickRequest?
+    private var lastRawWhiteBalancePreview: (slot: VideoSlot, adjustment: ColorAdjustmentState)?
     private static let loopPreviewFrameCount = 8
     private static let loopSeekTimeout: TimeInterval = 1.5
+
+    private struct RawWhiteBalancePickRequest {
+        var generation: Int
+        var slot: VideoSlot
+        var canvasPoint: NSPoint
+        var phase: WhiteBalancePickPhase
+    }
+
     private var selectedSlot: VideoSlot? {
         didSet {
             canvas.selectedSlot = selectedSlot
@@ -735,8 +747,8 @@ final class MainWindowController: NSWindowController {
         canvas.onROIAlignmentRequested = { [weak self] slot, rect in
             self?.performROIAlignment(sourceSlot: slot, sourceCanvasRect: rect)
         }
-        canvas.onWhiteBalanceSampleRequested = { [weak self] slot, point in
-            self?.applyWhiteBalanceSample(slot: slot, canvasPoint: point)
+        canvas.onWhiteBalanceSampleRequested = { [weak self] slot, point, phase in
+            self?.handleWhiteBalancePick(slot: slot, canvasPoint: point, phase: phase)
         }
         canvas.onToggleChanged = { [weak self] in
             self?.refreshStatus()
@@ -2107,11 +2119,101 @@ final class MainWindowController: NSWindowController {
         showTransientMessage("点击画面中的白色或中性灰区域")
     }
 
-    private func cancelWhiteBalanceSampling() {
+    private func cancelWhiteBalanceSampling(invalidatePending: Bool = true) {
         guard isWhiteBalanceSampling else { return }
         isWhiteBalanceSampling = false
         canvas.isWhiteBalanceSampling = false
         colorAdjustmentPanel?.setWhiteBalanceSampling(false)
+        if invalidatePending {
+            rawWhiteBalanceGeneration += 1
+            pendingRawWhiteBalanceRequest = nil
+            lastRawWhiteBalancePreview = nil
+        }
+    }
+
+    private func handleWhiteBalancePick(slot: VideoSlot, canvasPoint: NSPoint, phase: WhiteBalancePickPhase) {
+        guard isWhiteBalanceSampling else { return }
+        selectedSlot = slot
+        if !isRawImageLoaded(in: slot) {
+            if phase == .begin {
+                applyWhiteBalanceSample(slot: slot, canvasPoint: canvasPoint)
+            }
+            return
+        }
+        if phase == .begin {
+            showTransientMessage("正在计算 RAW 白平衡...")
+            submitRawWhiteBalancePick(slot: slot, canvasPoint: canvasPoint, phase: phase)
+        } else if phase == .cancel {
+            cancelWhiteBalanceSampling()
+        }
+    }
+
+    private func submitRawWhiteBalancePick(slot: VideoSlot, canvasPoint: NSPoint, phase: WhiteBalancePickPhase) {
+        rawWhiteBalanceGeneration += 1
+        let request = RawWhiteBalancePickRequest(
+            generation: rawWhiteBalanceGeneration,
+            slot: slot,
+            canvasPoint: canvasPoint,
+            phase: phase
+        )
+        if rawWhiteBalanceIsSolving {
+            pendingRawWhiteBalanceRequest = request
+            return
+        }
+        startRawWhiteBalancePick(request)
+    }
+
+    private func startRawWhiteBalancePick(_ request: RawWhiteBalancePickRequest) {
+        guard let pixelBuffer = pixelBuffer(for: request.slot),
+              let pixelPoint = pixelPoint(for: request.canvasPoint, slot: request.slot, pixelBuffer: pixelBuffer),
+              isRawImageLoaded(in: request.slot) else {
+            showTransientMessage("请点击画面内容区域")
+            return
+        }
+        let player = request.slot == .a ? playerA! : playerB!
+        let baseAdjustment = colorAdjustment(for: request.slot)
+        let preferredAdjustment = lastRawWhiteBalancePreview?.slot == request.slot
+            ? lastRawWhiteBalancePreview?.adjustment
+            : baseAdjustment
+        let searchMode: RawWhiteBalanceSearchMode = .finalCommit
+        let started = CACurrentMediaTime()
+        rawWhiteBalanceIsSolving = true
+        player.solveRawWhiteBalance(
+            canvasPixelPoint: pixelPoint,
+            baseAdjustment: baseAdjustment,
+            preferredAdjustment: preferredAdjustment,
+            searchMode: searchMode,
+            sampleRadius: 7
+        ) { [weak self] result in
+            guard let self else { return }
+            self.rawWhiteBalanceIsSolving = false
+            let solveElapsed = CACurrentMediaTime() - started
+            Diagnostics.log("raw.wb.solve slot=\(request.slot.rawValue) phase=\(request.phase) mode=\(searchMode) elapsed=\(String(format: "%.4f", solveElapsed))")
+            defer {
+                if let pending = self.pendingRawWhiteBalanceRequest {
+                    self.pendingRawWhiteBalanceRequest = nil
+                    self.startRawWhiteBalancePick(pending)
+                }
+            }
+            guard request.generation == self.rawWhiteBalanceGeneration else { return }
+            guard let result,
+                  self.isRawImageLoaded(in: request.slot) else {
+                self.showTransientMessage("取样区域不适合白平衡")
+                return
+            }
+            var adjustment = self.colorAdjustment(for: request.slot)
+            adjustment.isEnabled = true
+            adjustment.temperature = result.adjustmentTemperature
+            adjustment.tint = result.adjustmentTint
+            self.lastRawWhiteBalancePreview = (request.slot, adjustment)
+            self.applyRawWhiteBalanceAdjustment(
+                adjustment,
+                slot: request.slot,
+                commitFullResolution: true
+            )
+            self.showTransientMessage("已应用 RAW 取色白平衡，可继续点击取样")
+            self.lastRawWhiteBalancePreview = nil
+        }
     }
 
     private func applyWhiteBalanceSample(slot: VideoSlot, canvasPoint: NSPoint) {
@@ -2125,13 +2227,35 @@ final class MainWindowController: NSWindowController {
             showTransientMessage("请点击画面内容区域")
             return
         }
+        if isRawImageLoaded(in: slot) {
+            let player = slot == .a ? playerA! : playerB!
+            let baseAdjustment = colorAdjustment(for: slot)
+            showTransientMessage("正在计算 RAW 白平衡...")
+            player.solveRawWhiteBalance(
+                canvasPixelPoint: pixelPoint,
+                baseAdjustment: baseAdjustment,
+                sampleRadius: 7
+            ) { [weak self] result in
+                guard let self else { return }
+                guard let result,
+                      self.isRawImageLoaded(in: slot) else {
+                    self.showTransientMessage("取样区域不适合白平衡")
+                    return
+                }
+                var adjustment = self.colorAdjustment(for: slot)
+                adjustment.isEnabled = true
+                adjustment.temperature = result.adjustmentTemperature
+                adjustment.tint = result.adjustmentTint
+                self.applyRawWhiteBalanceAdjustment(adjustment, slot: slot)
+                self.showTransientMessage("已应用 RAW 取色白平衡，可继续点击取样")
+            }
+            return
+        }
         guard let sample = Self.sampleRGB(pixelBuffer: pixelBuffer, center: pixelPoint, radius: 7) else {
             showTransientMessage("取样失败，请换一个位置")
             return
         }
-        let range = isRawImageLoaded(in: slot)
-            ? ColorAdjustmentControlRanges.rawTemperatureTint
-            : ColorAdjustmentControlRanges.standardTemperatureTint
+        let range = ColorAdjustmentControlRanges.standardTemperatureTint
         var adjustment = colorAdjustment(for: slot)
         guard let correction = WhiteBalanceSolver.temperatureTintCorrection(
             sample: sample,
@@ -2145,8 +2269,55 @@ final class MainWindowController: NSWindowController {
         adjustment.temperature = correction.temperature
         adjustment.tint = correction.tint
         setColorAdjustment(adjustment, slot: slot)
-        cancelWhiteBalanceSampling()
-        showTransientMessage("已应用取色白平衡")
+        showTransientMessage("已应用取色白平衡，可继续点击取样")
+    }
+
+    private func applyRawWhiteBalanceAdjustment(_ adjustment: ColorAdjustmentState, slot: VideoSlot, commitFullResolution: Bool = true) {
+        let previous = colorAdjustment(for: slot)
+        let changed = previous != adjustment
+        if changed && !isApplyingPreviewHistory {
+            beginPreviewUndoGroup()
+        }
+        if changed {
+            switch slot {
+            case .a:
+                colorAdjustmentA = adjustment
+                canvas.renderer.colorAdjustmentA = rendererColorAdjustment(for: .a)
+            case .b:
+                colorAdjustmentB = adjustment
+                canvas.renderer.colorAdjustmentB = rendererColorAdjustment(for: .b)
+            }
+            refreshHistogramForCurrentFrame(slot: slot)
+            refreshColorAdjustmentPanel()
+            if !isApplyingPreviewHistory {
+                schedulePreviewUndoCommit()
+            }
+        }
+
+        let player = slot == .a ? playerA! : playerB!
+        let previewStarted = CACurrentMediaTime()
+        player.reloadStaticImage(rawAdjustment: adjustment, preview: true) { [weak self] ok in
+            guard let self else { return }
+            Diagnostics.log("raw.wb.preview slot=\(slot.rawValue) elapsed=\(String(format: "%.4f", CACurrentMediaTime() - previewStarted))")
+            guard ok else {
+                self.showTransientMessage("该 RAW 文件不支持解码级调色")
+                return
+            }
+            self.refreshHistogramForCurrentFrame(slot: slot)
+            guard commitFullResolution else { return }
+            guard self.colorAdjustment(for: slot) == adjustment,
+                  self.isRawImageLoaded(in: slot) else { return }
+            let commitStarted = CACurrentMediaTime()
+            player.reloadStaticImage(rawAdjustment: adjustment, preview: false) { [weak self] ok in
+                guard let self else { return }
+                Diagnostics.log("raw.wb.commit slot=\(slot.rawValue) elapsed=\(String(format: "%.4f", CACurrentMediaTime() - commitStarted))")
+                if ok {
+                    self.refreshHistogramForCurrentFrame(slot: slot)
+                } else {
+                    self.showTransientMessage("该 RAW 文件不支持解码级调色")
+                }
+            }
+        }
     }
 
     private func pixelBuffer(for slot: VideoSlot) -> CVPixelBuffer? {
