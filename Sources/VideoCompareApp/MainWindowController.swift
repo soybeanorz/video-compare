@@ -399,7 +399,7 @@ final class MainWindowController: NSWindowController {
     private var loopPreviewFramesA: [NativeVideoFrame] = []
     private var loopPreviewFramesB: [NativeVideoFrame] = []
     private var isSynchronizedPlaying = false
-    private var fileTreesExpanded = false
+    private var fileTreesExpanded = true
     private var fileTreeAnimationTimer: Timer?
     private var synchronizedPlaybackToken = 0
     private var synchronizedDebugFrameCount = 0
