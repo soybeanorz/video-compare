@@ -374,6 +374,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     let slot: VideoSlot
     var onFileOpened: ((VideoSlot, URL) -> Void)?
     var onIconSizeChanged: ((CGFloat) -> Void)?
+    var onLocationChanged: ((VideoSlot, URL, URL?) -> Void)?
     var isExpanded = false {
         didSet {
             guard oldValue != isExpanded else { return }
@@ -384,6 +385,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
 
     private let toolbarView = NSView()
     private let upButton = NSButton()
+    private let homeButton = NSButton()
     private let pathField = PathTextField(string: "")
     private let viewModeControl: NSSegmentedControl
     private let sortButton = NSButton()
@@ -452,6 +454,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         if !isAnimatingToolbar {
             let frames = toolbarFrames(expanded: isExpanded)
             upButton.frame = frames.up
+            homeButton.frame = frames.home
             sortButton.frame = frames.sort
             viewModeControl.frame = frames.viewMode
             pathField.frame = frames.path
@@ -486,6 +489,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         pendingDirectoryLoads.removeAll()
         refreshPathField()
         reloadBrowsers()
+        onLocationChanged?(slot, self.rootURL, self.displayURL)
     }
 
     func setBrowserContentSuppressed(_ suppressed: Bool) {
@@ -512,7 +516,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         layoutSubtreeIfNeeded()
         let startFrames = toolbarFrames(expanded: isExpanded)
         let targetFrames = toolbarFrames(expanded: expanded)
-        let controls = [upButton, viewModeControl, sortButton]
+        let controls = [upButton, homeButton, viewModeControl, sortButton]
         Diagnostics.log(
             "fileTree.\(slot.rawValue).toolbar.request from=\(isExpanded) to=\(expanded) animated=\(animated) pathStart=(\(rectDebug(startFrames.path))) pathTarget=(\(rectDebug(targetFrames.path))) currentPath=(\(rectDebug(pathField.frame)))"
         )
@@ -522,6 +526,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
             isExpanded = expanded
             pathField.frame = targetFrames.path
             upButton.frame = targetFrames.up
+            homeButton.frame = targetFrames.home
             viewModeControl.frame = targetFrames.viewMode
             sortButton.frame = targetFrames.sort
             controls.forEach {
@@ -534,6 +539,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         isAnimatingToolbar = true
         pathField.frame = startFrames.path
         upButton.frame = startFrames.up
+        homeButton.frame = startFrames.home
         viewModeControl.frame = startFrames.viewMode
         sortButton.frame = startFrames.sort
 
@@ -549,12 +555,14 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
                 Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.expand.path.start duration=\(context.duration)")
                 pathField.animator().frame = targetFrames.path
                 upButton.animator().frame = targetFrames.up
+                homeButton.animator().frame = targetFrames.home
                 viewModeControl.animator().frame = targetFrames.viewMode
                 sortButton.animator().frame = targetFrames.sort
             } completionHandler: {
                 Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.expand.path.complete actual=(\(self.rectDebug(self.pathField.frame)))")
                 self.pathField.frame = targetFrames.path
                 self.upButton.frame = targetFrames.up
+                self.homeButton.frame = targetFrames.home
                 self.viewModeControl.frame = targetFrames.viewMode
                 self.sortButton.frame = targetFrames.sort
                 NSAnimationContext.runAnimationGroup { context in
@@ -594,6 +602,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
                 Diagnostics.log("fileTree.\(self.slot.rawValue).toolbar.collapse.path.complete actual=(\(self.rectDebug(self.pathField.frame)))")
                 self.pathField.frame = targetFrames.path
                 self.upButton.frame = targetFrames.up
+                self.homeButton.frame = targetFrames.home
                 self.viewModeControl.frame = targetFrames.viewMode
                 self.sortButton.frame = targetFrames.sort
                 self.isAnimatingToolbar = false
@@ -635,6 +644,30 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
             return false
         }
         return window.fieldEditor(false, for: pathField) === fieldEditor
+    }
+
+    func clearFocusAndSelectionForCollapse() {
+        _ = endPathEditingIfNeeded()
+        outlineView.deselectAll(nil)
+        collectionView.selectionIndexPaths = []
+        guard let window else { return }
+        let responder = window.firstResponder
+        if responderBelongsToTree(responder) {
+            window.makeFirstResponder(nil)
+        }
+    }
+
+    private func responderBelongsToTree(_ responder: NSResponder?) -> Bool {
+        guard let responder else { return false }
+        if responder === self { return true }
+        if let view = responder as? NSView {
+            return view === self || view.isDescendant(of: self)
+        }
+        if let fieldEditor = responder as? NSTextView,
+           window?.fieldEditor(false, for: pathField) === fieldEditor {
+            return true
+        }
+        return false
     }
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
@@ -744,9 +777,16 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         addSubview(toolbarView)
 
         configureToolbarButton(upButton, symbolName: "arrow.up")
+        upButton.toolTip = "返回上级目录"
         upButton.target = self
         upButton.action = #selector(goUp)
         toolbarView.addSubview(upButton)
+
+        configureToolbarButton(homeButton, symbolName: "house")
+        homeButton.toolTip = "回到 Home 目录"
+        homeButton.target = self
+        homeButton.action = #selector(goHome)
+        toolbarView.addSubview(homeButton)
 
         pathField.font = NSFont.systemFont(ofSize: 13)
         pathField.textColor = .labelColor
@@ -896,6 +936,10 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         let parent = rootURL.deletingLastPathComponent()
         guard parent.path != rootURL.path else { return }
         reload(rootURL: parent)
+    }
+
+    @objc private func goHome() {
+        reload(rootURL: FileManager.default.homeDirectoryForCurrentUser)
     }
 
     @objc private func viewModeChanged() {
@@ -1099,6 +1143,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
 
     private func updateExpandedState() {
         upButton.isHidden = !isExpanded
+        homeButton.isHidden = !isExpanded
         viewModeControl.isHidden = !isExpanded
         sortButton.isHidden = !isExpanded
         let showsBrowser = isExpanded && !suppressesBrowserContent
@@ -1183,19 +1228,20 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         pathField.stringValue = (displayURL ?? rootURL).path
     }
 
-    private func toolbarFrames(expanded: Bool) -> (up: NSRect, path: NSRect, viewMode: NSRect, sort: NSRect) {
+    private func toolbarFrames(expanded: Bool) -> (up: NSRect, home: NSRect, path: NSRect, viewMode: NSRect, sort: NSRect) {
         let controlW: CGFloat = 74
         let sortW: CGFloat = 34
         let sort = NSRect(x: bounds.width - 10 - sortW, y: 7, width: sortW, height: 30)
         let viewMode = NSRect(x: sort.minX - controlW - 8, y: 7, width: controlW, height: 30)
         let up = NSRect(x: 10, y: 7, width: 30, height: 30)
+        let home = NSRect(x: up.maxX + 4, y: 7, width: 30, height: 30)
         let path: NSRect
         if expanded {
-            path = NSRect(x: 48, y: 8, width: max(120, viewMode.minX - 58), height: 28)
+            path = NSRect(x: 84, y: 8, width: max(120, viewMode.minX - 94), height: 28)
         } else {
             path = NSRect(x: 12, y: 8, width: max(120, bounds.width - 24), height: 28)
         }
-        return (up, path, viewMode, sort)
+        return (up, home, path, viewMode, sort)
     }
 
     private func children(of entry: MediaEntry) -> [MediaEntry] {
@@ -1421,11 +1467,19 @@ final class MediaFileTreesView: NSView {
     }
 
     func setExpanded(_ expanded: Bool, animated: Bool = false) {
+        if !expanded {
+            clearFocusAndSelectionForCollapse()
+        }
         isExpanded = expanded
         treeA.setExpanded(expanded, animated: animated)
         treeB.setExpanded(expanded, animated: animated)
         updateResizeHandleVisibility()
         needsLayout = true
+        if !expanded {
+            DispatchQueue.main.async { [weak self] in
+                self?.clearFocusAndSelectionForCollapse()
+            }
+        }
     }
 
     func setBrowserContentSuppressed(_ suppressed: Bool) {
@@ -1435,6 +1489,16 @@ final class MediaFileTreesView: NSView {
 
     func endPathEditingIfNeeded() -> Bool {
         treeA.endPathEditingIfNeeded() || treeB.endPathEditingIfNeeded()
+    }
+
+    func clearFocusAndSelectionForCollapse() {
+        treeA.clearFocusAndSelectionForCollapse()
+        treeB.clearFocusAndSelectionForCollapse()
+        if let window,
+           let firstResponder = window.firstResponder as? NSView,
+           firstResponder.isDescendant(of: self) {
+            window.makeFirstResponder(nil)
+        }
     }
 
     var isPathEditing: Bool {

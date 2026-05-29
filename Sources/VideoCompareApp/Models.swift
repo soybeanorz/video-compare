@@ -32,8 +32,8 @@ enum CompareLayout: Int, CaseIterable {
 
     var title: String {
         switch self {
-        case .sideBySideHorizontal: "左右"
-        case .overlapWipe: "拖动遮罩"
+        case .sideBySideHorizontal: "并排对比"
+        case .overlapWipe: "滑动对比"
         }
     }
 }

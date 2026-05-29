@@ -562,6 +562,9 @@ final class MainWindowController: NSWindowController {
         case directory(URL)
     }
 
+    private static let filePanelRootADefaultsKey = "mediaFileTree.root.a.v1"
+    private static let filePanelRootBDefaultsKey = "mediaFileTree.root.b.v1"
+
     convenience init() {
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 1440, height: 900))
         let window = VideoCompareWindow(
@@ -714,6 +717,7 @@ final class MainWindowController: NSWindowController {
         playerB.onOpenFailed = { [weak self] slot, message in self?.showLoadError(slot: slot, message: message) }
         playerA.onSeekCompleted = { [weak self] _, exact, elapsed in self?.recordSeekCompleted(exact: exact, elapsed: elapsed) }
         playerB.onSeekCompleted = { [weak self] _, exact, elapsed in self?.recordSeekCompleted(exact: exact, elapsed: elapsed) }
+        restoreFilePanelRoots()
         configureScrubCoordinators()
 
         canvas.containerA.onFileDropped = { [weak self] slot, url in self?.handleDroppedItems([url], targetSlot: slot) }
@@ -762,6 +766,12 @@ final class MainWindowController: NSWindowController {
         mediaFileTrees.setExpanded(fileTreesExpanded)
         mediaFileTrees.treeA.onFileOpened = { [weak self] slot, url in self?.load(url: url, slot: slot) }
         mediaFileTrees.treeB.onFileOpened = { [weak self] slot, url in self?.load(url: url, slot: slot) }
+        mediaFileTrees.treeA.onLocationChanged = { [weak self] slot, root, display in
+            self?.setFilePanelLocation(root: root, display: display, slot: slot)
+        }
+        mediaFileTrees.treeB.onLocationChanged = { [weak self] slot, root, display in
+            self?.setFilePanelLocation(root: root, display: display, slot: slot)
+        }
         mediaFileTrees.onHeightChanged = { [weak self] _ in
             self?.layoutContent(animated: false)
         }
@@ -788,6 +798,7 @@ final class MainWindowController: NSWindowController {
         layoutControl.selectedSegment = CompareLayout.sideBySideHorizontal.rawValue
         applyColorAdjustmentsToRenderer()
         selectedSlot = nil
+        reloadMediaFileTrees()
 
     }
 
@@ -1207,11 +1218,19 @@ final class MainWindowController: NSWindowController {
         fileTreesExpanded.toggle()
         Diagnostics.log("fileTree.toggle previous=\(previous) next=\(fileTreesExpanded)")
         let targetExpanded = fileTreesExpanded
+        if !targetExpanded {
+            mediaFileTrees.clearFocusAndSelectionForCollapse()
+            window?.makeFirstResponder(nil)
+        }
         updateFileTreeToggleButton()
         mediaFileTrees.setBrowserContentSuppressed(true)
         mediaFileTrees.setExpanded(targetExpanded, animated: true)
         animateFileTreeTransition(to: targetExpanded) { [weak self] in
             self?.mediaFileTrees.setBrowserContentSuppressed(!targetExpanded)
+            if !targetExpanded {
+                self?.mediaFileTrees.clearFocusAndSelectionForCollapse()
+                self?.window?.makeFirstResponder(nil)
+            }
         }
     }
 
@@ -1222,6 +1241,11 @@ final class MainWindowController: NSWindowController {
             rootB: mediaRoot(for: .b),
             displayB: mediaDisplayURL(for: .b)
         )
+    }
+
+    private func restoreFilePanelRoots() {
+        filePanelRootA = Self.loadSavedFilePanelRoot(slot: .a)
+        filePanelRootB = Self.loadSavedFilePanelRoot(slot: .b)
     }
 
     private func mediaRoot(for slot: VideoSlot) -> URL {
@@ -1247,6 +1271,30 @@ final class MainWindowController: NSWindowController {
             filePanelRootB = root.standardizedFileURL
             filePanelDisplayB = display?.standardizedFileURL
         }
+        Self.saveFilePanelRoot(root, slot: slot)
+    }
+
+    private static func filePanelRootDefaultsKey(slot: VideoSlot) -> String {
+        switch slot {
+        case .a: filePanelRootADefaultsKey
+        case .b: filePanelRootBDefaultsKey
+        }
+    }
+
+    private static func saveFilePanelRoot(_ root: URL, slot: VideoSlot) {
+        UserDefaults.standard.set(root.standardizedFileURL.path, forKey: filePanelRootDefaultsKey(slot: slot))
+    }
+
+    private static func loadSavedFilePanelRoot(slot: VideoSlot) -> URL? {
+        let path = UserDefaults.standard.string(forKey: filePanelRootDefaultsKey(slot: slot)) ?? ""
+        guard !path.isEmpty else { return nil }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return nil
+        }
+        return url
     }
 
     private func expandMediaFileTreesIfNeeded() {
