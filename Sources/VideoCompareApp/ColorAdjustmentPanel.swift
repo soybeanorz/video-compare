@@ -1,5 +1,25 @@
 import AppKit
 
+final class ColorAdjustmentPanel: NSPanel {
+    var onUndoShortcut: (() -> Void)?
+    var onRedoShortcut: (() -> Void)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown,
+           event.modifierFlags.contains(.command),
+           event.modifierFlags.intersection([.control, .option]).isEmpty,
+           event.charactersIgnoringModifiers?.lowercased() == "z" {
+            if event.modifierFlags.contains(.shift) {
+                onRedoShortcut?()
+            } else {
+                onUndoShortcut?()
+            }
+            return
+        }
+        super.sendEvent(event)
+    }
+}
+
 private enum AdjustmentPanelStyle {
     static let background = NSColor(calibratedWhite: 0.56, alpha: 1)
     static let label = NSColor(calibratedWhite: 1, alpha: 0.90)
@@ -474,7 +494,7 @@ final class ColorAdjustmentPanelController: NSWindowController {
     var onWhiteBalanceRequested: (() -> Void)?
 
     convenience init() {
-        let panel = NSPanel(
+        let panel = ColorAdjustmentPanel(
             contentRect: NSRect(x: 0, y: 0, width: 318, height: 448),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,

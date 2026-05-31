@@ -476,6 +476,7 @@ final class MainWindowController: NSWindowController {
         var transformB: TransformState
         var colorAdjustmentA: ColorAdjustmentState
         var colorAdjustmentB: ColorAdjustmentState
+        var wipeFraction: CGFloat
     }
 
     private struct ROIAlignmentSnapshot: @unchecked Sendable {
@@ -754,6 +755,16 @@ final class MainWindowController: NSWindowController {
         canvas.onWhiteBalanceSampleRequested = { [weak self] slot, point, phase in
             self?.handleWhiteBalancePick(slot: slot, canvasPoint: point, phase: phase)
         }
+        canvas.onWipeInteractionBegan = { [weak self] in
+            self?.beginPreviewUndoGroup()
+        }
+        canvas.onWipeChanged = { [weak self] _ in
+            guard let self else { return }
+            self.refreshStatus()
+        }
+        canvas.onWipeInteractionEnded = { [weak self] in
+            self?.commitPreviewUndoGroup()
+        }
         canvas.onToggleChanged = { [weak self] in
             self?.refreshStatus()
         }
@@ -798,7 +809,7 @@ final class MainWindowController: NSWindowController {
         layoutControl.selectedSegment = CompareLayout.sideBySideHorizontal.rawValue
         applyColorAdjustmentsToRenderer()
         selectedSlot = nil
-        reloadMediaFileTrees()
+        reloadMediaFileTrees(recordHistory: false)
 
     }
 
@@ -967,35 +978,9 @@ final class MainWindowController: NSWindowController {
         appMenu.addItem(withTitle: "退出 VideoCompare", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
-        let editItem = NSMenuItem()
-        mainMenu.addItem(editItem)
-        let editMenu = NSMenu(title: "编辑")
-        let undoItem = NSMenuItem(title: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
-        undoItem.keyEquivalentModifierMask = [.command]
-        undoItem.target = nil
-        editMenu.addItem(undoItem)
-        let redoItem = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
-        redoItem.keyEquivalentModifierMask = [.command, .shift]
-        redoItem.target = nil
-        editMenu.addItem(redoItem)
-        editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        editItem.submenu = editMenu
-
         let fileItem = NSMenuItem()
         mainMenu.addItem(fileItem)
         let fileMenu = NSMenu(title: "文件")
-        let loadAItem = NSMenuItem(title: "加载 A...", action: #selector(openA), keyEquivalent: "")
-        loadAItem.target = self
-        fileMenu.addItem(loadAItem)
-        let loadBItem = NSMenuItem(title: "加载 B...", action: #selector(openB), keyEquivalent: "")
-        loadBItem.target = self
-        fileMenu.addItem(loadBItem)
-        fileMenu.addItem(.separator())
         let recentItem = NSMenuItem(title: "最近视频组", action: nil, keyEquivalent: "")
         recentItem.submenu = recentMenu
         fileMenu.addItem(recentItem)
@@ -1113,9 +1098,6 @@ final class MainWindowController: NSWindowController {
     private func layoutContent(animated: Bool) {
         guard let content = window?.contentView else { return }
         guard let frames = contentLayoutFrames(expanded: fileTreesExpanded) else { return }
-        Diagnostics.log(
-            "layoutContent animated=\(animated) expanded=\(fileTreesExpanded) mediaTarget=(\(rectDebug(frames.mediaFileTrees))) canvasTarget=(\(rectDebug(frames.canvas))) mediaCurrent=(\(rectDebug(mediaFileTrees.frame))) canvasCurrent=(\(rectDebug(canvas.frame)))"
-        )
 
         func setFrame(_ view: NSView, _ frame: NSRect) {
             if animated {
@@ -1157,9 +1139,6 @@ final class MainWindowController: NSWindowController {
         let startMediaFrame = mediaFileTrees.frame
         let startCanvasFrame = canvas.frame
         let startHelpFrame = shortcutHelpPanel.frame
-        Diagnostics.log(
-            "fileTree.anim.request expanded=\(expanded) mediaStart=(\(rectDebug(startMediaFrame))) mediaTarget=(\(rectDebug(targetFrames.mediaFileTrees))) canvasStart=(\(rectDebug(startCanvasFrame))) canvasTarget=(\(rectDebug(targetFrames.canvas)))"
-        )
         layoutControl.setWidth(targetFrames.layoutControl.width / 2, forSegment: 0)
         layoutControl.setWidth(targetFrames.layoutControl.width / 2, forSegment: 1)
         mediaFileTrees.alphaValue = 1
@@ -1167,7 +1146,6 @@ final class MainWindowController: NSWindowController {
 
         let duration: TimeInterval = 0.24
         let startTime = CACurrentMediaTime()
-        Diagnostics.log("fileTree.anim.manual.start expanded=\(expanded) duration=\(duration)")
         fileTreeAnimationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { [weak self] in
                 guard let self else { return }
@@ -1190,33 +1168,16 @@ final class MainWindowController: NSWindowController {
                     self.mediaFileTrees.frame = targetFrames.mediaFileTrees
                     self.canvas.frame = targetFrames.canvas
                     self.canvas.layoutSubtreeIfNeeded()
-                    Diagnostics.log(
-                        "fileTree.anim.manual.complete expanded=\(expanded) mediaActual=(\(self.rectDebug(self.mediaFileTrees.frame))) canvasActual=(\(self.rectDebug(self.canvas.frame)))"
-                    )
                     self.layoutContent(animated: false)
                     completion?()
                 }
             }
         }
         RunLoop.main.add(fileTreeAnimationTimer!, forMode: .common)
-        logFileTreeAnimationSamples(expanded: expanded)
-    }
-
-    private func logFileTreeAnimationSamples(expanded: Bool) {
-        for delay in [0.04, 0.12, 0.22, 0.32] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self else { return }
-                Diagnostics.log(
-                    "fileTree.anim.sample expanded=\(expanded) t=\(String(format: "%.2f", delay)) media=(\(self.rectDebug(self.mediaFileTrees.frame))) canvas=(\(self.rectDebug(self.canvas.frame)))"
-                )
-            }
-        }
     }
 
     @objc private func toggleMediaFileTrees() {
-        let previous = fileTreesExpanded
         fileTreesExpanded.toggle()
-        Diagnostics.log("fileTree.toggle previous=\(previous) next=\(fileTreesExpanded)")
         let targetExpanded = fileTreesExpanded
         if !targetExpanded {
             mediaFileTrees.clearFocusAndSelectionForCollapse()
@@ -1234,12 +1195,13 @@ final class MainWindowController: NSWindowController {
         }
     }
 
-    private func reloadMediaFileTrees() {
+    private func reloadMediaFileTrees(recordHistory: Bool = true) {
         mediaFileTrees.reload(
             rootA: mediaRoot(for: .a),
             displayA: mediaDisplayURL(for: .a),
             rootB: mediaRoot(for: .b),
-            displayB: mediaDisplayURL(for: .b)
+            displayB: mediaDisplayURL(for: .b),
+            recordHistory: recordHistory
         )
     }
 
@@ -1329,22 +1291,6 @@ final class MainWindowController: NSWindowController {
         )
     }
 
-    @objc private func openA() { open(slot: .a) }
-    @objc private func openB() { open(slot: .b) }
-
-    private func open(slot: VideoSlot) {
-        ensureMainWindowVisible()
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = MediaFileSupport.allowedContentTypes
-        panel.allowsOtherFileTypes = true
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            load(url: url, slot: slot)
-        }
-    }
-
     private func handleDroppedItems(_ urls: [URL], targetSlot: VideoSlot) {
         let items = urls.compactMap(droppedItem(for:))
         guard !items.isEmpty else {
@@ -1412,6 +1358,7 @@ final class MainWindowController: NSWindowController {
         switch slot {
         case .a:
             canvas.containerA.showsPlaceholder = false
+            canvas.setFileName(url, slot: .a)
             colorAdjustmentA = ColorAdjustmentState()
             rawTemperatureTintTrackingSlots.remove(.a)
             colorHistogramA = ColorHistogram.empty
@@ -1420,6 +1367,7 @@ final class MainWindowController: NSWindowController {
             playerA.load(url: url)
         case .b:
             canvas.containerB.showsPlaceholder = false
+            canvas.setFileName(url, slot: .b)
             colorAdjustmentB = ColorAdjustmentState()
             rawTemperatureTintTrackingSlots.remove(.b)
             colorHistogramB = ColorHistogram.empty
@@ -2029,13 +1977,6 @@ final class MainWindowController: NSWindowController {
     }
 
     @objc func openColorAdjustmentPanel(_ sender: Any?) {
-        Diagnostics.log(
-            "colorPanel.open.begin sender=\(String(describing: sender.map { type(of: $0) })) " +
-            "exe=\(Bundle.main.executableURL?.path ?? "unknown") " +
-            "selected=\(selectedSlot?.rawValue ?? "nil") " +
-            "fileA=\(playerA.fileURL?.path ?? "nil") fileB=\(playerB.fileURL?.path ?? "nil") " +
-            "hasPanel=\(colorAdjustmentPanel != nil)"
-        )
         if selectedSlot == nil {
             if playerA.fileURL != nil {
                 selectedSlot = .a
@@ -2050,14 +1991,9 @@ final class MainWindowController: NSWindowController {
         panel.showWindow(nil)
         panel.window?.makeKeyAndOrderFront(nil)
         panel.window?.orderFrontRegardless()
-        Diagnostics.log(
-            "colorPanel.open.end selected=\(selectedSlot?.rawValue ?? "nil") " +
-            "visible=\(panel.window?.isVisible ?? false) key=\(panel.window?.isKeyWindow ?? false)"
-        )
     }
 
     private func makeColorAdjustmentPanel() -> ColorAdjustmentPanelController {
-        Diagnostics.log("colorPanel.make.begin")
         let panel = ColorAdjustmentPanelController()
         panel.onStateChanged = { [weak self] state in
             guard let self, let slot = self.selectedSlot else { return }
@@ -2074,7 +2010,14 @@ final class MainWindowController: NSWindowController {
         panel.onWhiteBalanceRequested = { [weak self] in
             self?.toggleWhiteBalanceSampling()
         }
-        Diagnostics.log("colorPanel.make.end window=\(panel.window != nil)")
+        if let window = panel.window as? ColorAdjustmentPanel {
+            window.onUndoShortcut = { [weak self] in
+                self?.undoPreviewEdit()
+            }
+            window.onRedoShortcut = { [weak self] in
+                self?.redoPreviewEdit()
+            }
+        }
         return panel
     }
 
@@ -2413,7 +2356,8 @@ final class MainWindowController: NSWindowController {
             transformA: syncState.transformA,
             transformB: syncState.transformB,
             colorAdjustmentA: colorAdjustmentA,
-            colorAdjustmentB: colorAdjustmentB
+            colorAdjustmentB: colorAdjustmentB,
+            wipeFraction: canvas.wipeFraction
         )
     }
 
@@ -2478,8 +2422,11 @@ final class MainWindowController: NSWindowController {
         colorAdjustmentA = state.colorAdjustmentA
         colorAdjustmentB = state.colorAdjustmentB
 
+        canvas.wipeFraction = state.wipeFraction
+        canvas.renderer.wipeFraction = state.wipeFraction
         canvas.renderer.transformA = syncState.transformA
         canvas.renderer.transformB = syncState.transformB
+        canvas.needsLayout = true
         playerA.applyTransform(syncState.transformA)
         playerB.applyTransform(syncState.transformB)
         applyColorAdjustmentsToRenderer()
@@ -2551,7 +2498,7 @@ final class MainWindowController: NSWindowController {
     }
 
     private func messageForROIAlignmentRejection(_ reason: String) -> String {
-        if reason.contains("layout") { return "请先切换到拖动遮罩模式" }
+        if reason.contains("layout") { return "请先切换到滑动对比模式" }
         if reason.contains("missing-frame") { return "请先加载 A/B 并停在当前帧" }
         if reason.contains("playing") { return "自动对齐仅在暂停时可用" }
         if reason.contains("busy") { return "正在计算自动对齐" }
@@ -3747,8 +3694,12 @@ final class MainWindowController: NSWindowController {
 
     private func showLoadError(slot: VideoSlot, message: String) {
         switch slot {
-        case .a: canvas.containerA.showsPlaceholder = true
-        case .b: canvas.containerB.showsPlaceholder = true
+        case .a:
+            canvas.containerA.showsPlaceholder = true
+            canvas.setFileName(nil, slot: .a)
+        case .b:
+            canvas.containerB.showsPlaceholder = true
+            canvas.setFileName(nil, slot: .b)
         }
         let alert = NSAlert()
         alert.messageText = "加载 \(slot.rawValue.uppercased()) 失败"
@@ -3834,7 +3785,9 @@ final class MainWindowController: NSWindowController {
             return true
         case 48:
             guard canvas.layoutMode == .overlapWipe else { return false }
+            beginPreviewUndoGroup()
             canvas.toggleWipeEdge()
+            commitPreviewUndoGroup()
             return true
         case 123:
             stepBySelection(-1)

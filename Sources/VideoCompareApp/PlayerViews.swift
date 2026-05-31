@@ -98,6 +98,9 @@ private extension NSPasteboard.PasteboardType {
 }
 
 final class WipeDividerView: NSView {
+    private let handleSize = NSSize(width: 16, height: 56)
+    private let handleBottomInset: CGFloat = 10
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -126,11 +129,118 @@ final class WipeDividerView: NSView {
         NSColor(calibratedWhite: 1, alpha: 0.95).setFill()
         NSBezierPath(rect: NSRect(x: floor(bounds.midX) - 1, y: 0, width: 2, height: bounds.height)).fill()
 
-        let knob = NSRect(x: bounds.midX - 8, y: bounds.midY - 28, width: 16, height: 56)
+        let knob = NSRect(
+            x: bounds.midX - handleSize.width / 2,
+            y: max(0, bounds.maxY - handleBottomInset - handleSize.height),
+            width: handleSize.width,
+            height: handleSize.height
+        )
         NSColor(calibratedWhite: 0.05, alpha: 0.65).setFill()
-        NSBezierPath(roundedRect: knob, xRadius: 8, yRadius: 8).fill()
+        NSBezierPath(roundedRect: knob, xRadius: handleSize.width / 2, yRadius: handleSize.width / 2).fill()
         NSColor.white.setStroke()
-        NSBezierPath(roundedRect: knob.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8).stroke()
+        NSBezierPath(
+            roundedRect: knob.insetBy(dx: 0.5, dy: 0.5),
+            xRadius: handleSize.width / 2,
+            yRadius: handleSize.width / 2
+        ).stroke()
+
+        drawChevron(direction: -1, center: NSPoint(x: knob.midX - 3.5, y: knob.midY), color: .white)
+        drawChevron(direction: 1, center: NSPoint(x: knob.midX + 3.5, y: knob.midY), color: .white)
+    }
+
+    private func drawChevron(direction: CGFloat, center: NSPoint, color: NSColor) {
+        let path = NSBezierPath()
+        let width: CGFloat = 3
+        let height: CGFloat = 6
+        path.move(to: NSPoint(x: center.x - direction * width / 2, y: center.y - height / 2))
+        path.line(to: NSPoint(x: center.x + direction * width / 2, y: center.y))
+        path.line(to: NSPoint(x: center.x - direction * width / 2, y: center.y + height / 2))
+        path.lineWidth = 1.25
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        color.setStroke()
+        path.stroke()
+    }
+}
+
+final class FileNameBadgeView: NSView {
+    var title = "" {
+        didSet {
+            isHidden = title.isEmpty
+            needsDisplay = true
+        }
+    }
+    var isSelected = false {
+        didSet { needsDisplay = true }
+    }
+
+    private let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+    private let horizontalPadding: CGFloat = 12
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    var preferredWidth: CGFloat {
+        ceil((title as NSString).size(withAttributes: textAttributes()).width) + horizontalPadding * 2
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !title.isEmpty else { return }
+        NSColor(calibratedWhite: 0.03, alpha: 0.72).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
+
+        let attributes = textAttributes()
+        let availableWidth = max(0, bounds.width - horizontalPadding * 2)
+        let text = truncatedTitle(fitting: availableWidth, attributes: attributes)
+        let size = (text as NSString).size(withAttributes: attributes)
+        let x = floor((bounds.width - min(size.width, availableWidth)) / 2)
+        let lineHeight = ceil(font.ascender - font.descender)
+        let textRect = NSRect(
+            x: max(horizontalPadding, x),
+            y: floor((bounds.height - lineHeight) / 2),
+            width: min(size.width, availableWidth),
+            height: lineHeight
+        )
+        (text as NSString).draw(in: textRect, withAttributes: attributes)
+    }
+
+    private func textAttributes() -> [NSAttributedString.Key: Any] {
+        [
+            .font: font,
+            .foregroundColor: isSelected ? NSColor.systemYellow : NSColor(calibratedWhite: 0.94, alpha: 1)
+        ]
+    }
+
+    private func truncatedTitle(fitting width: CGFloat, attributes: [NSAttributedString.Key: Any]) -> String {
+        guard width > 0 else { return "" }
+        guard (title as NSString).size(withAttributes: attributes).width > width else { return title }
+        let characters = Array(title)
+        guard characters.count > 3 else { return title }
+        var low = 1
+        var high = characters.count - 1
+        var best = "..."
+        while low <= high {
+            let count = (low + high) / 2
+            let prefixCount = max(1, count / 2)
+            let suffixCount = max(1, count - prefixCount)
+            let candidate = String(characters.prefix(prefixCount)) + "..." + String(characters.suffix(suffixCount))
+            if (candidate as NSString).size(withAttributes: attributes).width <= width {
+                best = candidate
+                low = count + 1
+            } else {
+                high = count - 1
+            }
+        }
+        return best
     }
 }
 
@@ -193,13 +303,15 @@ final class VideoCanvasView: NSView {
     let containerA = DropVideoView(slot: .a)
     let containerB = DropVideoView(slot: .b)
     let renderer = MetalCompositeView()
-    let labelA = NSTextField(labelWithString: "A: 未加载")
-    let labelB = NSTextField(labelWithString: "B: 未加载")
+    let labelA = FileNameBadgeView()
+    let labelB = FileNameBadgeView()
     private let frameNumberA = NSTextField(labelWithString: "")
     private let frameNumberB = NSTextField(labelWithString: "")
     private let divider = WipeDividerView()
     private let roiOverlay = ROISelectionOverlayView()
     private let labelHeight: CGFloat = 0
+    private let fileNameLabelHeight: CGFloat = 24
+    private let fileNameLabelTopInset: CGFloat = 10
 
     var layoutMode: CompareLayout = .sideBySideHorizontal {
         didSet { needsLayout = true }
@@ -208,7 +320,9 @@ final class VideoCanvasView: NSView {
         didSet { needsLayout = true }
     }
     var onToggleChanged: (() -> Void)?
+    var onWipeInteractionBegan: (() -> Void)?
     var onWipeChanged: ((CGFloat) -> Void)?
+    var onWipeInteractionEnded: (() -> Void)?
     var onPanDragged: ((VideoSlot?, CGFloat, CGFloat) -> Void)?
     var onZoomDragged: ((VideoSlot, CGFloat) -> Void)?
     var onAlignmentGestureEnded: (() -> Void)?
@@ -264,15 +378,6 @@ final class VideoCanvasView: NSView {
         addSubview(frameNumberA)
         addSubview(frameNumberB)
         addSubview(roiOverlay)
-        for label in [labelA, labelB] {
-            label.isHidden = true
-            label.lineBreakMode = .byTruncatingMiddle
-            label.maximumNumberOfLines = 1
-            label.textColor = NSColor(calibratedWhite: 0.88, alpha: 1)
-            label.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1)
-            label.drawsBackground = true
-            label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        }
         for label in [frameNumberA, frameNumberB] {
             label.isHidden = true
             label.lineBreakMode = .byTruncatingTail
@@ -411,22 +516,19 @@ final class VideoCanvasView: NSView {
         switch layoutMode {
         case .sideBySideHorizontal:
             let leftWidth = floor(b.width / 2)
+            let leftRect = NSRect(x: 0, y: oneLabel, width: leftWidth, height: max(0, b.height - oneLabel))
+            let rightRect = NSRect(x: leftWidth + 1, y: oneLabel, width: max(0, b.width - leftWidth - 1), height: max(0, b.height - oneLabel))
             containerA.isHidden = false
             containerB.isHidden = false
             divider.isHidden = true
-            labelA.isHidden = true
-            labelB.isHidden = true
             labelA.frame = NSRect(x: 0, y: 0, width: leftWidth, height: oneLabel)
             labelB.frame = NSRect(x: leftWidth + 1, y: 0, width: max(0, b.width - leftWidth - 1), height: oneLabel)
-            containerA.frame = NSRect(x: 0, y: oneLabel, width: leftWidth, height: max(0, b.height - oneLabel))
-            containerB.frame = NSRect(x: leftWidth + 1, y: oneLabel, width: max(0, b.width - leftWidth - 1), height: max(0, b.height - oneLabel))
+            containerA.frame = leftRect
+            containerB.frame = rightRect
             rectA = containerA.frame
             rectB = containerB.frame
+            layoutFileNameLabels(rectA: leftRect, rectB: rightRect)
         case .overlapWipe:
-            labelA.isHidden = true
-            labelB.isHidden = true
-            labelA.alignment = .left
-            labelB.alignment = .right
             labelA.frame = NSRect(x: 0, y: 0, width: floor(b.width / 2), height: oneLabel)
             labelB.frame = NSRect(x: floor(b.width / 2), y: 0, width: ceil(b.width / 2), height: oneLabel)
             let content = NSRect(x: 0, y: oneLabel, width: b.width, height: max(0, b.height - oneLabel))
@@ -441,15 +543,12 @@ final class VideoCanvasView: NSView {
             divider.frame = NSRect(x: content.minX + width - 12, y: content.minY, width: 24, height: content.height)
             rectA = content
             rectB = content
+            layoutFileNameLabels(rectA: leftRect, rectB: rightRect)
         }
         renderer.layoutMode = layoutMode
         renderer.wipeFraction = wipeFraction
         renderer.rectA = rectA
         renderer.rectB = rectB
-        if layoutMode != .overlapWipe {
-            labelA.alignment = .left
-            labelB.alignment = .left
-        }
         layoutFrameNumberLabels(rectA: rectA, rectB: rectB)
         updateSelectionAppearance()
     }
@@ -464,6 +563,14 @@ final class VideoCanvasView: NSView {
         let value = text ?? ""
         label.stringValue = value
         label.isHidden = !visible || value.isEmpty
+        needsLayout = true
+    }
+
+    func setFileName(_ url: URL?, slot: VideoSlot) {
+        let label = slot == .a ? labelA : labelB
+        label.title = url?.lastPathComponent ?? ""
+        label.toolTip = url?.path
+        label.isHidden = url == nil
         needsLayout = true
     }
 
@@ -503,6 +610,7 @@ final class VideoCanvasView: NSView {
         didPan = false
         lastDragPoint = point
         if isDraggingWipe {
+            onWipeInteractionBegan?()
             updateWipeFromPoint(point)
         }
     }
@@ -553,10 +661,14 @@ final class VideoCanvasView: NSView {
             }
             return
         }
+        let didDragWipe = isDraggingWipe
         isDraggingWipe = false
         isPanning = false
         panSlot = nil
         lastDragPoint = nil
+        if didDragWipe {
+            onWipeInteractionEnded?()
+        }
         if didPan {
             onAlignmentGestureEnded?()
         }
@@ -649,6 +761,27 @@ final class VideoCanvasView: NSView {
         }
     }
 
+    private func layoutFileNameLabels(rectA: NSRect, rectB: NSRect) {
+        let labels: [(FileNameBadgeView, NSRect)] = [(labelA, rectA), (labelB, rectB)]
+        for (label, rect) in labels {
+            guard !label.title.isEmpty,
+                  rect.width >= 72,
+                  rect.height >= fileNameLabelHeight + fileNameLabelTopInset else {
+                label.isHidden = true
+                continue
+            }
+            let maxWidth = max(48, rect.width - 24)
+            let width = min(max(72, label.preferredWidth), maxWidth)
+            label.frame = NSRect(
+                x: rect.midX - width / 2,
+                y: rect.minY + fileNameLabelTopInset,
+                width: width,
+                height: fileNameLabelHeight
+            )
+            label.isHidden = false
+        }
+    }
+
     private func slot(at point: NSPoint) -> VideoSlot? {
         switch layoutMode {
         case .sideBySideHorizontal:
@@ -707,7 +840,7 @@ final class VideoCanvasView: NSView {
             container.layer?.borderWidth = selected ? 3 : 0
             container.layer?.borderColor = selected ? NSColor.systemYellow.cgColor : nil
         }
-        labelA.textColor = selectedSlot == .a ? .systemYellow : NSColor(calibratedWhite: 0.88, alpha: 1)
-        labelB.textColor = selectedSlot == .b ? .systemYellow : NSColor(calibratedWhite: 0.88, alpha: 1)
+        labelA.isSelected = selectedSlot == .a
+        labelB.isSelected = selectedSlot == .b
     }
 }
