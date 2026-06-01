@@ -436,6 +436,7 @@ final class MainWindowController: NSWindowController {
     private var rawWhiteBalanceIsSolving = false
     private var pendingRawWhiteBalanceRequest: RawWhiteBalancePickRequest?
     private var lastRawWhiteBalancePreview: (slot: VideoSlot, adjustment: ColorAdjustmentState)?
+    private var didApplyInitialWindowFrame = false
     private static let loopPreviewFrameCount = 8
     private static let loopSeekTimeout: TimeInterval = 1.5
 
@@ -815,9 +816,18 @@ final class MainWindowController: NSWindowController {
 
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender)
+        applyInitialWindowFrameIfNeeded()
         layoutContent()
         DispatchQueue.main.async { [weak self] in
             self?.window?.makeFirstResponder(nil)
+        }
+    }
+
+    private func applyInitialWindowFrameIfNeeded() {
+        guard !didApplyInitialWindowFrame, let window else { return }
+        didApplyInitialWindowFrame = true
+        if let frame = (window.screen ?? NSScreen.main)?.visibleFrame {
+            window.setFrame(frame, display: true)
         }
     }
 

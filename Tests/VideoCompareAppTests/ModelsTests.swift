@@ -207,4 +207,86 @@ struct ModelsTests {
         #expect(disabled == defaults)
     }
 
+    @Test func smbURLParsesToNetworkTarget() throws {
+        let resolution = NetworkPathResolver.resolve(
+            "smb://10.1.228.130/影像系统部/abc.mp4",
+            mountedVolumes: [],
+            volumesRoot: URL(fileURLWithPath: "/tmp/nonexistent-volumes", isDirectory: true)
+        )
+
+        guard case .needsMount(let mountURL, let target) = resolution else {
+            Issue.record("Expected SMB URL to require mount")
+            return
+        }
+        #expect(mountURL.absoluteString == "smb://10.1.228.130/%E5%BD%B1%E5%83%8F%E7%B3%BB%E7%BB%9F%E9%83%A8/")
+        #expect(target.host == "10.1.228.130")
+        #expect(target.share == "影像系统部")
+        #expect(target.pathComponents == ["abc.mp4"])
+        #expect(target.localURL(volumeURL: URL(fileURLWithPath: "/Volumes/影像系统部", isDirectory: true)).path == "/Volumes/影像系统部/abc.mp4")
+    }
+
+    @Test func windowsUNCPathParsesToNetworkTarget() {
+        let resolution = NetworkPathResolver.resolve(
+            "\\\\10.1.228.130\\影像系统部\\abc.mp4",
+            mountedVolumes: [],
+            volumesRoot: URL(fileURLWithPath: "/tmp/nonexistent-volumes", isDirectory: true)
+        )
+
+        guard case .needsMount(let mountURL, let target) = resolution else {
+            Issue.record("Expected UNC path to require mount")
+            return
+        }
+        #expect(mountURL.absoluteString == "smb://10.1.228.130/%E5%BD%B1%E5%83%8F%E7%B3%BB%E7%BB%9F%E9%83%A8/")
+        #expect(target.host == "10.1.228.130")
+        #expect(target.share == "影像系统部")
+        #expect(target.pathComponents == ["abc.mp4"])
+        #expect(target.localURL(volumeURL: URL(fileURLWithPath: "/Volumes/影像系统部", isDirectory: true)).path == "/Volumes/影像系统部/abc.mp4")
+    }
+
+    @Test func percentEncodedSMBShareParsesAsUnicode() {
+        let resolution = NetworkPathResolver.resolve(
+            "cifs://10.1.228.130/%E5%BD%B1%E5%83%8F%E7%B3%BB%E7%BB%9F%E9%83%A8/sub%20folder/abc.mp4",
+            mountedVolumes: [],
+            volumesRoot: URL(fileURLWithPath: "/tmp/nonexistent-volumes", isDirectory: true)
+        )
+
+        guard case .needsMount(_, let target) = resolution else {
+            Issue.record("Expected percent-encoded CIFS URL to require mount")
+            return
+        }
+        #expect(target.share == "影像系统部")
+        #expect(target.pathComponents == ["sub folder", "abc.mp4"])
+    }
+
+    @Test func mountedSMBShareMapsToVolumesPath() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VideoCompareNetworkPathTests-\(UUID().uuidString)", isDirectory: true)
+        let volumesRoot = base.appendingPathComponent("Volumes", isDirectory: true)
+        let shareRoot = volumesRoot.appendingPathComponent("影像系统部", isDirectory: true)
+        try FileManager.default.createDirectory(at: shareRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let resolution = NetworkPathResolver.resolve(
+            "smb://10.1.228.130/影像系统部/abc.mp4",
+            mountedVolumes: [],
+            volumesRoot: volumesRoot
+        )
+
+        guard case .local(let localURL) = resolution else {
+            Issue.record("Expected mounted SMB share to map to local URL")
+            return
+        }
+        #expect(localURL.path == shareRoot.appendingPathComponent("abc.mp4").standardizedFileURL.path)
+    }
+
+    @Test func ordinaryLocalPathIsNotNetworkPath() {
+        let resolution = NetworkPathResolver.resolve(
+            "/Users/soybean/Downloads",
+            mountedVolumes: [],
+            volumesRoot: URL(fileURLWithPath: "/tmp/nonexistent-volumes", isDirectory: true)
+        )
+
+        #expect(resolution == .unsupported)
+    }
+
 }

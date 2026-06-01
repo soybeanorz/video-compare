@@ -543,7 +543,7 @@ final class VideoCanvasView: NSView {
             divider.frame = NSRect(x: content.minX + width - 12, y: content.minY, width: 24, height: content.height)
             rectA = content
             rectB = content
-            layoutFileNameLabels(rectA: leftRect, rectB: rightRect)
+            layoutFileNameLabels(rectA: content, rectB: content)
         }
         renderer.layoutMode = layoutMode
         renderer.wipeFraction = wipeFraction
@@ -762,24 +762,45 @@ final class VideoCanvasView: NSView {
     }
 
     private func layoutFileNameLabels(rectA: NSRect, rectB: NSRect) {
-        let labels: [(FileNameBadgeView, NSRect)] = [(labelA, rectA), (labelB, rectB)]
-        for (label, rect) in labels {
-            guard !label.title.isEmpty,
-                  rect.width >= 72,
-                  rect.height >= fileNameLabelHeight + fileNameLabelTopInset else {
-                label.isHidden = true
-                continue
-            }
-            let maxWidth = max(48, rect.width - 24)
-            let width = min(max(72, label.preferredWidth), maxWidth)
-            label.frame = NSRect(
-                x: rect.midX - width / 2,
-                y: rect.minY + fileNameLabelTopInset,
-                width: width,
-                height: fileNameLabelHeight
-            )
-            label.isHidden = false
+        switch layoutMode {
+        case .sideBySideHorizontal:
+            layoutFileNameLabel(labelA, in: rectA, alignment: .left, maxWidth: max(48, rectA.width - 24))
+            layoutFileNameLabel(labelB, in: rectB, alignment: .right, maxWidth: max(48, rectB.width - 24))
+        case .overlapWipe:
+            let maxWidth = max(48, floor(rectA.width / 2) - 18)
+            layoutFileNameLabel(labelA, in: rectA, alignment: .left, maxWidth: maxWidth)
+            layoutFileNameLabel(labelB, in: rectB, alignment: .right, maxWidth: maxWidth)
         }
+    }
+
+    private enum FileNameBadgeAlignment {
+        case left
+        case right
+    }
+
+    private func layoutFileNameLabel(_ label: FileNameBadgeView, in rect: NSRect, alignment: FileNameBadgeAlignment, maxWidth: CGFloat) {
+        guard !label.title.isEmpty,
+              rect.width >= 72,
+              rect.height >= fileNameLabelHeight + fileNameLabelTopInset else {
+            label.isHidden = true
+            return
+        }
+        let edgeInset: CGFloat = 12
+        let width = min(max(72, label.preferredWidth), maxWidth)
+        let x: CGFloat
+        switch alignment {
+        case .left:
+            x = rect.minX + edgeInset
+        case .right:
+            x = rect.maxX - edgeInset - width
+        }
+        label.frame = NSRect(
+            x: x,
+            y: rect.minY + fileNameLabelTopInset,
+            width: width,
+            height: fileNameLabelHeight
+        )
+        label.isHidden = false
     }
 
     private func slot(at point: NSPoint) -> VideoSlot? {

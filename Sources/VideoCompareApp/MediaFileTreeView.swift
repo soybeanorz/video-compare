@@ -426,6 +426,9 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     private var backHistory: [URL] = []
     private var forwardHistory: [URL] = []
     private var isApplyingHistoryNavigation = false
+    private var networkPathRequestID = 0
+    private var isResolvingNetworkPath = false
+    private var pendingNetworkPathInput: String?
 
     init(slot: VideoSlot, rootURL: URL) {
         self.slot = slot
@@ -617,14 +620,16 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         }
     }
 
-    func endPathEditingIfNeeded() -> Bool {
+    func endPathEditingIfNeeded(refreshPath: Bool = true) -> Bool {
         guard let window,
               let fieldEditor = window.firstResponder as? NSTextView,
               window.fieldEditor(false, for: pathField) === fieldEditor else {
             return false
         }
         window.makeFirstResponder(nil)
-        refreshPathField()
+        if refreshPath {
+            refreshPathField()
+        }
         return true
     }
 
@@ -942,25 +947,128 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     }
 
     @objc private func pathEntered() {
-        let expanded = NSString(string: pathField.stringValue).expandingTildeInPath
+        let rawInput = pathField.stringValue
+        let normalizedInput = normalizedNetworkPathInput(rawInput)
+        if isResolvingNetworkPath {
+            if pendingNetworkPathInput == normalizedInput {
+                Diagnostics.log("networkPath duplicate action ignored input=\(normalizedInput)")
+                return
+            }
+            Diagnostics.log("networkPath pending request cancelled by new input=\(normalizedInput)")
+            finishNetworkPathResolution()
+        }
+
+        networkPathRequestID += 1
+        let expanded = NSString(string: rawInput).expandingTildeInPath
         let url = URL(fileURLWithPath: expanded).standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+        if applyPathFieldURL(url) {
+            return
+        }
+
+        switch NetworkPathResolver.resolve(rawInput) {
+        case .local(let url):
+            if applyPathFieldURL(url) {
+                return
+            }
             NSSound.beep()
             refreshPathField()
-            return
+        case .needsMount(let mountURL, let target):
+            beginNetworkMount(
+                mountURL: mountURL,
+                target: target,
+                requestID: networkPathRequestID,
+                originalInput: rawInput
+            )
+        case .unsupported:
+            NSSound.beep()
+            refreshPathField()
+        }
+    }
+
+    @discardableResult
+    private func applyPathFieldURL(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return false
         }
         if isDirectory.boolValue {
             reload(rootURL: url)
-            return
+            return true
         }
         guard MediaFileSupport.isSupported(url) else {
+            return false
+        }
+        onFileOpened?(slot, url)
+        reload(rootURL: url.deletingLastPathComponent(), displayURL: url)
+        return true
+    }
+
+    private func normalizedNetworkPathInput(_ input: String) -> String {
+        input.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func finishNetworkPathResolution() {
+        isResolvingNetworkPath = false
+        pendingNetworkPathInput = nil
+    }
+
+    private func beginNetworkMount(
+        mountURL: URL,
+        target: NetworkPathTarget,
+        requestID: Int,
+        originalInput: String
+    ) {
+        isResolvingNetworkPath = true
+        pendingNetworkPathInput = normalizedNetworkPathInput(originalInput)
+        let targetPath = target.pathComponents.joined(separator: "/")
+        Diagnostics.log(
+            "networkPath mount begin mountURL=\(mountURL.absoluteString) share=\(target.share) targetPath=\(targetPath)"
+        )
+        _ = endPathEditingIfNeeded(refreshPath: false)
+        guard NSWorkspace.shared.open(mountURL) else {
+            Diagnostics.log("networkPath mount open failed mountURL=\(mountURL.absoluteString)")
+            finishNetworkPathResolution()
             NSSound.beep()
             refreshPathField()
             return
         }
-        onFileOpened?(slot, url)
-        reload(rootURL: url.deletingLastPathComponent(), displayURL: url)
+        waitForMountedNetworkPath(target: target, requestID: requestID, deadline: Date().addingTimeInterval(30))
+    }
+
+    private func waitForMountedNetworkPath(target: NetworkPathTarget, requestID: Int, deadline: Date) {
+        guard requestID == networkPathRequestID else {
+            Diagnostics.log("networkPath mount poll ignored stale request=\(requestID)")
+            return
+        }
+        if let volumeURL = NetworkPathResolver.mountedVolumeURL(for: target) {
+            let localURL = target.localURL(volumeURL: volumeURL)
+            guard applyPathFieldURL(localURL) else {
+                Diagnostics.log("networkPath mount matched but target missing targetLocalPath=\(localURL.path)")
+                finishNetworkPathResolution()
+                NSSound.beep()
+                refreshPathField()
+                return
+            }
+            bringApplicationToFrontAfterNetworkMount()
+            Diagnostics.log("networkPath mount ready targetLocalPath=\(localURL.path)")
+            finishNetworkPathResolution()
+            return
+        }
+        guard Date() < deadline else {
+            Diagnostics.log("networkPath mount timeout host=\(target.host) share=\(target.share)")
+            finishNetworkPathResolution()
+            NSSound.beep()
+            refreshPathField()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.waitForMountedNetworkPath(target: target, requestID: requestID, deadline: deadline)
+        }
+    }
+
+    private func bringApplicationToFrontAfterNetworkMount() {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func goUp() {
