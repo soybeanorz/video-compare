@@ -367,7 +367,7 @@ private final class PathTextField: NSTextField {
     }
 }
 
-final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSCollectionViewDataSource, NSCollectionViewDelegate {
+final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSCollectionViewDataSource, NSCollectionViewDelegate, NSTextFieldDelegate {
     static let collapsedHeight: CGFloat = 44
     static let expandedHeight: CGFloat = 220
 
@@ -791,6 +791,7 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         pathField.lineBreakMode = .byTruncatingMiddle
         pathField.target = self
         pathField.action = #selector(pathEntered)
+        pathField.delegate = self
         pathField.bezelStyle = .roundedBezel
         pathField.focusRingType = .default
         toolbarView.addSubview(pathField)
@@ -947,7 +948,18 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
     }
 
     @objc private func pathEntered() {
+        submitPathFieldInput(source: "action")
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard (obj.object as? NSTextField) === pathField else { return }
+        let movement = (obj.userInfo?["NSTextMovement"] as? NSNumber)?.intValue ?? -1
+        submitPathFieldInput(source: "endEditing:\(movement)")
+    }
+
+    private func submitPathFieldInput(source: String) {
         let rawInput = pathField.stringValue
+        Diagnostics.log("pathField submit source=\(source) input=\(rawInput)")
         let normalizedInput = normalizedNetworkPathInput(rawInput)
         if isResolvingNetworkPath {
             if pendingNetworkPathInput == normalizedInput {
@@ -1042,17 +1054,20 @@ final class MediaDirectoryTreeView: NSView, NSOutlineViewDataSource, NSOutlineVi
         }
         if let volumeURL = NetworkPathResolver.mountedVolumeURL(for: target) {
             let localURL = target.localURL(volumeURL: volumeURL)
-            guard applyPathFieldURL(localURL) else {
-                Diagnostics.log("networkPath mount matched but target missing targetLocalPath=\(localURL.path)")
+            if applyPathFieldURL(localURL) {
+                bringApplicationToFrontAfterNetworkMount()
+                Diagnostics.log("networkPath mount ready targetLocalPath=\(localURL.path)")
+                finishNetworkPathResolution()
+                return
+            }
+            guard Date() < deadline else {
+                Diagnostics.log("networkPath mount target timeout targetLocalPath=\(localURL.path)")
                 finishNetworkPathResolution()
                 NSSound.beep()
                 refreshPathField()
                 return
             }
-            bringApplicationToFrontAfterNetworkMount()
-            Diagnostics.log("networkPath mount ready targetLocalPath=\(localURL.path)")
-            finishNetworkPathResolution()
-            return
+            Diagnostics.log("networkPath mount matched waiting for targetLocalPath=\(localURL.path)")
         }
         guard Date() < deadline else {
             Diagnostics.log("networkPath mount timeout host=\(target.host) share=\(target.share)")

@@ -45,7 +45,7 @@ enum NetworkPathResolver {
     }
 
     static func parse(_ input: String) -> NetworkPathTarget? {
-        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = networkPathCandidate(from: input)
         guard !trimmed.isEmpty else { return nil }
         if trimmed.hasPrefix("\\\\") {
             return parseUNC(trimmed)
@@ -103,6 +103,41 @@ enum NetworkPathResolver {
             share: rawComponents[1],
             pathComponents: Array(rawComponents.dropFirst(2))
         )
+    }
+
+    private static func networkPathCandidate(from input: String) -> String {
+        let trimmed = trimExtractedCandidate(input)
+        guard !trimmed.isEmpty else { return "" }
+        if parseableNetworkPrefix(trimmed) {
+            return trimmed
+        }
+
+        for line in input.components(separatedBy: .newlines) {
+            if let range = line.range(of: "smb://", options: [.caseInsensitive]) ??
+                line.range(of: "cifs://", options: [.caseInsensitive]) {
+                return trimExtractedCandidate(String(line[range.lowerBound...]))
+            }
+            if let range = line.range(of: "\\\\") {
+                return trimExtractedCandidate(String(line[range.lowerBound...]))
+            }
+        }
+        return trimmed
+    }
+
+    private static func parseableNetworkPrefix(_ input: String) -> Bool {
+        let lowercased = input.lowercased()
+        return lowercased.hasPrefix("smb://") || lowercased.hasPrefix("cifs://") || input.hasPrefix("\\\\")
+    }
+
+    private static func trimExtractedCandidate(_ input: String) -> String {
+        var result = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trailingCharacters = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "，。；;、"))
+        result = result.trimmingCharacters(in: trailingCharacters)
+        while let range = result.range(of: #"\[[^/\[\]\\]{1,12}\]$"#, options: .regularExpression) {
+            result.removeSubrange(range)
+            result = result.trimmingCharacters(in: trailingCharacters)
+        }
+        return result
     }
 
     private static func pathComponents(fromPercentEncodedPath path: String) -> [String] {

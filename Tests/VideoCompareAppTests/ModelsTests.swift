@@ -258,6 +258,47 @@ struct ModelsTests {
         #expect(target.pathComponents == ["sub folder", "abc.mp4"])
     }
 
+    @Test func embeddedSMBPathParsesFromPastedChatText() {
+        let resolution = NetworkPathResolver.resolve(
+            """
+            吴珍燕:
+            素材地址：smb://10.1.228.130/影像系统部/图像效果部/2026/Z03/自测素材/wuzhenyan/20260530_Z03 6x 提升解析的新模型 外景测试[图片]
+            现在手机看不太到
+            """,
+            mountedVolumes: [],
+            volumesRoot: URL(fileURLWithPath: "/tmp/nonexistent-volumes", isDirectory: true)
+        )
+
+        guard case .needsMount(let mountURL, let target) = resolution else {
+            Issue.record("Expected embedded SMB URL to require mount")
+            return
+        }
+        #expect(mountURL.absoluteString == "smb://10.1.228.130/%E5%BD%B1%E5%83%8F%E7%B3%BB%E7%BB%9F%E9%83%A8/")
+        #expect(target.pathComponents == [
+            "图像效果部",
+            "2026",
+            "Z03",
+            "自测素材",
+            "wuzhenyan",
+            "20260530_Z03 6x 提升解析的新模型 外景测试"
+        ])
+    }
+
+    @Test func embeddedUNCPathParsesFromPastedText() {
+        let resolution = NetworkPathResolver.resolve(
+            "路径：\\\\10.1.228.130\\影像系统部\\图像效果部\\abc.mp4[文件]",
+            mountedVolumes: [],
+            volumesRoot: URL(fileURLWithPath: "/tmp/nonexistent-volumes", isDirectory: true)
+        )
+
+        guard case .needsMount(let mountURL, let target) = resolution else {
+            Issue.record("Expected embedded UNC path to require mount")
+            return
+        }
+        #expect(mountURL.absoluteString == "smb://10.1.228.130/%E5%BD%B1%E5%83%8F%E7%B3%BB%E7%BB%9F%E9%83%A8/")
+        #expect(target.pathComponents == ["图像效果部", "abc.mp4"])
+    }
+
     @Test func mountedSMBShareMapsToVolumesPath() throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("VideoCompareNetworkPathTests-\(UUID().uuidString)", isDirectory: true)
