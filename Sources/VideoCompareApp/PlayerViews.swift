@@ -244,6 +244,66 @@ final class FileNameBadgeView: NSView {
     }
 }
 
+final class ZoomScaleBadgeView: NSView {
+    var scale: Double = 1 {
+        didSet { needsDisplay = true }
+    }
+    var hasContent = false {
+        didSet {
+            isHidden = !hasContent
+            needsDisplay = true
+        }
+    }
+
+    private let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+    private let horizontalPadding: CGFloat = 10
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isFlipped: Bool { true }
+
+    var preferredWidth: CGFloat {
+        ceil((title as NSString).size(withAttributes: textAttributes()).width) + horizontalPadding * 2
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard hasContent else { return }
+        NSColor(calibratedWhite: 0.03, alpha: 0.68).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
+
+        let attributes = textAttributes()
+        let text = title
+        let size = (text as NSString).size(withAttributes: attributes)
+        let lineHeight = ceil(font.ascender - font.descender)
+        let textRect = NSRect(
+            x: floor((bounds.width - size.width) / 2),
+            y: floor((bounds.height - lineHeight) / 2),
+            width: size.width,
+            height: lineHeight
+        )
+        (text as NSString).draw(in: textRect, withAttributes: attributes)
+    }
+
+    private var title: String {
+        "\(Int((scale * 100).rounded()))%"
+    }
+
+    private func textAttributes() -> [NSAttributedString.Key: Any] {
+        [
+            .font: font,
+            .foregroundColor: NSColor(calibratedWhite: 0.94, alpha: 1)
+        ]
+    }
+}
+
 final class ROISelectionOverlayView: NSView {
     var selectionRect: NSRect? {
         didSet {
@@ -305,6 +365,8 @@ final class VideoCanvasView: NSView {
     let renderer = MetalCompositeView()
     let labelA = FileNameBadgeView()
     let labelB = FileNameBadgeView()
+    private let zoomBadgeA = ZoomScaleBadgeView()
+    private let zoomBadgeB = ZoomScaleBadgeView()
     private let frameNumberA = NSTextField(labelWithString: "")
     private let frameNumberB = NSTextField(labelWithString: "")
     private let divider = WipeDividerView()
@@ -374,6 +436,8 @@ final class VideoCanvasView: NSView {
         addSubview(containerB)
         addSubview(labelA)
         addSubview(labelB)
+        addSubview(zoomBadgeA)
+        addSubview(zoomBadgeB)
         addSubview(divider)
         addSubview(frameNumberA)
         addSubview(frameNumberB)
@@ -391,6 +455,10 @@ final class VideoCanvasView: NSView {
             label.layer?.cornerRadius = 5
             label.layer?.masksToBounds = true
         }
+        renderer.onTransformChanged = { [weak self] in
+            self?.updateZoomBadges()
+        }
+        updateZoomBadges()
         updateSelectionAppearance()
     }
 
@@ -550,6 +618,7 @@ final class VideoCanvasView: NSView {
         renderer.rectA = rectA
         renderer.rectB = rectB
         layoutFrameNumberLabels(rectA: rectA, rectB: rectB)
+        layoutZoomBadges(rectA: rectA, rectB: rectB)
         updateSelectionAppearance()
     }
 
@@ -571,6 +640,8 @@ final class VideoCanvasView: NSView {
         label.title = url?.lastPathComponent ?? ""
         label.toolTip = url?.path
         label.isHidden = url == nil
+        let badge = slot == .a ? zoomBadgeA : zoomBadgeB
+        badge.hasContent = url != nil
         needsLayout = true
     }
 
@@ -759,6 +830,49 @@ final class VideoCanvasView: NSView {
                 height: height
             )
         }
+    }
+
+    private func updateZoomBadges() {
+        zoomBadgeA.scale = pow(2.0, renderer.transformA.zoom)
+        zoomBadgeB.scale = pow(2.0, renderer.transformB.zoom)
+        needsLayout = true
+    }
+
+    private func layoutZoomBadges(rectA: NSRect, rectB: NSRect) {
+        layoutZoomBadge(zoomBadgeA, in: rectA, alignment: .left)
+        layoutZoomBadge(zoomBadgeB, in: rectB, alignment: .right)
+    }
+
+    private enum ZoomBadgeAlignment {
+        case left
+        case right
+    }
+
+    private func layoutZoomBadge(_ badge: ZoomScaleBadgeView, in rect: NSRect, alignment: ZoomBadgeAlignment) {
+        guard badge.hasContent,
+              rect.width >= 60,
+              rect.height >= 40 else {
+            badge.isHidden = true
+            return
+        }
+        let edgeInset: CGFloat = 12
+        let bottomInset: CGFloat = 12
+        let height: CGFloat = 22
+        let width = min(max(52, badge.preferredWidth), max(52, rect.width - edgeInset * 2))
+        let x: CGFloat
+        switch alignment {
+        case .left:
+            x = rect.minX + edgeInset
+        case .right:
+            x = rect.maxX - edgeInset - width
+        }
+        badge.frame = NSRect(
+            x: x,
+            y: rect.maxY - bottomInset - height,
+            width: width,
+            height: height
+        )
+        badge.isHidden = false
     }
 
     private func layoutFileNameLabels(rectA: NSRect, rectB: NSRect) {

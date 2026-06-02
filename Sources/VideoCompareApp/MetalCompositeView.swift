@@ -50,11 +50,18 @@ final class MetalCompositeView: MTKView {
         didSet { needsDisplay = true }
     }
     var transformA = TransformState() {
-        didSet { needsDisplay = true }
+        didSet {
+            needsDisplay = true
+            onTransformChanged?()
+        }
     }
     var transformB = TransformState() {
-        didSet { needsDisplay = true }
+        didSet {
+            needsDisplay = true
+            onTransformChanged?()
+        }
     }
+    var onTransformChanged: (() -> Void)?
     var colorAdjustmentA = ColorAdjustmentState() {
         didSet { needsDisplay = true }
     }
